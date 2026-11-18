@@ -515,16 +515,21 @@ func cmdTriage(ctx context.Context, args []string) error {
 	return nil
 }
 
-// defaultProposalDir is where triage keeps what it proposes.
-func defaultProposalDir() string {
+// defaultStateDir is where loa keeps what outlives one command.
+func defaultStateDir() string {
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "loa", "proposals")
+		return filepath.Join(dir, "loa")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(os.TempDir(), "loa", "proposals")
+		return filepath.Join(os.TempDir(), "loa")
 	}
-	return filepath.Join(home, ".local", "state", "loa", "proposals")
+	return filepath.Join(home, ".local", "state", "loa")
+}
+
+// defaultProposalDir is where triage keeps what it proposes.
+func defaultProposalDir() string {
+	return filepath.Join(defaultStateDir(), "proposals")
 }
 
 // cmdImport applies a proposal. It is the only door through which a
@@ -737,8 +742,9 @@ func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
 }
 
 // buildRunner assembles the runner both commands use. One binary, one way to
-// work the queue.
-func buildRunner(ctx context.Context, s *store.Store, f runFlags) (*runner.Runner, error) {
+// work the queue. logw is separate from the process's stderr because `dash`
+// owns the terminal it runs on: its run log goes to a file.
+func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer) (*runner.Runner, error) {
 	if !herdr.InSession() {
 		return nil, errors.New("not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
 	}
@@ -764,7 +770,7 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags) (*runner.Runne
 		MaxTasks:    f.maxTasks,
 		LeaseTTL:    f.ttl,
 		TaskTimeout: f.timeout,
-		Logger:      log.New(os.Stderr, "loa: ", log.LstdFlags),
+		Logger:      log.New(logw, "loa: ", log.LstdFlags),
 	})
 }
 
@@ -780,7 +786,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
 
-	r, err := buildRunner(ctx, s, flags)
+	r, err := buildRunner(ctx, s, flags, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -840,19 +846,35 @@ func cmdDash(ctx context.Context, args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
 
+	// The tab owns the terminal. A run started from it must not write the runner's
+	// log over the view, so the log goes to a file and the path is printed once.
+	if err := os.MkdirAll(defaultStateDir(), 0o700); err != nil {
+		return fmt.Errorf("dash: state dir: %w", err)
+	}
+	logPath := filepath.Join(defaultStateDir(), "dash.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: the state dir the runner already owns
+	if err != nil {
+		return fmt.Errorf("dash: run log: %w", err)
+	}
+	defer func() { _ = logFile.Close() }()
+
 	client := &herdr.Client{}
-	r, err := buildRunner(ctx, s, flags)
+	r, err := buildRunner(ctx, s, flags, logFile)
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "loa: run log: %s\n", logPath)
 
 	c := controls{client: client, store: s}
 	c.runFn = func(ctx context.Context) error {
+		// Progress is the tab's job, not a log line's: the summary lands in the
+		// message line, and the details are already in the log file.
 		stats, err := r.Run(ctx)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
+		// A failed write here is a full disk; the run still happened.
+		_, _ = fmt.Fprintf(logFile, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 		return nil
 	}
 

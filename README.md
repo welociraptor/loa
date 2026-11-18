@@ -146,6 +146,10 @@ LOA_DB="$XDG_STATE_HOME/loa/tasks.db" loa dash
 Task worktrees are separate linked workspaces under the repository's own
 workspace, so the tab is an index rather than a container.
 
+A run started from the tab writes its log to `$XDG_STATE_HOME/loa/dash.log`
+rather than to the terminal the tab is drawing on; the tab itself only shows the
+outcome.
+
 ## Proposals
 
 An agent may propose work; only a person applies it. `loa triage` writes the
