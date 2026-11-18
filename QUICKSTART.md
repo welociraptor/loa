@@ -106,7 +106,9 @@ reject the whole document; `import` applies everything in one transaction.
   pane and press them.
 - A failed task is not retried in the same run: `-max` is that run's budget, and
   the retry delay keeps the task unclaimable anyway.
-- `loa done` and `loa fail` require a live lease. When a task is already
-  `blocked`, a human settles it from the dashboard: `u` unblocks it for one more
-  attempt, `d`/`f` resolve it with a one-line result. The runner is not the
+- A blocked task is settled with the CLI or the dashboard. `loa unblock ID`
+  returns a blocked task to the queue for one more attempt. `loa resolve ID
+  [-fail] [-result TEXT]` settles it: done by default, blocked with `-fail`.
+  `loa done` and `loa fail` require a live lease, so they cannot settle a blocked
+  task. The dashboard does the same with `u`, `d` and `f`. The runner is not the
   authority on a blocked task.
