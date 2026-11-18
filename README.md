@@ -131,8 +131,9 @@ enter focus  x interrupt  d/f resolve  u unblock  c close  s/S run  q quit
 `enter` jumps to the task's pane (`agent focus`, or `workspace focus` when the
 agent has already exited), `x` interrupts, `u` returns a blocked task to the
 queue, `c` removes its workspace, `d`/`f` resolve it with a one-line result,
-`s`/`S` start and stop a run, `q` quits. It shows state and never announces it:
-Herdr already marks an agent that needs input.
+`s`/`S` start and stop a run, `q` quits. Outside the tab, `loa unblock ID` and
+`loa resolve ID [-fail]` settle a blocked task the same way. It shows state and
+never announces it: Herdr already marks an agent that needs input.
 
 One tab, set up once:
 
