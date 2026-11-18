@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"taskflow/internal/store"
+	"loa/internal/store"
 )
 
 func open(t *testing.T) *store.Store {
@@ -50,9 +50,9 @@ func TestAddRoundTrip(t *testing.T) {
 	id := add(t, s, store.NewTask{
 		Title:     "fix the flaky test",
 		Body:      "reproduce it first",
-		Workspace: "taskflow",
+		Workspace: "loa",
 		Priority:  7,
-		Scopes:    []string{"repo:taskflow", "repo:taskflow/ci"},
+		Scopes:    []string{"repo:loa", "repo:loa/ci"},
 	})
 
 	task, err := s.Get(ctx, id)
@@ -62,8 +62,8 @@ func TestAddRoundTrip(t *testing.T) {
 	if task.Title != "fix the flaky test" || task.Body != "reproduce it first" {
 		t.Errorf("text not round-tripped: %+v", task)
 	}
-	if task.Workspace != "taskflow" {
-		t.Errorf("workspace = %q, want taskflow", task.Workspace)
+	if task.Workspace != "loa" {
+		t.Errorf("workspace = %q, want loa", task.Workspace)
 	}
 	if task.Status != store.New || task.Priority != 7 || task.Attempts != 0 || task.MaxAttempts != 2 {
 		t.Errorf("unexpected initial state: %+v", task)
@@ -80,10 +80,10 @@ func TestAddRejectsBlankFields(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	if _, err := s.Add(ctx, store.NewTask{Workspace: "taskflow", Title: "  "}); err == nil {
+	if _, err := s.Add(ctx, store.NewTask{Workspace: "loa", Title: "  "}); err == nil {
 		t.Error("blank title accepted")
 	}
-	if _, err := s.Add(ctx, store.NewTask{Workspace: "taskflow", Title: "ok", Scopes: []string{""}}); err == nil {
+	if _, err := s.Add(ctx, store.NewTask{Workspace: "loa", Title: "ok", Scopes: []string{""}}); err == nil {
 		t.Error("blank scope accepted")
 	}
 }
@@ -91,9 +91,9 @@ func TestAddRejectsBlankFields(t *testing.T) {
 func TestLeaseFollowsPriorityThenID(t *testing.T) {
 	s := open(t)
 
-	low := add(t, s, store.NewTask{Workspace: "taskflow", Title: "low", Priority: 1})
-	high := add(t, s, store.NewTask{Workspace: "taskflow", Title: "high", Priority: 9})
-	alsoLow := add(t, s, store.NewTask{Workspace: "taskflow", Title: "also low", Priority: 1})
+	low := add(t, s, store.NewTask{Workspace: "loa", Title: "low", Priority: 1})
+	high := add(t, s, store.NewTask{Workspace: "loa", Title: "high", Priority: 9})
+	alsoLow := add(t, s, store.NewTask{Workspace: "loa", Title: "also low", Priority: 1})
 
 	now := time.Now()
 	for _, want := range []int64{high, low, alsoLow} {
@@ -114,9 +114,9 @@ func TestLeaseExcludesSharedScopes(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	slow := add(t, s, store.NewTask{Workspace: "taskflow", Title: "edit the parser", Priority: 10, Scopes: []string{"repo:taskflow"}})
-	contending := add(t, s, store.NewTask{Workspace: "taskflow", Title: "edit the lexer", Priority: 9, Scopes: []string{"repo:taskflow"}})
-	unrelated := add(t, s, store.NewTask{Workspace: "taskflow", Title: "bump the flake", Priority: 1, Scopes: []string{"repo:nixos"}})
+	slow := add(t, s, store.NewTask{Workspace: "loa", Title: "edit the parser", Priority: 10, Scopes: []string{"repo:loa"}})
+	contending := add(t, s, store.NewTask{Workspace: "loa", Title: "edit the lexer", Priority: 9, Scopes: []string{"repo:loa"}})
+	unrelated := add(t, s, store.NewTask{Workspace: "loa", Title: "bump the flake", Priority: 1, Scopes: []string{"repo:nixos"}})
 
 	now := time.Now()
 	if got := lease(t, s, now); got == nil || got.ID != slow {
@@ -139,8 +139,8 @@ func TestLeaseWaitsForDependencies(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	first := add(t, s, store.NewTask{Workspace: "taskflow", Title: "schema"})
-	second := add(t, s, store.NewTask{Workspace: "taskflow", Title: "writer", Deps: []int64{first}})
+	first := add(t, s, store.NewTask{Workspace: "loa", Title: "schema"})
+	second := add(t, s, store.NewTask{Workspace: "loa", Title: "writer", Deps: []int64{first}})
 
 	now := time.Now()
 	if got := lease(t, s, now); got == nil || got.ID != first {
@@ -161,7 +161,7 @@ func TestExpiredLeaseRetriesThenBlocks(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	id := add(t, s, store.NewTask{Workspace: "taskflow", Title: "long job", MaxTries: 2})
+	id := add(t, s, store.NewTask{Workspace: "loa", Title: "long job", MaxTries: 2})
 	start := time.Now()
 
 	if got := lease(t, s, start); got == nil || got.ID != id || got.Attempts != 1 {
@@ -196,7 +196,7 @@ func TestFailRequeuesUntilAttemptsAreSpent(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	id := add(t, s, store.NewTask{Workspace: "taskflow", Title: "flaky", MaxTries: 2})
+	id := add(t, s, store.NewTask{Workspace: "loa", Title: "flaky", MaxTries: 2})
 	now := time.Now()
 
 	lease(t, s, now)
@@ -236,7 +236,7 @@ func TestFinishRequiresLease(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	id := add(t, s, store.NewTask{Workspace: "taskflow", Title: "unclaimed"})
+	id := add(t, s, store.NewTask{Workspace: "loa", Title: "unclaimed"})
 	if err := s.Complete(ctx, id, "b/x", "done"); !errors.Is(err, store.ErrNotLeased) {
 		t.Errorf("complete unleased: %v, want ErrNotLeased", err)
 	}
@@ -264,7 +264,7 @@ func TestConcurrentLeasesNeverDuplicate(t *testing.T) {
 
 	const tasks = 12
 	for i := 0; i < tasks; i++ {
-		add(t, a, store.NewTask{Workspace: "taskflow", Title: fmt.Sprintf("task %d", i)})
+		add(t, a, store.NewTask{Workspace: "loa", Title: fmt.Sprintf("task %d", i)})
 	}
 
 	var mu sync.Mutex
@@ -312,7 +312,7 @@ func TestReopenIsStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	id := add(t, first, store.NewTask{Workspace: "taskflow", Title: "survives"})
+	id := add(t, first, store.NewTask{Workspace: "loa", Title: "survives"})
 	first.Close()
 
 	second, err := store.Open(ctx, path)
@@ -334,9 +334,9 @@ func TestListFiltersAndOrders(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
 
-	a := add(t, s, store.NewTask{Workspace: "taskflow", Title: "a", Priority: 1})
-	b := add(t, s, store.NewTask{Workspace: "taskflow", Title: "b", Priority: 5})
-	done := add(t, s, store.NewTask{Workspace: "taskflow", Title: "c", Priority: 1})
+	a := add(t, s, store.NewTask{Workspace: "loa", Title: "a", Priority: 1})
+	b := add(t, s, store.NewTask{Workspace: "loa", Title: "b", Priority: 5})
+	done := add(t, s, store.NewTask{Workspace: "loa", Title: "c", Priority: 1})
 	lease(t, s, time.Now())
 	if err := s.Complete(ctx, b, "b/done", "shipped"); err != nil {
 		t.Fatalf("complete: %v", err)
@@ -420,16 +420,16 @@ func TestBlockersAgreeWithLease(t *testing.T) {
 	type setup func(t *testing.T, s *store.Store) int64
 	cases := map[string]setup{
 		"runnable": func(t *testing.T, s *store.Store) int64 {
-			return add(t, s, store.NewTask{Workspace: "taskflow", Title: "free"})
+			return add(t, s, store.NewTask{Workspace: "loa", Title: "free"})
 		},
 		"unfinished dependency": func(t *testing.T, s *store.Store) int64 {
-			dep := add(t, s, store.NewTask{Workspace: "taskflow", Title: "dep"})
-			task := add(t, s, store.NewTask{Workspace: "taskflow", Title: "blocked", Deps: []int64{dep}})
+			dep := add(t, s, store.NewTask{Workspace: "loa", Title: "dep"})
+			task := add(t, s, store.NewTask{Workspace: "loa", Title: "blocked", Deps: []int64{dep}})
 			lease(t, s, now) // takes the dep, the only other claimable task
 			return task
 		},
 		"retry delay": func(t *testing.T, s *store.Store) int64 {
-			task := add(t, s, store.NewTask{Workspace: "taskflow", Title: "flaky"})
+			task := add(t, s, store.NewTask{Workspace: "loa", Title: "flaky"})
 			lease(t, s, now)
 			if err := s.Fail(ctx, task, "boom"); err != nil {
 				t.Fatalf("fail: %v", err)
@@ -437,15 +437,15 @@ func TestBlockersAgreeWithLease(t *testing.T) {
 			return task
 		},
 		"scope contention": func(t *testing.T, s *store.Store) int64 {
-			holder := add(t, s, store.NewTask{Workspace: "taskflow", Title: "holder", Scopes: []string{"repo:a"}})
-			task := add(t, s, store.NewTask{Workspace: "taskflow", Title: "contender", Scopes: []string{"repo:a"}})
+			holder := add(t, s, store.NewTask{Workspace: "loa", Title: "holder", Scopes: []string{"repo:a"}})
+			task := add(t, s, store.NewTask{Workspace: "loa", Title: "contender", Scopes: []string{"repo:a"}})
 			if got := lease(t, s, now); got == nil || got.ID != holder {
 				t.Fatalf("holder was not leased: %v", got)
 			}
 			return task
 		},
 		"blocked": func(t *testing.T, s *store.Store) int64 {
-			task := add(t, s, store.NewTask{Workspace: "taskflow", Title: "dead", MaxTries: 1})
+			task := add(t, s, store.NewTask{Workspace: "loa", Title: "dead", MaxTries: 1})
 			lease(t, s, now)
 			if err := s.Fail(ctx, task, "out of attempts"); err != nil {
 				t.Fatalf("fail: %v", err)
@@ -453,7 +453,7 @@ func TestBlockersAgreeWithLease(t *testing.T) {
 			return task
 		},
 		"done": func(t *testing.T, s *store.Store) int64 {
-			task := add(t, s, store.NewTask{Workspace: "taskflow", Title: "finished"})
+			task := add(t, s, store.NewTask{Workspace: "loa", Title: "finished"})
 			lease(t, s, now)
 			if err := s.Complete(ctx, task, "b/done", "ok"); err != nil {
 				t.Fatalf("complete: %v", err)
@@ -487,8 +487,8 @@ func TestBlockersNameTheReason(t *testing.T) {
 	s := open(t)
 	now := time.Now()
 
-	dep := add(t, s, store.NewTask{Workspace: "taskflow", Title: "schema"})
-	child := add(t, s, store.NewTask{Workspace: "taskflow", Title: "writer", Scopes: []string{"repo:a"}, Deps: []int64{dep}})
+	dep := add(t, s, store.NewTask{Workspace: "loa", Title: "schema"})
+	child := add(t, s, store.NewTask{Workspace: "loa", Title: "writer", Scopes: []string{"repo:a"}, Deps: []int64{dep}})
 	lease(t, s, now)
 
 	blockers, err := s.Blockers(ctx, child, now)
@@ -506,7 +506,7 @@ func TestAttachRecordsWhatTheAttemptOwns(t *testing.T) {
 	s := open(t)
 	now := time.Now()
 
-	id := add(t, s, store.NewTask{Title: "work", Workspace: "taskflow"})
+	id := add(t, s, store.NewTask{Title: "work", Workspace: "loa"})
 	if err := s.Attach(ctx, id, "w1", "w1:p1"); !errors.Is(err, store.ErrNotLeased) {
 		t.Fatalf("attach before leasing: %v, want ErrNotLeased", err)
 	}
@@ -545,8 +545,8 @@ func TestClaimsListWhatTheStoreCanProve(t *testing.T) {
 	s := open(t)
 	now := time.Now()
 
-	claimed := add(t, s, store.NewTask{Title: "claimed", Workspace: "taskflow"})
-	unclaimed := add(t, s, store.NewTask{Title: "never dispatched", Workspace: "taskflow"})
+	claimed := add(t, s, store.NewTask{Title: "claimed", Workspace: "loa"})
+	unclaimed := add(t, s, store.NewTask{Title: "never dispatched", Workspace: "loa"})
 	if got := lease(t, s, now); got == nil || got.ID != claimed {
 		t.Fatalf("leased %v, want task %d", got, claimed)
 	}
@@ -571,7 +571,7 @@ func TestRunTimeIsMeasuredAtFinish(t *testing.T) {
 	s := open(t)
 	now := time.Now()
 
-	id := add(t, s, store.NewTask{Title: "slow", Workspace: "taskflow"})
+	id := add(t, s, store.NewTask{Title: "slow", Workspace: "loa"})
 	lease(t, s, now)
 	// Timestamps are stored to the second, so a shorter attempt would measure 0.
 	time.Sleep(1100 * time.Millisecond)
@@ -603,11 +603,11 @@ func TestRunTimeIsMeasuredAtFinish(t *testing.T) {
 func TestApplyCreatesTheBatchInOneTransaction(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
-	existing := add(t, s, store.NewTask{Title: "existing", Workspace: "taskflow", Priority: 1})
+	existing := add(t, s, store.NewTask{Title: "existing", Workspace: "loa", Priority: 1})
 
 	ids, err := s.Apply(ctx, []store.BatchItem{
-		{NewTask: store.NewTask{Title: "first", Workspace: "taskflow", Scopes: []string{"repo:a"}}},
-		{NewTask: store.NewTask{Title: "second", Workspace: "taskflow"},
+		{NewTask: store.NewTask{Title: "first", Workspace: "loa", Scopes: []string{"repo:a"}}},
+		{NewTask: store.NewTask{Title: "second", Workspace: "loa"},
 			After: []int{0}, Deps: []int64{existing}},
 	}, []store.Priority{{ID: existing, Priority: 9}})
 	if err != nil {
@@ -647,7 +647,7 @@ func TestApplyRollsBackWhenAnyPartFails(t *testing.T) {
 	}
 
 	_, err = s.Apply(ctx,
-		[]store.BatchItem{{NewTask: store.NewTask{Title: "would be created", Workspace: "taskflow"}}},
+		[]store.BatchItem{{NewTask: store.NewTask{Title: "would be created", Workspace: "loa"}}},
 		[]store.Priority{{ID: 404, Priority: 3}},
 	)
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {

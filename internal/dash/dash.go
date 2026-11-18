@@ -11,8 +11,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"taskflow/internal/live"
-	"taskflow/internal/store"
+	"loa/internal/herdr"
+	"loa/internal/live"
+	"loa/internal/store"
 )
 
 // Controls is everything the tab can do. The composition root supplies it, so
@@ -286,7 +287,7 @@ func (m Model) View() string {
 			fresh++
 		}
 	}
-	fmt.Fprintf(&b, "taskflow  %d running  %d blocked  %d queued", leased, blocked, fresh)
+	fmt.Fprintf(&b, "loa  %d running  %d blocked  %d queued", leased, blocked, fresh)
 	if m.running {
 		b.WriteString("  [running]")
 	}
@@ -318,7 +319,7 @@ func (m Model) View() string {
 
 	for _, o := range m.orphans {
 		fmt.Fprintf(&b, "  %s %s %s %s %s\n", pad("-", 4), pad("orphan", 8),
-			pad(strings.TrimPrefix(o.Label, "taskflow #"), 10), pad(o.WorkspaceID, 18), "(no task)")
+			pad(herdr.TaskLabelNumber(o.Label), 10), pad(o.WorkspaceID, 18), "(no task)")
 	}
 
 	b.WriteString("\n")

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"sort"
 
-	"taskflow/internal/herdr"
-	"taskflow/internal/store"
+	"loa/internal/herdr"
+	"loa/internal/store"
 )
 
 // Session is the part of Herdr this package needs. Recorded JSON fixtures pin

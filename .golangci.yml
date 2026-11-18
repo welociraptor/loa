@@ -7,7 +7,7 @@ formatters:
     goimports:
       # Groups this module's imports apart from third-party ones.
       local-prefixes:
-        - taskflow
+        - loa
 
 linters:
   # Listed one by one rather than "standard", so an upgrade cannot silently
@@ -34,7 +34,7 @@ linters:
         - (*database/sql.DB).Close
         - (*database/sql.Tx).Rollback
         - (*database/sql.Rows).Close
-        - (*taskflow/internal/store.Store).Close
+        - (*loa/internal/store.Store).Close
     gosec:
       excludes:
         # Commands are run through exec with an argument slice and no shell, so

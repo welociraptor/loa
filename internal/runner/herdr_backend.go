@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"taskflow/internal/herdr"
+	"loa/internal/herdr"
 )
 
 // Herdr is the real backend: the worktree, the pane and the agent all belong to

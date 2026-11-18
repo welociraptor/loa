@@ -1,4 +1,4 @@
-module taskflow
+module loa
 
 go 1.27.3
 

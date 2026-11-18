@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"taskflow/internal/herdr"
+	"loa/internal/herdr"
 )
 
 // The fake binary answers with recorded server output, so these tests pin both
@@ -104,7 +104,7 @@ func TestAgentsCarryStatusAndWorkspace(t *testing.T) {
 	if len(agents) != 2 {
 		t.Fatalf("agents = %+v", agents)
 	}
-	if agents[1].Name != "tf-7-1" || agents[1].Status != "blocked" || agents[1].WorkspaceID != "w3" {
+	if agents[1].Name != "loa-7-1" || agents[1].Status != "blocked" || agents[1].WorkspaceID != "w3" {
 		t.Errorf("named agent = %+v", agents[1])
 	}
 }
@@ -115,14 +115,14 @@ func TestCreateWorktreeBuildsTheCommandAndDecodesIds(t *testing.T) {
 
 	wt, err := h.client.CreateWorktree(ctx, herdr.WorktreeRequest{
 		WorkspaceID: "w1",
-		Branch:      "taskflow/7.1",
+		Branch:      "loa/7.1",
 		Base:        "HEAD",
-		Label:       "taskflow #7",
+		Label:       "loa #7",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if wt.WorkspaceID != "w3" || wt.PaneID != "w3:p1" || wt.Branch != "taskflow/7.1" ||
+	if wt.WorkspaceID != "w3" || wt.PaneID != "w3:p1" || wt.Branch != "loa/7.1" ||
 		wt.Repo != "/home/u/Repositories/nixos" {
 		t.Errorf("worktree = %+v", wt)
 	}
@@ -137,9 +137,9 @@ func TestCreateWorktreeBuildsTheCommandAndDecodesIds(t *testing.T) {
 	for _, want := range []string{
 		"worktree create",
 		"--workspace w1",
-		"--branch taskflow/7.1",
+		"--branch loa/7.1",
 		"--base HEAD",
-		"--label taskflow #7",
+		"--label loa #7",
 		"--no-focus",
 	} {
 		if !strings.Contains(got, want) {
@@ -162,21 +162,21 @@ func TestCreateWorktreeNeedsAWorkspace(t *testing.T) {
 
 func TestPromptReportsTheBlockedCode(t *testing.T) {
 	h := newHarness(t, "BLOCK_PROMPT=1")
-	err := h.client.Prompt(context.Background(), "tf-7-1", "do it", 10*time.Second)
+	err := h.client.Prompt(context.Background(), "loa-7-1", "do it", 10*time.Second)
 	if err == nil {
 		t.Fatal("a blocked agent was reported as accepted")
 	}
 	if got := herdr.CodeOf(err); got != "agent_blocked" {
 		t.Errorf("code = %q, want agent_blocked (%v)", got, err)
 	}
-	if !strings.Contains(err.Error(), "agent prompt tf-7-1") {
+	if !strings.Contains(err.Error(), "agent prompt loa-7-1") {
 		t.Errorf("error does not name the command: %v", err)
 	}
 }
 
 func TestPromptPassesTheTimeout(t *testing.T) {
 	h := newHarness(t)
-	if err := h.client.Prompt(context.Background(), "tf-7-1", "do it", 90*time.Second); err != nil {
+	if err := h.client.Prompt(context.Background(), "loa-7-1", "do it", 90*time.Second); err != nil {
 		t.Fatalf("prompt: %v", err)
 	}
 	if got := h.calls(t)[0]; !strings.Contains(got, "--wait") || !strings.Contains(got, "--timeout 90000") {
@@ -186,7 +186,7 @@ func TestPromptPassesTheTimeout(t *testing.T) {
 
 func TestReadReturnsText(t *testing.T) {
 	h := newHarness(t)
-	out, err := h.client.Read(context.Background(), "tf-7-1", 200)
+	out, err := h.client.Read(context.Background(), "loa-7-1", 200)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestReadReturnsText(t *testing.T) {
 func TestStartAgentPassesNativeArgsAfterTheSeparator(t *testing.T) {
 	h := newHarness(t)
 	err := h.client.StartAgent(context.Background(), herdr.StartAgentRequest{
-		Name:    "tf-7-1",
+		Name:    "loa-7-1",
 		Kind:    "pi",
 		PaneID:  "w3:p1",
 		Args:    []string{"--no-session", "--tools", "read,edit"},
@@ -235,7 +235,7 @@ func TestUnknownServerErrorSurfacesAsPlainError(t *testing.T) {
 
 func TestSendKeysRejectsNothing(t *testing.T) {
 	h := newHarness(t)
-	if err := h.client.SendKeys(context.Background(), "tf-7-1"); err == nil {
+	if err := h.client.SendKeys(context.Background(), "loa-7-1"); err == nil {
 		t.Fatal("an empty key sequence was sent")
 	}
 	if calls := h.calls(t); len(calls) != 0 {
@@ -247,14 +247,14 @@ func TestFocusTargetsTheAgentOrTheWorkspace(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 
-	if err := h.client.FocusAgent(ctx, "tf-7-1"); err != nil {
+	if err := h.client.FocusAgent(ctx, "loa-7-1"); err != nil {
 		t.Fatalf("focus agent: %v", err)
 	}
 	if err := h.client.FocusWorkspace(ctx, "w3"); err != nil {
 		t.Fatalf("focus workspace: %v", err)
 	}
 	calls := h.calls(t)
-	if calls[0] != "agent focus tf-7-1" {
+	if calls[0] != "agent focus loa-7-1" {
 		t.Errorf("calls[0] = %q", calls[0])
 	}
 	if calls[1] != "workspace focus w3" {
@@ -264,14 +264,14 @@ func TestFocusTargetsTheAgentOrTheWorkspace(t *testing.T) {
 
 func TestCreateWorkspace(t *testing.T) {
 	h := newHarness(t)
-	ws, err := h.client.CreateWorkspace(context.Background(), "/home/u/.local/state/taskflow/triage/1", "taskflow triage")
+	ws, err := h.client.CreateWorkspace(context.Background(), "/home/u/.local/state/loa/triage/1", "loa triage")
 	if err != nil {
 		t.Fatalf("create workspace: %v", err)
 	}
 	if ws.ID != "w4" || ws.PaneID != "w4:p1" {
 		t.Fatalf("workspace = %+v", ws)
 	}
-	if got := h.calls(t)[0]; got != "workspace create --cwd /home/u/.local/state/taskflow/triage/1 --label taskflow triage" {
+	if got := h.calls(t)[0]; got != "workspace create --cwd /home/u/.local/state/loa/triage/1 --label loa triage" {
 		t.Errorf("command = %q", got)
 	}
 }

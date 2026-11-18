@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"taskflow/internal/store"
+	"loa/internal/store"
 )
 
 // prompt is what a worker wakes up to. It carries the contract, because the

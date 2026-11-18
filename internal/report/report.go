@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"taskflow/internal/live"
-	"taskflow/internal/store"
+	"loa/internal/live"
+	"loa/internal/store"
 )
 
 // Item is one task in a section.

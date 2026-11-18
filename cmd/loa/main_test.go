@@ -16,11 +16,11 @@ import (
 var binary string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "taskflow-bin")
+	dir, err := os.MkdirTemp("", "loa-bin")
 	if err != nil {
 		panic(err)
 	}
-	binary = filepath.Join(dir, "taskflow")
+	binary = filepath.Join(dir, "loa")
 
 	build := exec.Command("go", "build", "-o", binary, ".")
 	build.Stderr = os.Stderr
@@ -47,7 +47,7 @@ func newCLI(t *testing.T) *cli {
 func (c *cli) run(args ...string) (stdout, stderr string, code int) {
 	c.t.Helper()
 	cmd := exec.Command(binary, args...)
-	cmd.Env = append(os.Environ(), "TASKFLOW_DB="+c.db)
+	cmd.Env = append(os.Environ(), "LOA_DB="+c.db)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -74,7 +74,7 @@ func (c *cli) mustRun(args ...string) string {
 func TestAddListLeaseDone(t *testing.T) {
 	c := newCLI(t)
 
-	if out := c.mustRun("add", "-workspace", "taskflow", "-title", "ship it", "-priority", "3", "-scope", "repo:demo"); strings.TrimSpace(out) != "1" {
+	if out := c.mustRun("add", "-workspace", "loa", "-title", "ship it", "-priority", "3", "-scope", "repo:demo"); strings.TrimSpace(out) != "1" {
 		t.Fatalf("add printed %q, want the new id", out)
 	}
 
@@ -101,7 +101,7 @@ func TestAddListLeaseDone(t *testing.T) {
 
 	// Flags after the positional argument, which the stdlib flag package does
 	// not support on its own.
-	c.mustRun("done", "1", "-branch", "taskflow/1.1", "-result", "merged")
+	c.mustRun("done", "1", "-branch", "loa/1.1", "-result", "merged")
 
 	done := c.mustRun("list", "-status", "done")
 	if !strings.Contains(done, "ship it") || !strings.Contains(done, "1/2") {
@@ -109,7 +109,7 @@ func TestAddListLeaseDone(t *testing.T) {
 	}
 
 	show := c.mustRun("show", "1")
-	for _, want := range []string{"branch:", "taskflow/1.1", "result:", "merged", "already done"} {
+	for _, want := range []string{"branch:", "loa/1.1", "result:", "merged", "already done"} {
 		if !strings.Contains(show, want) {
 			t.Errorf("show = %q, missing %q", show, want)
 		}
@@ -118,8 +118,8 @@ func TestAddListLeaseDone(t *testing.T) {
 
 func TestShowExplainsWhyATaskIsNotRunning(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "schema", "-scope", "repo:demo")
-	c.mustRun("add", "-workspace", "taskflow", "-title", "writer", "-scope", "repo:demo", "-dep", "1")
+	c.mustRun("add", "-workspace", "loa", "-title", "schema", "-scope", "repo:demo")
+	c.mustRun("add", "-workspace", "loa", "-title", "writer", "-scope", "repo:demo", "-dep", "1")
 	c.mustRun("lease", "-owner", "cli-test")
 
 	show := c.mustRun("show", "2")
@@ -144,7 +144,7 @@ func TestShowRejectsUnknownTask(t *testing.T) {
 
 func TestDoneRequiresALease(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "unclaimed")
+	c.mustRun("add", "-workspace", "loa", "-title", "unclaimed")
 
 	_, errOut, code := c.run("done", "1")
 	if code != 1 || !strings.Contains(errOut, "not leased") {
@@ -154,7 +154,7 @@ func TestDoneRequiresALease(t *testing.T) {
 
 func TestFailRequeuesAndReportsRetry(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "flaky")
+	c.mustRun("add", "-workspace", "loa", "-title", "flaky")
 	c.mustRun("lease", "-owner", "cli-test")
 	c.mustRun("fail", "1", "-result", "tests were red")
 
@@ -183,8 +183,8 @@ func TestUsageErrorsExitWithTwo(t *testing.T) {
 
 func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "queued", "-scope", "repo:demo")
-	c.mustRun("add", "-workspace", "taskflow", "-title", "running", "-scope", "repo:other")
+	c.mustRun("add", "-workspace", "loa", "-title", "queued", "-scope", "repo:demo")
+	c.mustRun("add", "-workspace", "loa", "-title", "running", "-scope", "repo:other")
 	c.mustRun("lease", "-owner", "cli-test")
 
 	// With a session: the leased row names its workspace, if not yet its agent.
@@ -203,7 +203,7 @@ func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 
 func TestPsJSONCarriesTheJoin(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "queued")
+	c.mustRun("add", "-workspace", "loa", "-title", "queued")
 	c.mustRun("lease", "-owner", "cli-test")
 
 	var snap struct {
@@ -219,7 +219,7 @@ func TestPsJSONCarriesTheJoin(t *testing.T) {
 	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
 		t.Fatalf("ps -json: %v", err)
 	}
-	if len(snap.Rows) != 1 || snap.Rows[0].Status != "leased" || snap.Rows[0].Workspace != "taskflow" {
+	if len(snap.Rows) != 1 || snap.Rows[0].Status != "leased" || snap.Rows[0].Workspace != "loa" {
 		t.Fatalf("rows = %+v", snap.Rows)
 	}
 	// "closed" would be a lie here: nothing was ever dispatched, so there is no
@@ -231,13 +231,13 @@ func TestPsJSONCarriesTheJoin(t *testing.T) {
 
 func TestReportPrintsTheDayAndTheGap(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "ship the report")
-	c.mustRun("add", "-workspace", "taskflow", "-title", "waiting")
+	c.mustRun("add", "-workspace", "loa", "-title", "ship the report")
+	c.mustRun("add", "-workspace", "loa", "-title", "waiting")
 	c.mustRun("lease", "-owner", "cli-test")
-	c.mustRun("done", "1", "-branch", "taskflow/1.1", "-result", "shipped it")
+	c.mustRun("done", "1", "-branch", "loa/1.1", "-result", "shipped it")
 
 	out := c.mustRun("report")
-	for _, want := range []string{"since ", "done: 1", "taskflow/1.1", "queued: 1", "activity:"} {
+	for _, want := range []string{"since ", "done: 1", "loa/1.1", "queued: 1", "activity:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report is missing %q:\n%s", want, out)
 		}
@@ -246,7 +246,7 @@ func TestReportPrintsTheDayAndTheGap(t *testing.T) {
 
 func TestReportAcceptsADateWindow(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "yesterday")
+	c.mustRun("add", "-workspace", "loa", "-title", "yesterday")
 	if out := c.mustRun("report", "-since", "2026-01-01"); !strings.Contains(out, "since ") {
 		t.Errorf("report = %q", out)
 	}
@@ -257,7 +257,7 @@ func TestReportAcceptsADateWindow(t *testing.T) {
 
 func TestReportJSONCarriesTheSections(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-workspace", "taskflow", "-title", "queued")
+	c.mustRun("add", "-workspace", "loa", "-title", "queued")
 
 	var r struct {
 		Queued []struct {
@@ -279,8 +279,8 @@ func TestImportCreatesTasksWithDependencies(t *testing.T) {
 	c := newCLI(t)
 	file := filepath.Join(t.TempDir(), "proposal.json")
 	doc := `{"tasks":[
-		{"title":"schema","workspace":"taskflow","priority":3},
-		{"title":"writer","workspace":"taskflow","after":["schema"]}
+		{"title":"schema","workspace":"loa","priority":3},
+		{"title":"writer","workspace":"loa","after":["schema"]}
 	]}`
 	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -302,7 +302,7 @@ func TestImportAppliesNothingWhenAnythingIsWrong(t *testing.T) {
 	c := newCLI(t)
 	file := filepath.Join(t.TempDir(), "proposal.json")
 	doc := `{"tasks":[
-		{"title":"fine","workspace":"taskflow"},
+		{"title":"fine","workspace":"loa"},
 		{"title":"broken"}
 	]}`
 	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
@@ -321,7 +321,7 @@ func TestImportAppliesNothingWhenAnythingIsWrong(t *testing.T) {
 func TestImportDryRunCreatesNothing(t *testing.T) {
 	c := newCLI(t)
 	file := filepath.Join(t.TempDir(), "proposal.json")
-	if err := os.WriteFile(file, []byte(`[{"title":"later","workspace":"taskflow"}]`), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte(`[{"title":"later","workspace":"loa"}]`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 

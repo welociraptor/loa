@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"taskflow/internal/store"
-	"taskflow/internal/taskspec"
-	"taskflow/internal/triage"
+	"loa/internal/store"
+	"loa/internal/taskspec"
+	"loa/internal/triage"
 )
 
 func TestContextWritesTheQueueTheAgentReads(t *testing.T) {

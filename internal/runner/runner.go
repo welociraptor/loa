@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"taskflow/internal/store"
+	"loa/internal/store"
 )
 
 // Config is one run's worth of settings. Zero values are replaced by defaults
@@ -60,7 +60,7 @@ func New(cfg Config) (*Runner, error) {
 		cfg.Base = "HEAD"
 	}
 	if cfg.BranchPrefix == "" {
-		cfg.BranchPrefix = "taskflow/"
+		cfg.BranchPrefix = "loa/"
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 1
@@ -176,7 +176,7 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		WorkspaceLabel: task.Workspace,
 		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
 		Base:           r.cfg.Base,
-		AgentName:      fmt.Sprintf("tf-%d-%d", task.ID, task.Attempts),
+		AgentName:      fmt.Sprintf("loa-%d-%d", task.ID, task.Attempts),
 	})
 	if err != nil {
 		return r.fail(ctx, task, err.Error())
@@ -257,7 +257,7 @@ func (r *Runner) stopAndClose(handle Handle, logf func(string, ...any)) {
 
 // reconcile closes workspaces the runner owns but nobody is holding, plus the
 // ones a dead run created before it could record them. Ownership is the stored
-// id; the `taskflow #N` label is only trusted for the window where a workspace
+// id; the `loa #N` label is only trusted for the window where a workspace
 // exists and no row claims it, and never while that task is being worked on.
 func (r *Runner) reconcile(ctx context.Context, now time.Time) {
 	spaces, err := r.cfg.Backend.TaskWorkspaces(ctx)

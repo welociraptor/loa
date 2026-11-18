@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"taskflow/internal/herdr"
-	"taskflow/internal/live"
-	"taskflow/internal/store"
+	"loa/internal/herdr"
+	"loa/internal/live"
+	"loa/internal/store"
 )
 
 type fakeSession struct {
@@ -100,7 +100,7 @@ func TestReadJoinsTasksWithTheirSession(t *testing.T) {
 			{ID: "w2", Label: herdr.TaskLabel(gone)},
 		},
 		agents: []herdr.Agent{
-			{Name: "tf-1-1", Status: "blocked", WorkspaceID: "w1"},
+			{Name: "loa-1-1", Status: "blocked", WorkspaceID: "w1"},
 		},
 	}
 
@@ -112,7 +112,7 @@ func TestReadJoinsTasksWithTheirSession(t *testing.T) {
 		t.Fatalf("unavailable: %s", snap.Unavailable)
 	}
 
-	if got := rowFor(t, snap, blocked); got.AgentName != "tf-1-1" || got.AgentState != "blocked" ||
+	if got := rowFor(t, snap, blocked); got.AgentName != "loa-1-1" || got.AgentState != "blocked" ||
 		got.WorkspaceState != live.WorkspaceLive {
 		t.Errorf("blocked row = %+v", got)
 	}

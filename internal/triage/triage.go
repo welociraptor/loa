@@ -1,6 +1,6 @@
 // Package triage prepares what a triage agent is given, and reads back what it
 // proposes. It never writes to the queue: a proposal is a document that a person
-// applies with `taskflow import`.
+// applies with `loa import`.
 package triage
 
 import (
@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"taskflow/internal/store"
-	"taskflow/internal/taskspec"
+	"loa/internal/store"
+	"loa/internal/taskspec"
 )
 
 // Queue is the queue as the agent sees it: what exists, what state it is in, and

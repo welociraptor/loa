@@ -1,4 +1,4 @@
-// Command taskflow is the human- and script-facing edge of the task store.
+// Command loa is the human- and script-facing edge of the task store.
 // The store is the contract; this CLI is a thin shell over it.
 package main
 
@@ -19,33 +19,33 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"taskflow/internal/dash"
-	"taskflow/internal/herdr"
-	"taskflow/internal/live"
-	"taskflow/internal/report"
-	"taskflow/internal/runner"
-	"taskflow/internal/store"
-	"taskflow/internal/taskspec"
-	"taskflow/internal/triage"
+	"loa/internal/dash"
+	"loa/internal/herdr"
+	"loa/internal/live"
+	"loa/internal/report"
+	"loa/internal/runner"
+	"loa/internal/store"
+	"loa/internal/taskspec"
+	"loa/internal/triage"
 )
 
-const usage = `taskflow — task queue for a multi-agent workflow
+const usage = `loa — task queue for a multi-agent workflow
 
 usage:
-  taskflow add   -title TEXT -workspace LABEL [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
-  taskflow list  [-status STATUS]...
-  taskflow show  ID
-  taskflow ps    [-json]                # the queue joined with the live session
-  taskflow report [-since 24h|-since 2026-11-18] [-json]   # what the day did
-  taskflow import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
-  taskflow triage [-timeout 10m]        # ask an agent to propose one
-  taskflow lease [-owner NAME] [-ttl 1h]
-  taskflow done  ID [-branch BRANCH] [-result TEXT]
-  taskflow fail  ID [-result TEXT]
-  taskflow run   [-workers N] [-max N] [-timeout 45m]
-  taskflow dash  [-workers N] [-max N]      # the tab: state, and the keys to act
+  loa add    -title TEXT -workspace LABEL [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
+  loa list   [-status STATUS]...
+  loa show   ID
+  loa ps     [-json]               # the queue joined with the live session
+  loa report [-since 24h|-since 2026-11-18] [-json]   # what the day did
+  loa import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
+  loa triage [-timeout 10m]        # ask an agent to propose one
+  loa lease  [-owner NAME] [-ttl 1h]
+  loa done   ID [-branch BRANCH] [-result TEXT]
+  loa fail   ID [-result TEXT]
+  loa run    [-workers N] [-max N] [-timeout 45m]
+  loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
 
-all commands accept -db PATH (default $TASKFLOW_DB, else taskflow.db)`
+all commands accept -db PATH (default $LOA_DB, else loa.db)`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -84,21 +84,21 @@ func main() {
 		fmt.Println(usage)
 		return
 	default:
-		fmt.Fprintf(os.Stderr, "taskflow: unknown command %q\n\n%s\n", os.Args[1], usage)
+		fmt.Fprintf(os.Stderr, "loa: unknown command %q\n\n%s\n", os.Args[1], usage)
 		os.Exit(2)
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "taskflow: %v\n", err)
+		fmt.Fprintf(os.Stderr, "loa: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func defaultDB() string {
-	if p := os.Getenv("TASKFLOW_DB"); p != "" {
+	if p := os.Getenv("LOA_DB"); p != "" {
 		return p
 	}
-	return "taskflow.db"
+	return "loa.db"
 }
 
 // open builds a flag set for one command, parses args, and returns the opened
@@ -372,7 +372,7 @@ func cmdPs(ctx context.Context, args []string) error {
 	}
 
 	if snap.Unavailable != "" {
-		fmt.Fprintf(os.Stderr, "taskflow: %s\n", snap.Unavailable)
+		fmt.Fprintf(os.Stderr, "loa: %s\n", snap.Unavailable)
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -396,7 +396,7 @@ func cmdPs(ctx context.Context, args []string) error {
 }
 
 // cmdTriage runs one read-only agent against the queue and keeps the proposal it
-// writes. It never applies it: a person does that with `taskflow import`.
+// writes. It never applies it: a person does that with `loa import`.
 func cmdTriage(ctx context.Context, args []string) error {
 	var (
 		timeout time.Duration
@@ -408,7 +408,7 @@ func cmdTriage(ctx context.Context, args []string) error {
 		fs.DurationVar(&timeout, "timeout", 10*time.Minute, "limit for the triage agent")
 		fs.StringVar(&model, "model", "", "model passed to the agent")
 		fs.StringVar(&kind, "kind", "pi", "agent kind Herdr starts")
-		fs.StringVar(&outDir, "out", "", "where proposals are kept (default $XDG_STATE_HOME/taskflow/proposals)")
+		fs.StringVar(&outDir, "out", "", "where proposals are kept (default $XDG_STATE_HOME/loa/proposals)")
 	})
 	if err != nil {
 		return err
@@ -446,7 +446,7 @@ func cmdTriage(ctx context.Context, args []string) error {
 	}
 	queue := triage.Build(time.Now(), tasks, deps)
 
-	scratch, err := os.MkdirTemp("", "taskflow-triage-")
+	scratch, err := os.MkdirTemp("", "loa-triage-")
 	if err != nil {
 		return fmt.Errorf("triage: scratch dir: %w", err)
 	}
@@ -457,7 +457,7 @@ func cmdTriage(ctx context.Context, args []string) error {
 		return err
 	}
 
-	workspace, err := client.CreateWorkspace(ctx, scratch, "taskflow triage")
+	workspace, err := client.CreateWorkspace(ctx, scratch, "loa triage")
 	if err != nil {
 		return fmt.Errorf("triage: %w", err)
 	}
@@ -471,7 +471,7 @@ func cmdTriage(ctx context.Context, args []string) error {
 		}
 	}()
 
-	agentName := "tf-triage"
+	agentName := "loa-triage"
 	agentArgs := []string{"--no-session", "--tools", "read,grep,find,ls,write"}
 	if model != "" {
 		agentArgs = append(agentArgs, "--model", model)
@@ -507,7 +507,7 @@ func cmdTriage(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, "note: %s\n", note)
 	}
 	if len(doc.Tasks) > 0 || len(doc.Reprioritise) > 0 {
-		fmt.Fprintf(os.Stderr, "apply with: taskflow import %s\n", path)
+		fmt.Fprintf(os.Stderr, "apply with: loa import %s\n", path)
 	}
 	return nil
 }
@@ -515,13 +515,13 @@ func cmdTriage(ctx context.Context, args []string) error {
 // defaultProposalDir is where triage keeps what it proposes.
 func defaultProposalDir() string {
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "taskflow", "proposals")
+		return filepath.Join(dir, "loa", "proposals")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(os.TempDir(), "taskflow", "proposals")
+		return filepath.Join(os.TempDir(), "loa", "proposals")
 	}
-	return filepath.Join(home, ".local", "state", "taskflow", "proposals")
+	return filepath.Join(home, ".local", "state", "loa", "proposals")
 }
 
 // cmdImport applies a proposal. It is the only door through which a
@@ -761,7 +761,7 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags) (*runner.Runne
 		MaxTasks:    f.maxTasks,
 		LeaseTTL:    f.ttl,
 		TaskTimeout: f.timeout,
-		Logger:      log.New(os.Stderr, "taskflow: ", log.LstdFlags),
+		Logger:      log.New(os.Stderr, "loa: ", log.LstdFlags),
 	})
 }
 
@@ -785,7 +785,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
+	fmt.Fprintf(os.Stderr, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 	return nil
 }
 
@@ -849,7 +849,7 @@ func cmdDash(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
+		fmt.Fprintf(os.Stderr, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 		return nil
 	}
 

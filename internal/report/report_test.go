@@ -8,10 +8,10 @@ import (
 
 	"context"
 
-	"taskflow/internal/herdr"
-	"taskflow/internal/live"
-	"taskflow/internal/report"
-	"taskflow/internal/store"
+	"loa/internal/herdr"
+	"loa/internal/live"
+	"loa/internal/report"
+	"loa/internal/store"
 )
 
 func newStore(t *testing.T) *store.Store {
@@ -61,7 +61,7 @@ func day(t *testing.T) live.Snapshot {
 	}
 	// A measurable attempt, so the run time column means something.
 	time.Sleep(10 * time.Millisecond)
-	if err := s.Complete(ctx, done, "taskflow/1.1", "wrote the report"); err != nil {
+	if err := s.Complete(ctx, done, "loa/1.1", "wrote the report"); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if _, err := s.Lease(ctx, "run", time.Hour, now); err != nil {
@@ -97,7 +97,7 @@ func (f fakeSession) Workspaces(context.Context) ([]herdr.Workspace, error) {
 }
 
 func (f fakeSession) Agents(context.Context) ([]herdr.Agent, error) {
-	return []herdr.Agent{{Name: "tf-4-1", Status: "working", WorkspaceID: "w3"}}, nil
+	return []herdr.Agent{{Name: "loa-4-1", Status: "working", WorkspaceID: "w3"}}, nil
 }
 
 func TestBuildGroupsTheDay(t *testing.T) {
@@ -105,7 +105,7 @@ func TestBuildGroupsTheDay(t *testing.T) {
 	now := time.Now()
 	r := report.Build(snap, now.Add(-24*time.Hour), now)
 
-	if len(r.Done) != 1 || r.Done[0].Branch != "taskflow/1.1" {
+	if len(r.Done) != 1 || r.Done[0].Branch != "loa/1.1" {
 		t.Fatalf("done = %+v", r.Done)
 	}
 	if len(r.Blocked) != 1 || !strings.Contains(r.Blocked[0].Result, "which timer") {
@@ -115,7 +115,7 @@ func TestBuildGroupsTheDay(t *testing.T) {
 		t.Fatalf("queued = %+v", r.Queued)
 	}
 	// The queued tasks were added to the queue, but only one is the day's work.
-	if len(r.Open) != 1 || r.Open[0].Session != "w3 working tf-4-1" {
+	if len(r.Open) != 1 || r.Open[0].Session != "w3 working loa-4-1" {
 		t.Fatalf("open = %+v", r.Open)
 	}
 }
@@ -129,13 +129,13 @@ func TestTextRendersEverySectionAndTheGap(t *testing.T) {
 	for _, want := range []string{
 		"since ",
 		"done: 1",
-		"taskflow/1.1",
+		"loa/1.1",
 		"wrote the report",
 		"needs a human: 1",
 		"needs a decision: which timer?", // the failure reason is flattened to a line
 		"queued: 1",
 		"still open: 1",
-		"w3 working tf-4-1",
+		"w3 working loa-4-1",
 		"nothing has moved since",
 	} {
 		if !strings.Contains(text, want) {

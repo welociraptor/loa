@@ -1,9 +1,12 @@
-# taskflow
+# loa
 
 Task queue for a multi-agent daily workflow. The SQLite database is the only
 shared state: the runner leases one task at a time, hands it to an agent in a
 Herdr worktree workspace, and records the outcome. Agents never write to the
 store, so a crashed or misbehaving worker cannot corrupt the queue.
+
+Named for the loa of Gibson's *Count Zero*: a spirit that takes up residence in
+a host and works through it.
 
 ## The lease is the whole design
 
@@ -30,23 +33,23 @@ order, and a database newer than the binary is refused rather than opened.
 
 ```
 nix develop
-go build ./cmd/taskflow
+go build ./cmd/loa
 
-taskflow add -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:taskflow]... [-dep ID]...
-taskflow list [-status new]...
-taskflow show ID                      # fields, and why it is not running
-taskflow ps [-json]                   # the queue joined with the live session
-taskflow dash                         # the tab: state, and the keys to act on it
-taskflow report [-since 24h|-json]    # what the day did, and how long it has been still
-taskflow triage                       # ask an agent to propose work; never applies it
-taskflow import FILE [-dry-run]       # apply a proposal: tasks, and priority changes
-taskflow lease -owner runner-1 -ttl 1h    # prints the task as JSON, or null
-taskflow done ID -branch b/thing -result "shipped"
-taskflow fail ID -result "test suite red"
-taskflow run -workers 2 -max 5           # works the queue, inside Herdr
+loa add    -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:loa]... [-dep ID]...
+loa list   [-status new]...
+loa show   ID                      # fields, and why it is not running
+loa ps     [-json]                 # the queue joined with the live session
+loa dash                           # the tab: state, and the keys to act on it
+loa report [-since 24h|-json]      # what the day did, and how long it has been still
+loa triage                         # ask an agent to propose work; never applies it
+loa import FILE [-dry-run]         # apply a proposal: tasks, and priority changes
+loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
+loa done   ID -branch b/thing -result "shipped"
+loa fail   ID -result "test suite red"
+loa run    -workers 2 -max 5       # works the queue, inside Herdr
 ```
 
-`TASKFLOW_DB` selects the database (default `./taskflow.db`); every command
+`LOA_DB` selects the database (default `./loa.db`); every command
 also takes `-db`.
 
 Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
@@ -73,8 +76,8 @@ It has to be safe to interrupt and safe to run twice:
   exclusion domain: two leased tasks never share one, so two workers never
   fight over the same repository.
 - **Each attempt gets its own worktree workspace and branch**
-  (`taskflow/<id>.<attempt>`), branched from `-base`, labelled
-  `taskflow #<id>` so it can be found again. `herdr worktree remove` deletes the
+  (`loa/<id>.<attempt>`), branched from `-base`, labelled
+  `loa #<id>` so it can be found again. `herdr worktree remove` deletes the
   checkout and the workspace; the branch is the deliverable. Attempts that
   commit nothing also delete their branch, so a bad day does not litter the
   repository.
@@ -92,33 +95,33 @@ It has to be safe to interrupt and safe to run twice:
   answers an approval dialog; the human does, in that pane.
 - **Every run reconciles first.** A workspace whose recorded id belongs to a
   task nobody is holding is closed before new work starts; so is one labelled
-  `taskflow #N` that no row recorded, provided that task is not being worked on
+  `loa #N` that no row recorded, provided that task is not being worked on
   — the window a crashed run leaves behind. A workspace carrying an id recorded
   for a *different* task is left alone and logged: it was not this runner's to
   create, so removing it is not this runner's decision.
 - **The ids are recorded, not derived.** `workspace_id` and `pane_id` are written
   at dispatch and kept after the task finishes, so `ps` can say where an attempt
-  ran and reconciliation can prove it owns a workspace. The `taskflow #N` label
+  ran and reconciliation can prove it owns a workspace. The `loa #N` label
   is the fallback, not the authority.
 
 Defaults: `HEAD` as the base, and Herdr's own configuration decides where the
 checkout lives — the runner passes no `--path`, and reads the created path back
 from the result.
 
-`taskflow run` refuses to start outside a Herdr pane, and checks
+`loa run` refuses to start outside a Herdr pane, and checks
 `herdr status` first: a protocol or version mismatch fails the run before it
 does anything.
 
 ## The tab
 
-`taskflow dash` is a full-screen view of the queue joined with the session, and
+`loa dash` is a full-screen view of the queue joined with the session, and
 the only place a run is started from:
 
 ```
-taskflow  1 running  0 blocked  2 queued
+loa  1 running  0 blocked  2 queued
 
   ID   STATUS   WORKSPACE    SESSION            TITLE
-> 1    leased   nixos        w3 working tf-1-1  wire the report command
+> 1    leased   nixos        w3 working loa-1-1 wire the report command
   2    new      nixos        -                  needs a decision on the timer
   3    new      nixos        -                  bump the flake
 
@@ -134,9 +137,9 @@ Herdr already marks an agent that needs input.
 One tab, set up once:
 
 ```
-herdr workspace create --cwd "$XDG_STATE_HOME/taskflow" --label taskflow
+herdr workspace create --cwd "$XDG_STATE_HOME/loa" --label loa
 # then, in that workspace's root pane:
-TASKFLOW_DB="$XDG_STATE_HOME/taskflow/tasks.db" taskflow dash
+LOA_DB="$XDG_STATE_HOME/loa/tasks.db" loa dash
 ```
 
 Task worktrees are separate linked workspaces under the repository's own
@@ -144,16 +147,16 @@ workspace, so the tab is an index rather than a container.
 
 ## Proposals
 
-An agent may propose work; only a person applies it. `taskflow triage` writes the
+An agent may propose work; only a person applies it. `loa triage` writes the
 queue into a scratch directory (bodies included, dependencies resolved), runs a
 `read,grep,find,ls,write` agent there with no `bash`, and keeps whatever
-`proposal.json` comes back under `$XDG_STATE_HOME/taskflow/proposals/`. It never
+`proposal.json` comes back under `$XDG_STATE_HOME/loa/proposals/`. It never
 touches the queue.
 
 ```
-taskflow triage          # -> proposals/20261118T185722Z.json, plus its notes
-taskflow import -dry-run proposals/20261118T185722Z.json
-taskflow import proposals/20261118T185722Z.json
+loa triage          # -> proposals/20261118T185722Z.json, plus its notes
+loa import -dry-run proposals/20261118T185722Z.json
+loa import proposals/20261118T185722Z.json
 ```
 
 The document is the same shape in both directions:
@@ -174,13 +177,13 @@ document with one bad task creates nothing.
 
 ## The day
 
-`taskflow report` is the page to read after a day away, and it needs no model:
+`loa report` is the page to read after a day away, and it needs no model:
 
 ```
 since 2026-11-17T18:43:33Z, 24h0m0s ago
 
 done: 1
-  #1  add note.txt   taskflow/1.1   ran 16s   note.txt [taskflow/1.1 f640919] feat: add note.txt
+  #1  add note.txt   loa/1.1   ran 16s   note.txt [loa/1.1 f640919] feat: add note.txt
 
 queued: 1
   #2  decide the timer question
@@ -234,7 +237,7 @@ The gate cannot run Herdr, so the transport is a manual check after each Herdr
 upgrade:
 
 1. `herdr status` reports the same protocol the client was written against (22).
-2. One task end to end: `taskflow run -max 1` produces a branch, and its
+2. One task end to end: `loa run -max 1` produces a branch, and its
    workspace disappears.
 3. One blocked task: the agent waits for approval, the task fails naming the
    pane, and the workspace is still there to answer it in.
@@ -256,7 +259,7 @@ go test ./...
 `staticcheck`, `unused`, `revive`, `gocritic`, `errorlint`, `bodyclose`,
 `gosec` — named one at a time rather than via `standard`, so upgrading the
 linter cannot silently change what runs. `goimports` runs as the formatter with
-`taskflow` as a local prefix, so the module's own imports sit in their own
+`loa` as a local prefix, so the module's own imports sit in their own
 group. Exemptions are narrow and each has a reason:
 
 - errcheck ignores cleanup calls (`Close`, `Rollback`) on handles that are

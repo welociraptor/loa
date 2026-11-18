@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"taskflow/internal/taskspec"
+	"loa/internal/taskspec"
 )
 
 func parse(t *testing.T, doc string) taskspec.Apply {

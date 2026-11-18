@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"taskflow/internal/runner"
-	"taskflow/internal/store"
+	"loa/internal/runner"
+	"loa/internal/store"
 )
 
 // gitRun is for setup on the test goroutine.
@@ -47,7 +47,7 @@ func newRepo(t *testing.T, name string) string {
 	repo := filepath.Join(t.TempDir(), name)
 
 	gitRun(t, filepath.Dir(repo), "init", "-q", "-b", "main", repo)
-	gitRun(t, repo, "config", "user.name", "taskflow test")
+	gitRun(t, repo, "config", "user.name", "loa test")
 	gitRun(t, repo, "config", "user.email", "test@example.invalid")
 	gitRun(t, repo, "config", "commit.gpgsign", "false")
 
@@ -72,7 +72,7 @@ func newStore(t *testing.T) *store.Store {
 func addTask(t *testing.T, s *store.Store, task store.NewTask) *store.Task {
 	t.Helper()
 	if task.Workspace == "" {
-		task.Workspace = "taskflow"
+		task.Workspace = "loa"
 	}
 	id, err := s.Add(context.Background(), task)
 	if err != nil {
@@ -123,7 +123,7 @@ func newFakeBackend(t *testing.T, repo string) *fakeBackend {
 	}
 }
 
-func (f *fakeBackend) Label(taskID int64) string { return fmt.Sprintf("taskflow #%d", taskID) }
+func (f *fakeBackend) Label(taskID int64) string { return fmt.Sprintf("loa #%d", taskID) }
 
 func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Handle, error) {
 	f.mu.Lock()
@@ -281,7 +281,7 @@ func TestRunCompletesTaskThatCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status != store.Done || got.Branch != "taskflow/1.1" {
+	if got.Status != store.Done || got.Branch != "loa/1.1" {
 		t.Fatalf("task = %+v", got)
 	}
 	if !strings.Contains(got.Result, "did the thing") {
@@ -291,7 +291,7 @@ func TestRunCompletesTaskThatCommits(t *testing.T) {
 		t.Error("the workspace was left open after a successful task")
 	}
 	// The branch outlives the workspace; that is the deliverable.
-	gitRun(t, b.repo, "rev-parse", "--verify", "taskflow/1.1")
+	gitRun(t, b.repo, "rev-parse", "--verify", "loa/1.1")
 }
 
 func TestRunFailsWhenNothingIsCommitted(t *testing.T) {
@@ -320,7 +320,7 @@ func TestRunFailsWhenNothingIsCommitted(t *testing.T) {
 		t.Error("the workspace was left open after a failed task")
 	}
 	// An attempt that produced nothing leaves no branch behind.
-	if out, _ := gitE(b.repo, "branch", "--list", "taskflow/*"); strings.TrimSpace(out) != "" {
+	if out, _ := gitE(b.repo, "branch", "--list", "loa/*"); strings.TrimSpace(out) != "" {
 		t.Errorf("branches left behind: %s", out)
 	}
 }
@@ -329,7 +329,7 @@ func TestUnknownWorkspaceFailsTheTask(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	b := newFakeBackend(t, newRepo(t, "demo"))
-	b.openErr = errors.New(`no Herdr workspace is labelled "taskflow"`)
+	b.openErr = errors.New(`no Herdr workspace is labelled "loa"`)
 	task := addTask(t, s, store.NewTask{Title: "nowhere", Workspace: "nope"})
 
 	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {

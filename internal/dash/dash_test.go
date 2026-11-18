@@ -10,10 +10,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"taskflow/internal/dash"
-	"taskflow/internal/herdr"
-	"taskflow/internal/live"
-	"taskflow/internal/store"
+	"loa/internal/dash"
+	"loa/internal/herdr"
+	"loa/internal/live"
+	"loa/internal/store"
 )
 
 type fakeSession struct {
@@ -120,7 +120,7 @@ func seed(t *testing.T) (*store.Store, fakeSession, int64, int64) {
 
 	return s, fakeSession{
 		workspaces: []herdr.Workspace{{ID: "w1", Label: herdr.TaskLabel(running)}},
-		agents:     []herdr.Agent{{Name: "tf-1-1", Status: "blocked", WorkspaceID: "w1"}},
+		agents:     []herdr.Agent{{Name: "loa-1-1", Status: "blocked", WorkspaceID: "w1"}},
 	}, running, blocked
 }
 
@@ -182,7 +182,7 @@ func TestViewShowsLiveWorkFirst(t *testing.T) {
 	}
 	// The leased task is selected, and its session names the blocked agent.
 	rows := rowLines(m)
-	if len(rows) != 1 || !strings.Contains(rows[0], "running work") || !strings.Contains(rows[0], "w1 blocked tf-1-1") {
+	if len(rows) != 1 || !strings.Contains(rows[0], "running work") || !strings.Contains(rows[0], "w1 blocked loa-1-1") {
 		t.Fatalf("selected row = %v", rows)
 	}
 	for _, want := range []string{"needs a human", "waiting its turn", "enter focus", "q quit"} {
@@ -228,7 +228,7 @@ func TestXInterruptsTheAgentOfTheSelectedTask(t *testing.T) {
 	m := loaded(t, s, session, c)
 
 	run(t, mustCmd(t, m, key("x")))
-	if len(c.calls) != 1 || c.calls[0] != "interrupt tf-1-1" {
+	if len(c.calls) != 1 || c.calls[0] != "interrupt loa-1-1" {
 		t.Fatalf("calls = %v", c.calls)
 	}
 }

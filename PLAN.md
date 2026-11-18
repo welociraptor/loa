@@ -1,4 +1,4 @@
-# taskflow
+# loa
 
 Goal: a daily workflow where a deterministic runner drains a task queue by
 handing one task at a time to an agent in its own worktree, and where the result
@@ -14,7 +14,7 @@ is something to look at rather than a timeout to interpret.
 
 ## Where things stand
 
-    cmd/taskflow/main.go        444   add | list | show | lease | done | fail | run
+    cmd/loa/main.go             444   add | list | show | lease | done | fail | run
     internal/store/store.go     440   lease, deps, scopes, retries
     internal/store/explain.go   121   deps, blockers ("why is this not running")
     internal/store/migrate.go   119   numbered, transactional migrations
@@ -80,7 +80,7 @@ What that buys:
 - **Blocked becomes visible.** `agent prompt` rejects an agent that is waiting
   at an approval dialog, and `agent wait --until blocked` reports it. The task
   fails with the pane named, and the human answers the dialog in the pane.
-  Herdr already marks an agent that needs input; taskflow does not duplicate
+  Herdr already marks an agent that needs input; loa does not duplicate
   that with its own alerts.
 - **The worktree code goes away.** No `git worktree add`, no stale registration
   recovery, no pruning. That machinery moves into the tool that owns it.
@@ -107,7 +107,7 @@ What it costs, and why the trade still holds:
 ## Constraints
 
 - **One dependency:** `modernc.org/sqlite`. Pure Go, no cgo, static binary.
-- **One binary:** the runner and the dashboard are `taskflow` subcommands, not
+- **One binary:** the runner and the dashboard are `loa` subcommands, not
   separate services, and the dashboard *is* where a run starts.
 - **Three dependencies:** `modernc.org/sqlite`, and `github.com/charmbracelet/bubbletea`
   for the tab — a real TUI framework rather than hand-rolled raw mode, which
@@ -155,7 +155,7 @@ there is one command that says "this is green".
   before opening; an existing file's mode is left alone. Test:
   `TestDatabaseIsCreatedOwnerOnly`, `TestExistingDatabaseModeIsLeftAlone`.
 
-- [x] **3. `taskflow show ID`.** "Why is nothing running?" was a `sqlite3`
+- [x] **3. `loa show ID`.** "Why is nothing running?" was a `sqlite3`
   session, because dependencies were enforced but not readable.
   `store.Blockers` explains a task in the claim predicate's own terms (leased,
   done, blocked, retry delay, unfinished dependency, contending scope) and
@@ -185,7 +185,7 @@ there is one command that says "this is green".
 - [x] **7. `staticcheck`.** Superseded by `golangci-lint` 2.15 in the dev shell
   plus `.golangci.yml`, listing the linters one at a time instead of `standard`:
   errcheck, govet, ineffassign, staticcheck, unused, revive, gocritic, errorlint,
-  bodyclose, gosec; `goimports` as the formatter with `taskflow` as a local
+  bodyclose, gosec; `goimports` as the formatter with `loa` as a local
   import prefix. Clean today. Exemptions, each commented: errcheck on discarded
   handles, gosec `G104` (covered by errcheck) and `G204` (no shell), one
   `//nolint` where only SQL placeholders are concatenated. It runs inside the
@@ -215,7 +215,7 @@ here.
   test spawns a child that a naive kill leaves behind.
 - `golangci-lint` in the sandbox needs `GOLANGCI_LINT_CACHE` exported inside
   `checkPhase`; as a derivation attribute the path is not shell-expanded.
-- `taskflow show` needed deps to be readable. Dependencies were enforced in SQL
+- `loa show` needed deps to be readable. Dependencies were enforced in SQL
   but invisible, so explaining a stalled queue meant opening `sqlite3`.
 - `gosec` flags `os.OpenFile` on the database path (`G304`) and every
   `fmt.Fprintf` in a writer chain (`errcheck`). The former is a `//nolint` with
@@ -229,7 +229,7 @@ dispatch rewrite, so the logic kept its coverage while the real transport was
 written and checked by hand against a live session.
 
 - [x] **10. A task knows its workspace.** Migration `0002_task_workspace.sql`
-  adds `workspace TEXT NOT NULL DEFAULT ''`; `taskflow add -workspace LABEL`
+  adds `workspace TEXT NOT NULL DEFAULT ''`; `loa add -workspace LABEL`
   requires it, `list` shows it, `show` prints it. A workspace is a **label**, not
   an id: `w1` is an opaque handle that means nothing to a human writing a task,
   and it is not the human's to type. Resolution happens at dispatch, exact
@@ -237,7 +237,7 @@ written and checked by hand against a live session.
   `repo:` stops meaning "where the code is" — that comes from the workspace.
   It stays a contention scope, so existing tasks keep working; the `repo:` name
   check remains for that role. Test: a task with `repo:demo` and workspace
-  `taskflow` is rejected when no workspace carries that label;
+  `loa` is rejected when no workspace carries that label;
   `TestBlockersAgreeWithLease` grew no case: the claim predicate deliberately
   ignores the workspace, so a task with an unset one is still leased and then
   fails at dispatch, which is visible. `show` prints `workspace: (unset)`.
@@ -264,7 +264,7 @@ written and checked by hand against a live session.
 
 - [x] **13. Dispatch rewrite.** For each leased task: resolve the label to a
   workspace id; `worktree create --workspace <id> --path <dir>/<id>.<n>
-  --branch taskflow/<id>.<n> --base <ref> --label "taskflow #<id>" --no-focus`;
+  --branch loa/<id>.<n> --base <ref> --label "loa #<id>" --no-focus`;
   `agent start tf-<id>-<n> --kind pi --pane <root pane> -- <agent args>` (retried
   while the pane is not ready); `agent prompt tf-<id>-<n> <prompt> --wait
   --timeout <ms>`. Success is still `git rev-list --count <base>..HEAD`, with
@@ -275,7 +275,7 @@ written and checked by hand against a live session.
   rejected because the agent is already waiting) becomes `runner.ErrBlocked`.
   The runner fails the task with the workspace id and pane in `result`, leaves
   the workspace open, and does not interrupt it. The human answers the dialog
-  and finishes with `taskflow done`/`taskflow fail`; the next run's
+  and finishes with `loa done`/`loa fail`; the next run's
   reconciliation closes whatever is left over. Test:
   `TestBlockedAgentIsLeftForTheHuman` asserts no close and no interrupt.
 
@@ -283,7 +283,7 @@ written and checked by hand against a live session.
   --force` both deletes the checkout and closes the workspace (measured, not
   assumed); if it fails, the workspace is closed on its own so at least the pane
   disappears. Never `--group`. At the start of a run, any workspace labelled
-  `taskflow #N` whose task is missing, finished, or holding an expired lease is
+  `loa #N` whose task is missing, finished, or holding an expired lease is
   closed. Test: `TestReconcileClosesOrphanWorkspacesOnly` — an orphan is closed,
   a leased task's workspace is not. *(Superseded in part by step 18: what
   shipped is the label scan; the ownership check arrives with the stored ids.)*
@@ -331,7 +331,7 @@ written and checked by hand against a live session.
 ### Starting a run
 
 Decision: no timer. A run starts when a human starts it — `s` in the dashboard,
-or `taskflow run` in any pane. Three reasons, in order of weight:
+or `loa run` in any pane. Three reasons, in order of weight:
 
 1. The failure mode that matters is a blocked agent, and that needs a person.
    A scheduler delivers work to nobody.
@@ -357,7 +357,7 @@ reconciliation decides what it may close. A task's live state is joined as:
 | what | from |
 |---|---|
 | the row | the store, which is authoritative about status |
-| the workspace | `workspace_id` stored at dispatch; the `taskflow #N` label when the column is empty |
+| the workspace | `workspace_id` stored at dispatch; the `loa #N` label when the column is empty |
 | the agent | `agent list` by `workspace_id`; its `name` and `agent_status` are decoration |
 
 - [x] **18. Own the workspaces.** `0003_task_workspace_ids.sql` adds
@@ -384,7 +384,7 @@ reconciliation decides what it may close. A task's live state is joined as:
   `TestDispatchRecordsTheWorkspaceItOwns`, `TestUnrecordableWorkspaceIsLeftAlone`,
   and `TestReconcileClosesOnlyWhatItOwns` — five cases, one per rule above.
 
-- [x] **19. `taskflow ps`.** One read that answers what is running: each task's
+- [x] **19. `loa ps`.** One read that answers what is running: each task's
   store state, its workspace (from `workspace_id`, or from the label when the
   column is empty), and the agent Herdr reports in it (`working`, `idle`,
   `blocked`, `done`, `unknown`). One `agent list` and one `workspace list` per
@@ -407,7 +407,7 @@ reconciliation decides what it may close. A task's live state is joined as:
   recorded id whose workspace is gone reads "closed", which is why storing ids
   was worth doing: the alternative was claiming the attempt never ran.
 
-- [x] **20. `taskflow dash`.** Full screen in one pane. Raw mode and the window
+- [x] **20. `loa dash`.** Full screen in one pane. Raw mode and the window
   size come from `golang.org/x/term`; everything else is plain ANSI. Rows sort
   by what is live first: leased, then blocked, then new by priority, then the
   day's finished work collapsed to a count. Redraw on a one-second tick and
@@ -451,8 +451,8 @@ reconciliation decides what it may close. A task's live state is joined as:
   stopping a run leaves the in-flight task leased and expiring on its own.
 
 - [x] **23. The tab.** Documented, not coded: create the control workspace once
-  (`herdr workspace create --cwd $XDG_STATE_HOME/taskflow --label taskflow`),
-  run `taskflow dash` in its root pane, and leave it open. Task worktrees are
+  (`herdr workspace create --cwd $XDG_STATE_HOME/loa --label loa`),
+  run `loa dash` in its root pane, and leave it open. Task worktrees are
   linked worktree workspaces under the repository's own workspace, so the
   dashboard is an index rather than a container — closing a task's workspace
   never touches the tab. `README.md` carries the sequence, and a live check
@@ -461,7 +461,7 @@ reconciliation decides what it may close. A task's live state is joined as:
 
 ## Phase 4 — oversight (done)
 
-- [x] **24. `taskflow report`.** Deterministic, no model: what was completed,
+- [x] **24. `loa report`.** Deterministic, no model: what was completed,
   failed, blocked and left new since a given time; the branch of each finished
   task; the workspace of anything left open; and the gap — how long since
   anything was leased, so an unsupervised week is visible rather than silent.
@@ -489,7 +489,7 @@ reconciliation decides what it may close. A task's live state is joined as:
 
 ## Phase 5 — triage (done)
 
-- [x] **26. `taskflow import [FILE|-]`.** Read a proposal, validate it whole,
+- [x] **26. `loa import [FILE|-]`.** Read a proposal, validate it whole,
   apply it in one transaction or not at all. The boundary exists so an agent can
   *propose* work without the ability to write the queue directly. `internal/taskspec`
   parses strictly (unknown fields are rejected, not ignored) and resolves `after`
@@ -504,12 +504,12 @@ reconciliation decides what it may close. A task's live state is joined as:
   `TestValidateRequiresWorkspaceAndSaneNumbers`,
   `TestApplyCreatesTheBatchInOneTransaction`, `TestApplyRollsBackWhenAnyPartFails`,
   plus CLI tests for apply, refusal and dry run.
-- [x] **27. Triage agent.** `taskflow triage` writes the queue — bodies, states,
+- [x] **27. Triage agent.** `loa triage` writes the queue — bodies, states,
   dependencies — into a scratch directory, opens a workspace there, starts an
   agent with `read,grep,find,ls,write` (no `bash`) and the instruction to write
   `proposal.json`, then validates what came back and keeps it under
-  `$XDG_STATE_HOME/taskflow/proposals/`. It never applies anything: the queue is
-  only touched by `taskflow import`, and only when a person runs it. A blocked
+  `$XDG_STATE_HOME/loa/proposals/`. It never applies anything: the queue is
+  only touched by `loa import`, and only when a person runs it. A blocked
   agent is left open with its workspace named, as with a task.
 
   Live check on a two-task queue it had never seen: it split a task whose title
