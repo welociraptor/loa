@@ -2,28 +2,36 @@
 
 Goal: a daily workflow where a deterministic runner drains a task queue by
 handing one task at a time to an agent in its own worktree, and where the result
-of a day is legible afterwards without reading logs.
+of a day is legible afterwards without reading logs — including while it is
+running, from the terminal the human already has open.
 
 The store is the only shared state. Agents never write to it, so a confused
 worker can waste its own attempt and nothing else.
 
+Execution is Herdr: the runner itself lives in a pane, and each task becomes a
+worktree-backed workspace with one agent in it, so a stalled or blocked worker
+is something to look at rather than a timeout to interpret.
+
 ## Where things stand
 
-    cmd/taskflow/main.go        403   add | list | show | lease | done | fail | run
-    internal/store/store.go     435   lease, deps, scopes, retries
+    cmd/taskflow/main.go        444   add | list | show | lease | done | fail | run
+    internal/store/store.go     440   lease, deps, scopes, retries
     internal/store/explain.go   121   deps, blockers ("why is this not running")
     internal/store/migrate.go   119   numbered, transactional migrations
-    internal/store/migrations/   46   0001_initial.sql
-    internal/runner/runner.go   343   rounds, worktrees, judgement
-    internal/runner/agent.go     78   Agent interface + pi, process-group kill
+    internal/store/migrations/   57   0001_initial.sql, 0002_task_workspace.sql
+    internal/herdr/client.go    337   typed CLI client; JSON is the contract
+    internal/runner/runner.go   314   rounds, judgement, reconciliation
+    internal/runner/backend.go   63   Backend interface (the seam the fake sits on)
+    internal/runner/herdr_backend.go 207   resolve, worktree, agent, blocked, close
+    internal/runner/git.go       80   commit count, screen-to-summary
     internal/runner/prompt.go    34
-    tests                     1,505   37 tests, `-race` clean
+    tests                     1,674   49 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
-sandbox, so the gate is one command on a clean machine. Verified end to end with
-a fake `pi` on disk: lease → worktree → agent → commit check → done → worktree
-removed, branch kept. Verified the argv reaching `pi`, recovery from a stale
-worktree registration, and that a timed-out worker's children die with it.
+sandbox, so the gate is one command on a clean machine. Verified end to end in a
+live Herdr session: lease → worktree workspace → agent started and prompted →
+commit check → done → workspace closed, branch kept. Thrice, two of them with a
+real `pi` agent writing and committing a file.
 
 Invariants that have tests behind them:
 
@@ -39,18 +47,81 @@ Invariants that have tests behind them:
 - a database is created owner-only and an existing mode is never narrowed;
 - a migration applies once, in order, and a newer database is refused.
 
+Everything above survives the change below. What changes is where the agent
+runs and who owns the worktree.
+
+## Why the runner moves into Herdr
+
+The runner was built headless: `pi --print` in a worktree it created itself,
+output captured to memory, the process group killed on timeout. That is the
+right shape for a timer and the wrong shape for a human who wants to watch. A
+worker mid-flight is invisible until it exits; a worker waiting at an approval
+dialog looks exactly like a worker that hung; and the worktree handling was
+`exec git` code in this repository duplicating something Herdr already does.
+
+Herdr (0.9.5, protocol 22) already owns the parts that were hand-rolled:
+
+| need | Herdr |
+|---|---|
+| a worktree per task | `worktree create --workspace --cwd --branch --base --path --label` |
+| a place for the agent | the root pane the worktree comes with |
+| start / prompt / observe | `agent start\|prompt\|read\|wait` with `working`, `idle`, `blocked`, `done` |
+| stop | `agent send-keys ctrl+c`, then `workspace close` |
+| a human view | the tab bar; the pane is right there |
+
+What that buys:
+
+- **Blocked becomes visible.** `agent prompt` rejects an agent that is waiting
+  at an approval dialog, and `agent wait --until blocked` reports it. The task
+  fails with the pane named, and the human answers the dialog in the pane.
+  Herdr already marks an agent that needs input; taskflow does not duplicate
+  that with its own alerts.
+- **The worktree code goes away.** No `git worktree add`, no stale registration
+  recovery, no pruning. That machinery moves into the tool that owns it.
+- **A worker can be watched, not reconstructed.** No `--print` transcript to
+  read after the fact; the terminal is the record, and one tab indexes the rest
+  (Phase 3).
+- **Nothing is exec'd from task text.** The task names a *workspace label*;
+  Herdr resolves it to a directory. A label that matches nothing fails the
+  task. No path from task text reaches a filesystem call, so the `repo:`
+  name validation added in Phase 1 stops being the only line of defence.
+
+What it costs, and why the trade still holds:
+
+- The flake gate can no longer exercise the real transport: no Herdr session
+  exists inside a Nix sandbox. The runner logic stays under test behind an
+  interface; the thin Herdr client is verified by hand, once per Herdr upgrade
+  (step 17).
+- Herdr's CLI JSON becomes a contract. Version skew is now a failure mode that
+  did not exist, so the runner checks `herdr status` before it does anything.
+- The runner can leave state behind — workspaces, panes, agents — where a
+  subprocess could not. That state is not merely garbage: it is the point. It
+  still has to be reconciled (step 15).
+
 ## Constraints
 
 - **One dependency:** `modernc.org/sqlite`. Pure Go, no cgo, static binary.
-- **One binary:** the runner is a `taskflow` subcommand, not a second service.
+- **One binary:** the runner and the dashboard are `taskflow` subcommands, not
+  separate services, and the dashboard *is* where a run starts.
+- **Two dependencies:** `modernc.org/sqlite`, and `golang.org/x/term` for raw
+  mode and window size. No TUI framework: the view is a pure function and the
+  ANSI is ours.
+- **One run at a time per dashboard.** The queue would survive two, but the
+  budget would be spent twice.
 - **The queue is the contract:** every rule above is enforced in SQL, not in Go
   call ordering, so a second process cannot bypass it.
+- **Herdr is the execution substrate.** The runner does not exec agents and
+  does not create worktrees. Herdr's state is a cache of the queue, never the
+  other way round: a task's fate is decided by its branch, not by an agent
+  saying `done`.
+- **Never `workspace close --group`.** The worktree workspace is linked to the
+  primary one it came from; `--group` would close the human's project.
 - **`nixpkgs` unstable** for Go and the shell; `go.mod` pins the toolchain
   version that the shell provides.
 
-## Phase 1 — quality gate
+## Phase 1 — quality gate (done)
 
-Nothing below adds a feature. The point is to make the existing surface safe to
+Nothing here added a feature. The point was to make the existing surface safe to
 build on: the schema can change again, the failure paths are exercised, and
 there is one command that says "this is green".
 
@@ -107,7 +178,9 @@ there is one command that says "this is green".
 - [x] **8. Process-group kill.** The agent is started with `Setpgid` and
   cancellation kills the group (`procgroup_unix.go`), so a worker's dev server
   or test run dies with it. Test: the fake agent spawns a `sleep`, the timeout
-  fires, and the child pid no longer exists.
+  fires, and the child pid no longer exists. *Retired by step 16*: once the
+  agent lives in a pane, killing its process group is Herdr's business, not
+  ours.
 
 - [x] **9. Written threat model.** `README.md` now has "What bounds a worker,
   and what does not": the worktree, allowlist, no-push and scope rules on one
@@ -116,8 +189,9 @@ there is one command that says "this is green".
 
 ### Your additions
 
-Anything else you want in the gate before Phase 2 starts. Nothing here until
-you list it.
+The two things you added to this plan — run inside Herdr, and one tab that shows
+the state and starts the run — are Phase 2 and Phase 3. Further additions go
+here.
 
 ### What the gate found
 
@@ -132,50 +206,246 @@ you list it.
   the reason "the caller chose this path"; the latter was a real signal —
   `show` now builds its lines and writes them once.
 
-## Phase 2 — make it a daily thing
+## Phase 2 — run inside Herdr (done)
 
-- [ ] **10. Timer.** A user service running `taskflow run` on a daily calendar,
-  with the database in `$XDG_STATE_HOME/taskflow/tasks.db` and journald output.
-  Depends on 6: the unit should run the store-path binary, not `go run`.
-- [ ] **11. `taskflow report`.** Deterministic, no model: what was completed,
-  failed, blocked and left new since a given time, plus the branch of each
-  finished task. The reporter *agent* is then only for prose, and the daily
-  summary still exists on the day the model is unavailable.
-- [ ] **12. Spend visibility.** `-max` caps tasks per run, but not cost. Record
-  the agent invocation's wall time per task in the store (one column, `runs`
-  table if it earns its keep), so the first week shows what a day actually
-  costs before any budget logic is designed.
+The order mattered: the backend interface and the fake existed before the
+dispatch rewrite, so the logic kept its coverage while the real transport was
+written and checked by hand against a live session.
 
-## Phase 3 — triage
+- [x] **10. A task knows its workspace.** Migration `0002_task_workspace.sql`
+  adds `workspace TEXT NOT NULL DEFAULT ''`; `taskflow add -workspace LABEL`
+  requires it, `list` shows it, `show` prints it. A workspace is a **label**, not
+  an id: `w1` is an opaque handle that means nothing to a human writing a task,
+  and it is not the human's to type. Resolution happens at dispatch, exact
+  match only, ambiguity or no match is a task failure with a clear message.
+  `repo:` stops meaning "where the code is" — that comes from the workspace.
+  It stays a contention scope, so existing tasks keep working; the `repo:` name
+  check remains for that role. Test: a task with `repo:demo` and workspace
+  `taskflow` is rejected when no workspace carries that label;
+  `TestBlockersAgreeWithLease` grew no case: the claim predicate deliberately
+  ignores the workspace, so a task with an unset one is still leased and then
+  fails at dispatch, which is visible. `show` prints `workspace: (unset)`.
+  `TestAddRoundTrip` pins the round trip and `TestAddRejectsBlankFields` the
+  rejection.
 
-- [ ] **13. `taskflow import FILE`.** Read tasks from JSON, validate scopes and
-  dependencies, create nothing on any error. The boundary exists so an agent
-  can *propose* work without the ability to write the queue directly.
-- [ ] **14. Triage agent.** Read-only allowlist, runs before the workers, writes
+- [x] **11. `internal/herdr`.** A thin typed client over the CLI: `Status`,
+  `Workspaces`, `Agents`, `CreateWorktree`, `RemoveWorktree`, `CloseWorkspace`,
+  `StartAgent`, `Prompt`, `Read`, `Wait`, `SendKeys`. Structs for the JSON, no
+  interpretation, and a server-reported failure comes back as `*herdr.Error`
+  with its code (`agent_blocked`, `agent_not_found`, …) so callers switch on a
+  code rather than on text. Every call passes `--no-focus`. `Panes` was written
+  and then removed: it existed only to discover a workspace's checkout, which
+  Herdr resolves itself. Test: eleven tests drive a fake `herdr` binary with
+  recorded output from `testdata/`, which pins argument construction and
+  decoding together.
+
+- [x] **12. A `Backend` interface and a fake.** (Named `Backend` rather than
+  `Session`: it places one task's work, it is not one task's conversation.)
+  `Open`, `Prompt`, `Read`, `Interrupt`, `Close`, `Label`, `TaskWorkspaces`. The
+  fake makes real git worktrees in a temp directory, so runner tests still
+  exercise rounds, scopes, commit judgement, blocked handling and cleanup —
+  fourteen tests, no Herdr needed.
+
+- [x] **13. Dispatch rewrite.** For each leased task: resolve the label to a
+  workspace id; `worktree create --workspace <id> --path <dir>/<id>.<n>
+  --branch taskflow/<id>.<n> --base <ref> --label "taskflow #<id>" --no-focus`;
+  `agent start tf-<id>-<n> --kind pi --pane <root pane> -- <agent args>` (retried
+  while the pane is not ready); `agent prompt tf-<id>-<n> <prompt> --wait
+  --timeout <ms>`. Success is still `git rev-list --count <base>..HEAD`, with
+  `<base>` read from the fresh worktree — the branch starts there, so `HEAD` is
+  the base before the agent runs.
+
+- [x] **14. A blocked agent is the human's.** `agent_blocked` (and a prompt
+  rejected because the agent is already waiting) becomes `runner.ErrBlocked`.
+  The runner fails the task with the workspace id and pane in `result`, leaves
+  the workspace open, and does not interrupt it. The human answers the dialog
+  and finishes with `taskflow done`/`taskflow fail`; the next run's
+  reconciliation closes whatever is left over. Test:
+  `TestBlockedAgentIsLeftForTheHuman` asserts no close and no interrupt.
+
+- [x] **15. Cleanup and reconciliation.** `worktree remove --workspace <id>
+  --force` both deletes the checkout and closes the workspace (measured, not
+  assumed); if it fails, the workspace is closed on its own so at least the pane
+  disappears. Never `--group`. At the start of a run, any workspace labelled
+  `taskflow #N` whose task is missing, finished, or holding an expired lease is
+  closed. Test: `TestReconcileClosesOrphanWorkspacesOnly` — an orphan is closed,
+  a leased task's workspace is not.
+
+- [x] **16. Retire the subprocess backend.** `Pi`, `killProcessGroup`,
+  `procgroup_*.go`, `repoFor`/`checkRepoName`, `addWorktree`/`removeWorktree`,
+  the `-repos` and `-pi` flags: gone. The allowlist moves to `agent start --`.
+  Two git calls survive, deliberately: the commit count (the judgement) and
+  `git branch --delete` for a branch whose attempt committed nothing — the
+  runner asked Herdr for that branch name, so it cleans it up. Tests:
+  `TestRunFailsWhenNothingIsCommitted` asserts no branch is left behind.
+
+- [x] **17. Keep the gate honest.** Recorded JSON in
+  `internal/herdr/testdata/` covers every shape the client parses, so a server
+  change breaks the gate rather than a run. `README.md` carries the manual
+  checklist (protocol match, one task end to end, one blocked task) for the part
+  a sandbox cannot reach. Test: `nix flake check` passes with no Herdr present.
+
+### What Phase 2 found, live
+
+- **`--workspace` and `--cwd` are mutually exclusive.** The first real run
+  failed with a usage error (exit 2, not 1, and the message is on stderr as
+  plain text, not as an error document). The client now passes the workspace
+  only, and Herdr resolves the repository.
+- **`worktree remove` closes its workspace too**, so cleanup is one call. A
+  failed agent is interrupted first, because removing the checkout from under a
+  working process is not a stop.
+- **A worktree's base is the commit it starts at.** Reading `HEAD` in the fresh
+  worktree is simpler and safer than resolving the ref in the source checkout
+  and carrying it across.
+- **`agent read` is a screen, not a transcript.** The first stored result was
+  the whole pi TUI: skills banner, prompt, box drawing, status bar. `SummaryOf`
+  drops decoration and keeps the last dozen lines, which is where the agent's
+  own words are. The status bar still leaks in; fitting a summariser to one
+  agent's TUI is not worth more.
+- **A failed task delays its retry by 30 minutes**, so a re-run after fixing the
+  transport found an empty queue and did nothing. That is `not_before` working
+  as designed, and it is why the live check adds a fresh task instead of
+  retrying.
+
+### Starting a run
+
+Decision: no timer. A run starts when a human starts it — `s` in the dashboard,
+or `taskflow run` in any pane. Three reasons, in order of weight:
+
+1. The failure mode that matters is a blocked agent, and that needs a person.
+   A scheduler delivers work to nobody.
+2. A session started by a unit is a session the human is not looking at, which
+   is the exact problem the dashboard exists to solve.
+3. "Daily" is a habit plus a legible record, not an alarm clock.
+
+What it costs: a forgotten day is a day with no work done, and nothing says so
+until someone looks. `report` (step 23) covers that by naming the gap —
+"nothing leased since Tuesday" is a finding, and it is the right place for it.
+Revisit only if the workflow stops being supervised.
+
+## Phase 3 — the dashboard
+
+The tab answers one question — what is running, and where is it — and every key
+on it is a call that already exists. Nothing here adds policy to the queue, and
+nothing here alerts: Herdr already marks an agent that needs input.
+
+- [ ] **18. `taskflow ps`.** One read that answers what is running: each task's
+  store state plus, when leased, the agent name
+  (`tf-<id>-<n>`), its worktree workspace, and the state Herdr reports
+  (`working`, `idle`, `blocked`, `done`, `unknown`). One `agent list` and one
+  `workspace list` per refresh, joined in Go — never one CLI call per row.
+  `--json` feeds the dashboard and `report`; the table is for a shell. Test: a
+  fake client returns a leased task with a `blocked` agent and a leased task
+  with no agent; the first row says blocked and names the pane, the second says
+  "no agent". With Herdr absent, `ps` still prints the store half and marks the
+  session column "unavailable", because the queue is the truth.
+
+- [ ] **19. `taskflow dash`.** Full screen in one pane. Raw mode and the window
+  size come from `golang.org/x/term`; everything else is plain ANSI. Rows sort
+  by what is live first: leased, then blocked, then new by priority, then the
+  day's finished work collapsed to a count. Redraw on a one-second tick and
+  after every action. It shows state and never announces it. Test: the renderer
+  is a pure `(rows, selection, size) → string` function, tested for sort order,
+  selection at both edges, and 80×24 versus 200×50.
+
+- [ ] **20. Actions.** `enter` focuses the task's agent or workspace (`agent
+  focus`, `workspace focus`); `x` interrupts a working agent (`send-keys
+  ctrl+c`); `s`/`S` start and stop a run; `d`/`f` complete or fail the selected
+  task with a one-line result prompt; `c` closes the task's workspace; `u`
+  unblocks. Adding tasks stays in the CLI: a form in a TUI is not worth the
+  keys. `u` needs one new store method — `Unblock`: blocked → new,
+  `not_before` cleared, attempts kept. It buys exactly one more attempt,
+  because the next lease increments the counter and a second failure blocks
+  again. Test: `Unblock` makes a blocked task claimable once, and failing it
+  re-blocks; no other key writes to the store.
+
+- [ ] **21. One run at a time.** The dashboard starts the runner in a goroutine
+  with a cancel function. The UI never holds a lease or a transaction, and the
+  store's single connection serialises the short statements, so a running task
+  does not freeze the table. A second `s` while a run is in flight is refused
+  and says so, rather than queued or duplicated. Test: the refusal, and that
+  stopping a run leaves the in-flight task leased and expiring on its own.
+
+- [ ] **22. The tab.** Documented, not coded: create the control workspace once
+  (`herdr workspace create --cwd $XDG_STATE_HOME/taskflow --label taskflow`),
+  run `taskflow dash` in its root pane, and leave it open. Task worktrees are
+  linked worktree workspaces under the repository's own workspace, so the
+  dashboard is an index rather than a container — closing a task's workspace
+  never touches the tab. Test: the README sequence, followed from scratch,
+  reaches a drawn dashboard in one step.
+
+## Phase 4 — oversight
+
+- [ ] **23. `taskflow report`.** Deterministic, no model: what was completed,
+  failed, blocked and left new since a given time; the branch of each finished
+  task; the workspace of anything left open; and the gap — how long since
+  anything was leased, so an unsupervised week is visible rather than silent.
+  The reporter *agent* is then only for prose, and the daily summary still
+  exists on the day the model is unavailable. Test: a fabricated queue and
+  session render the four sections, including the empty-day case.
+
+- [ ] **24. Spend visibility.** `-max` caps tasks per run, but not cost. Record
+  each agent invocation's wall time in the store (one column, `runs` table if
+  it earns its keep), so the first week shows what a day actually costs before
+  any budget logic is designed. The dashboard's count line is the natural place
+  to read it.
+
+## Phase 5 — triage
+
+- [ ] **25. `taskflow import FILE`.** Read tasks from JSON, validate workspace,
+  scopes and dependencies, create nothing on any error. The boundary exists so
+  an agent can *propose* work without the ability to write the queue directly.
+- [ ] **26. Triage agent.** Read-only allowlist, runs before the workers, writes
   a proposal file: reorder priorities, split oversized tasks, flag what needs a
   human, never touch `body` of an existing task. Human approval stays manual
   until the proposals have been boring for a week.
 
 ## Not planned, on purpose
 
+- **No timer, no daemon, no scheduler.** A run is something a person starts,
+  and the dashboard is where they start it.
+- **No second execution backend.** Herdr is the only way a task runs. A headless
+  path would double every failure mode to save one attach.
+- **No web UI.** The dashboard is a pane because the workers are panes; a
+  browser tab would be further from the work than the terminal already is.
+- **No worktrees created by the runner.** Anything that touches `git worktree`
+  belongs in Herdr, where the stale-registration bug is already someone else's.
 - **No agent-to-agent messaging.** Coordination goes through the queue; two
   agents talking is a plan living in a context window, which is what this
   design exists to avoid.
+- **No answering approval dialogs.** A blocked agent is the human's decision,
+  and the dashboard makes it a two-second one.
 - **No LLM scheduler.** Priority, dependency and scope rules are SQL.
 - **No push, no merge, no branch deletion by an agent.** The runner keeps
   branches; a human merges them.
 - **No retry storms.** `not_before` is a fixed delay, not exponential backoff —
-  a daily timer makes the difference invisible and the simpler rule is the one
-  that stays correct.
+  the simpler rule is the one that stays correct.
 
 ## Known limitations
 
-- A hung agent is killed at `-timeout`, but its *children* are not (step 8).
-- Cost is visible only as wall time (step 12); tokens are not counted.
-- Only one host. Two runners pointed at the same database file would work, but
-  the worktrees would collide by path; nothing prevents it.
-- The queue removes a task from circulation after `max_attempts` without any
-  notification; a blocked task is found by `report` (step 11) or `show`
-  (step 3), not pushed to a human.
-- `repo:` scopes name a directory under `-repos`. A task that genuinely spans
-  two repositories has to be split by hand.
+- **Nothing runs unless someone starts it.** A missed day is a real gap; step
+  23 reports it, but nothing reminds you beforehand.
+- **The dashboard is one terminal and one user.** `report-metadata` is
+  display-only, and there is no remote view.
+- **Herdr is a dependency of the run.** Version skew is checked at startup
+  (`herdr status`, protocol 22 today) but not pinned: an upgrade that changes
+  `agent prompt` flags will fail a run before it damages one.
+- **Focus actions need a live session.** `ps` and `dash` still show the queue
+  without Herdr; only the actions that address a pane are disabled.
+- **Leftover state is possible.** A runner that dies between `worktree create`
+  and cleanup leaves a workspace open. Step 15 reconciles that at the next
+  start, so the residue is one tab, not a stuck queue.
+- **A blocked task waits for a human indefinitely.** That is the design: the
+  run does not answer dialogs, and the lease keeps the task claimed until it
+  expires.
+- **The real transport is not in the gate.** Its JSON is (step 17); its
+  behaviour with a live Herdr is a manual checklist.
+- **Cost is visible only as wall time** (step 24); tokens are not counted.
+- **One Herdr session.** Two runners in two sessions pointed at one database
+  would each lease distinct tasks and create their own worktrees, so they no
+  longer collide by path — but nothing stops that configuration from being a
+  surprise.
+- **The queue blocks a task after `max_attempts` without notifying anyone.** It
+  is found by `report` (step 23) or by the dashboard's blocked row — both of
+  which require someone to look.
+

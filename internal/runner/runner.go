@@ -1,6 +1,7 @@
-// Package runner turns the task store into work: lease a task, give it a
-// worktree and an agent, judge the result from the repository rather than from
-// what the agent claims, and record the outcome.
+// Package runner turns the task store into work: lease a task, hand it to a
+// backend that opens a worktree workspace with an agent in it, judge the result
+// from the repository rather than from what the agent claims, and record the
+// outcome.
 package runner
 
 import (
@@ -10,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,13 +23,12 @@ import (
 // a task.
 type Config struct {
 	Store        *store.Store
-	Agent        Agent
-	ReposDir     string // directory holding the checkouts a repo: scope names
-	WorktreeDir  string // where per-task worktrees are created
-	Base         string // commit or ref each worktree branches from
+	Backend      Backend
+	Worktrees    string // where task worktrees are created
+	Base         string // ref each worktree branches from
 	BranchPrefix string
 	Workers      int
-	MaxTasks     int           // tasks per run, i.e. the daily budget when run from a timer
+	MaxTasks     int           // tasks per run, i.e. the budget for one run
 	LeaseTTL     time.Duration // must exceed TaskTimeout
 	TaskTimeout  time.Duration
 	Logger       *log.Logger
@@ -55,18 +54,17 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("runner: no store")
 	}
-	if cfg.Agent == nil {
-		return nil, errors.New("runner: no agent")
+	if cfg.Backend == nil {
+		return nil, errors.New("runner: no backend")
 	}
-
 	var err error
-	if cfg.ReposDir, err = filepath.Abs(cfg.ReposDir); err != nil {
-		return nil, fmt.Errorf("runner: repos dir: %w", err)
+	if cfg.Worktrees == "" {
+		return nil, errors.New("runner: no worktree directory")
 	}
-	if cfg.WorktreeDir == "" {
-		cfg.WorktreeDir = defaultWorktreeDir()
+	if cfg.Worktrees, err = filepath.Abs(cfg.Worktrees); err != nil {
+		return nil, fmt.Errorf("runner: worktree dir: %w", err)
 	}
-	if cfg.WorktreeDir, err = filepath.Abs(cfg.WorktreeDir); err != nil {
+	if err := os.MkdirAll(cfg.Worktrees, 0o700); err != nil {
 		return nil, fmt.Errorf("runner: worktree dir: %w", err)
 	}
 	if cfg.Base == "" {
@@ -96,10 +94,6 @@ func New(cfg Config) (*Runner, error) {
 		cfg.Logger = log.New(os.Stderr, "runner: ", log.LstdFlags)
 	}
 
-	if err := os.MkdirAll(cfg.WorktreeDir, 0o700); err != nil {
-		return nil, fmt.Errorf("runner: worktree dir: %w", err)
-	}
-
 	host, err := os.Hostname()
 	if err != nil {
 		host = "runner"
@@ -112,23 +106,15 @@ func New(cfg Config) (*Runner, error) {
 	}, nil
 }
 
-func defaultWorktreeDir() string {
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "taskflow", "worktrees")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "taskflow", "worktrees")
-	}
-	return filepath.Join(home, ".local", "state", "taskflow", "worktrees")
-}
-
 // Run works the queue until it is empty or MaxTasks is spent. Each round leases
 // as many runnable tasks as it has workers and runs them concurrently, so a
 // task freed by a finishing sibling is picked up by the next round instead of
 // being missed by a worker that already gave up.
 func (r *Runner) Run(ctx context.Context) (Stats, error) {
 	var stats Stats
+
+	// Whatever a previous, dead run left open is closed before new work starts.
+	r.reconcile(ctx, time.Now())
 
 	for stats.Tasks < r.cfg.MaxTasks {
 		if err := ctx.Err(); err != nil {
@@ -191,63 +177,127 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		r.log.Printf("task %d: "+format, append([]any{task.ID}, args...)...)
 	}
 
-	repo, err := repoFor(task)
+	if strings.TrimSpace(task.Workspace) == "" {
+		return r.fail(ctx, task, "no workspace: a task needs -workspace LABEL to be dispatched")
+	}
+
+	handle, err := r.cfg.Backend.Open(ctx, OpenRequest{
+		TaskID:         task.ID,
+		Attempt:        task.Attempts,
+		WorkspaceLabel: task.Workspace,
+		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
+		WorktreePath:   filepath.Join(r.cfg.Worktrees, fmt.Sprintf("%d.%d", task.ID, task.Attempts)),
+		Base:           r.cfg.Base,
+		AgentName:      fmt.Sprintf("tf-%d-%d", task.ID, task.Attempts),
+	})
 	if err != nil {
 		return r.fail(ctx, task, err.Error())
 	}
-	repoPath := filepath.Join(r.cfg.ReposDir, repo)
+	logf("working in %s on %s (workspace %s, agent %s)",
+		handle.Worktree, handle.Branch, handle.WorkspaceID, handle.AgentName)
 
-	base, err := gitOutput(ctx, repoPath, "rev-parse", "--verify", r.cfg.Base+"^{commit}")
-	if err != nil {
-		return r.fail(ctx, task, "cannot resolve base: "+err.Error())
-	}
-
-	worktree, branch, err := r.addWorktree(ctx, repoPath, task)
-	if err != nil {
-		return r.fail(ctx, task, "cannot create worktree: "+err.Error())
-	}
-	logf("working in %s on %s", worktree, branch)
-
+	// The prompt is bounded twice: the backend's own wait, and this context, so a
+	// backend that ignores its timeout still cannot hold the run.
 	taskCtx, cancel := context.WithTimeout(ctx, r.cfg.TaskTimeout)
-	defer cancel()
+	promptErr := r.cfg.Backend.Prompt(taskCtx, handle, prompt(task, handle.Worktree, handle.Repo, handle.Branch), r.cfg.TaskTimeout)
+	cancel()
 
-	output, runErr := r.cfg.Agent.Run(taskCtx, worktree, prompt(task, worktree, repo, branch))
+	// A blocked agent is waiting for a person. Leave the pane alone; closing it
+	// would take away the thing they are being asked about.
+	blocked := errors.Is(promptErr, ErrBlocked)
+	if blocked {
+		logf("blocked: leaving workspace %s open for a human", handle.WorkspaceID)
+		return r.fail(ctx, task, fmt.Sprintf("%v (workspace %s, pane %s)", promptErr, handle.WorkspaceID, handle.PaneID))
+	}
 
 	// The agent's own summary cannot tell success from failure; the branch can.
 	// It is read even after a failed run, because a worker that crashed after
 	// committing has left work worth keeping.
-	commits, gitErr := commitsAhead(ctx, worktree, base)
+	commits, gitErr := commitsAhead(ctx, handle.Worktree, handle.Base)
+	output, _ := r.cfg.Backend.Read(ctx, handle, 100)
+	summary := SummaryOf(output, 12)
 
-	// Clean up before judging the task: the checkout is scratch space, but the
-	// branch is the output. An attempt that produced no commit leaves no branch
-	// behind, so a queue that fails all day does not litter the repository.
-	r.removeWorktree(repoPath, worktree)
-	if gitErr == nil && commits == 0 {
-		r.deleteBranch(repoPath, branch)
-	}
-
-	if runErr != nil {
-		return r.fail(ctx, task, runErr.Error())
+	if promptErr != nil {
+		r.stopAndClose(handle, logf)
+		return r.fail(ctx, task, promptErr.Error()+"\n"+summary)
 	}
 	if gitErr != nil {
+		r.stopAndClose(handle, logf)
 		return r.fail(ctx, task, "cannot inspect the worktree: "+gitErr.Error())
 	}
+
+	// Clean up before judging: the checkout is scratch space, the branch is the
+	// output. An attempt that produced no commit leaves no branch behind, so a
+	// queue that fails all day does not litter the repository.
+	r.stopAndClose(handle, logf)
 	if commits == 0 {
-		return r.fail(ctx, task, "finished without committing: "+Tail(strings.TrimSpace(output), 800))
+		if err := deleteBranch(ctx, handle.Repo, handle.Branch); err != nil {
+			logf("branch %s kept: %v", handle.Branch, err)
+		}
+		return r.fail(ctx, task, "finished without committing: "+summary)
 	}
 
-	if err := r.cfg.Store.Complete(ctx, task.ID, branch, Tail(strings.TrimSpace(output), 4000)); err != nil {
+	if err := r.cfg.Store.Complete(ctx, task.ID, handle.Branch, summary); err != nil {
 		return r.record(task, err)
 	}
-	logf("done: %s (%d commit(s))", branch, commits)
+	logf("done: %s (%d commit(s))", handle.Branch, commits)
 	return outcome{ok: true}
+}
+
+// stopAndClose interrupts the agent and removes its workspace. Cleanup uses its
+// own context so a cancelled run still tidies up.
+func (r *Runner) stopAndClose(handle Handle, logf func(string, ...any)) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	if err := r.cfg.Backend.Interrupt(ctx, handle); err != nil {
+		logf("interrupt %s: %v", handle.AgentName, err)
+	}
+	if err := r.cfg.Backend.Close(ctx, handle); err != nil {
+		logf("close workspace %s: %v", handle.WorkspaceID, err)
+	}
+}
+
+// reconcile closes task workspaces nobody is holding any more. It replaces the
+// stale-worktree pruning the subprocess runner needed: the residue is visible in
+// the session, so it can be tidied up on the way in instead of guessed at.
+func (r *Runner) reconcile(ctx context.Context, now time.Time) {
+	spaces, err := r.cfg.Backend.TaskWorkspaces(ctx)
+	if err != nil {
+		r.log.Printf("reconcile: %v", err)
+		return
+	}
+	for _, space := range spaces {
+		if r.held(ctx, space.TaskID, now) {
+			continue
+		}
+		if err := r.cfg.Backend.Close(ctx, Handle{TaskID: space.TaskID, WorkspaceID: space.WorkspaceID}); err != nil {
+			r.log.Printf("reconcile: close %s: %v", space.WorkspaceID, err)
+			continue
+		}
+		r.log.Printf("reconcile: closed workspace %s for task %d", space.WorkspaceID, space.TaskID)
+	}
+}
+
+// held reports whether a task's lease is still good. When in doubt it answers
+// yes: closing a live worker's pane is worse than leaving a tab behind.
+func (r *Runner) held(ctx context.Context, taskID int64, now time.Time) bool {
+	task, err := r.cfg.Store.Get(ctx, taskID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		r.log.Printf("reconcile: task %d: %v", taskID, err)
+		return true
+	}
+	return task.Status == store.Leased && task.LeaseExpiry.After(now)
 }
 
 // fail charges a failure to the task: the store decides whether it is retried
 // or blocked.
 func (r *Runner) fail(ctx context.Context, task *store.Task, reason string) outcome {
-	r.log.Printf("task %d: failed: %s", task.ID, Tail(reason, 500))
-	if err := r.cfg.Store.Fail(ctx, task.ID, Tail(reason, 4000)); err != nil {
+	r.log.Printf("task %d: failed: %s", task.ID, tail(reason, 500))
+	if err := r.cfg.Store.Fail(ctx, task.ID, tail(reason, 4000)); err != nil {
 		return r.record(task, err)
 	}
 	return outcome{}
@@ -261,98 +311,4 @@ func (r *Runner) record(task *store.Task, err error) outcome {
 		return outcome{}
 	}
 	return outcome{err: fmt.Errorf("runner: task %d: %w", task.ID, err)}
-}
-
-func repoFor(task *store.Task) (string, error) {
-	var repos []string
-	for _, scope := range task.Scopes {
-		name, ok := strings.CutPrefix(scope, "repo:")
-		if !ok {
-			continue
-		}
-		if err := checkRepoName(name); err != nil {
-			return "", err
-		}
-		repos = append(repos, name)
-	}
-
-	switch len(repos) {
-	case 0:
-		return "", errors.New("no repo: scope, so there is nothing to work on")
-	case 1:
-		return repos[0], nil
-	default:
-		return "", fmt.Errorf("several repo: scopes (%s), expected exactly one", strings.Join(repos, ", "))
-	}
-}
-
-// checkRepoName keeps a scope from naming a path outside ReposDir. Task text is
-// often machine-authored, so it is treated as untrusted input.
-func checkRepoName(name string) error {
-	if name == "" || name == "." || name == ".." ||
-		strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
-		return fmt.Errorf("repo scope %q is not a plain repository name", name)
-	}
-	return nil
-}
-
-func (r *Runner) addWorktree(ctx context.Context, repoPath string, task *store.Task) (path, branch string, err error) {
-	attempt := fmt.Sprintf("%d.%d", task.ID, task.Attempts)
-	branch = r.cfg.BranchPrefix + attempt
-	path = filepath.Join(r.cfg.WorktreeDir, filepath.Base(repoPath)+"-"+attempt)
-
-	// A crash can leave the directory and its registration behind; git refuses
-	// to reuse the path until the registration is pruned.
-	if err := os.RemoveAll(path); err != nil {
-		return "", "", err
-	}
-	if _, err := gitOutput(ctx, repoPath, "worktree", "prune"); err != nil {
-		return "", "", err
-	}
-	if _, err := gitOutput(ctx, repoPath, "worktree", "add", "-b", branch, path, r.cfg.Base); err != nil {
-		// A cancelled or killed git leaves the directory and, depending on how
-		// far it got, a registration behind. Neither is useful to anyone.
-		r.removeWorktree(repoPath, path)
-		return "", "", err
-	}
-	return path, branch, nil
-}
-
-// removeWorktree deletes the checkout and, when git cannot do that alone, the
-// directory and the registration separately. It is called on the happy path and
-// after failures, including a worktree that was never fully created.
-func (r *Runner) removeWorktree(repoPath, path string) {
-	// Cleanup must happen even when the run was cancelled.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	_, err := gitOutput(ctx, repoPath, "worktree", "remove", "--force", path)
-	if err == nil {
-		return
-	}
-	r.log.Printf("worktree %s: git could not remove it (%v), cleaning up by hand", path, err)
-
-	if err := os.RemoveAll(path); err != nil {
-		r.log.Printf("worktree %s kept: %v", path, err)
-	}
-	if _, err := gitOutput(ctx, repoPath, "worktree", "prune"); err != nil {
-		r.log.Printf("worktree %s: prune failed: %v", path, err)
-	}
-}
-
-func (r *Runner) deleteBranch(repoPath, branch string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	if _, err := gitOutput(ctx, repoPath, "branch", "--delete", "--force", branch); err != nil {
-		r.log.Printf("branch %s kept: %v", branch, err)
-	}
-}
-
-func commitsAhead(ctx context.Context, worktree, base string) (int, error) {
-	out, err := gitOutput(ctx, worktree, "rev-list", "--count", base+"..HEAD")
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(out)
 }

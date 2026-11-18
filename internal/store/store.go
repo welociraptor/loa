@@ -45,6 +45,7 @@ type Task struct {
 	ID          int64
 	Title       string
 	Body        string
+	Workspace   string // Herdr workspace label; resolved to an id at dispatch
 	Status      Status
 	Priority    int
 	Attempts    int
@@ -61,12 +62,13 @@ type Task struct {
 
 // NewTask is the caller-supplied part of a task.
 type NewTask struct {
-	Title    string
-	Body     string
-	Priority int
-	MaxTries int
-	Scopes   []string
-	Deps     []int64
+	Title     string
+	Body      string
+	Workspace string
+	Priority  int
+	MaxTries  int
+	Scopes    []string
+	Deps      []int64
 }
 
 // Store is the queue. It owns one SQLite connection so that writers in this
@@ -149,6 +151,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 	if strings.TrimSpace(t.Title) == "" {
 		return 0, errors.New("store: task title is required")
 	}
+	if strings.TrimSpace(t.Workspace) == "" {
+		return 0, errors.New("store: task workspace is required")
+	}
 
 	now := formatTime(time.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -158,9 +163,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (title, body, priority, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		t.Title, t.Body, t.Priority, maxTries(t.MaxTries), now, now)
+		`INSERT INTO tasks (title, body, workspace, priority, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.Title, t.Body, t.Workspace, t.Priority, maxTries(t.MaxTries), now, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: add: %w", err)
 	}
@@ -199,7 +204,7 @@ func maxTries(n int) int {
 	return n
 }
 
-const taskColumns = `id, title, body, status, priority, attempts, max_attempts,
+const taskColumns = `id, title, body, workspace, status, priority, attempts, max_attempts,
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
@@ -217,7 +222,7 @@ type scanner interface {
 func scanTask(sc scanner) (*Task, error) {
 	t := Task{}
 	var status, created, updated, expiry, notBefore string
-	err := sc.Scan(&t.ID, &t.Title, &t.Body, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
+	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

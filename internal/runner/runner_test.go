@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -20,47 +19,44 @@ import (
 	"taskflow/internal/store"
 )
 
-type fakeAgent struct {
-	fn func(ctx context.Context, dir, prompt string) (string, error)
-}
-
-func (f fakeAgent) Run(ctx context.Context, dir, prompt string) (string, error) {
-	return f.fn(ctx, dir, prompt)
-}
-
-func runCmd(t *testing.T, dir, name string, args ...string) {
+// gitRun is for setup on the test goroutine.
+func gitRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	out, err := gitE(dir, args...)
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
 	}
+	return out
 }
 
-// newRepo returns a parent directory holding a repository called name with one
-// commit on main.
+// gitE is safe to call from the backend, which runs on worker goroutines.
+func gitE(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// newRepo returns a repository called name with one commit on main.
 func newRepo(t *testing.T, name string) string {
 	t.Helper()
-	root := t.TempDir()
-	repo := filepath.Join(root, name)
+	repo := filepath.Join(t.TempDir(), name)
 
-	runCmd(t, root, "git", "init", "-q", "-b", "main", repo)
-	runCmd(t, repo, "git", "config", "user.name", "taskflow test")
-	runCmd(t, repo, "git", "config", "user.email", "test@example.invalid")
-	runCmd(t, repo, "git", "config", "commit.gpgsign", "false")
+	gitRun(t, filepath.Dir(repo), "init", "-q", "-b", "main", repo)
+	gitRun(t, repo, "config", "user.name", "taskflow test")
+	gitRun(t, repo, "config", "user.email", "test@example.invalid")
+	gitRun(t, repo, "config", "commit.gpgsign", "false")
 
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	runCmd(t, repo, "git", "add", "-A")
-	runCmd(t, repo, "git", "commit", "-q", "-m", "init")
-	return root
-}
-
-func commitAll(t *testing.T, dir, message string) {
-	t.Helper()
-	runCmd(t, dir, "git", "add", "-A")
-	runCmd(t, dir, "git", "commit", "-q", "-m", message)
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "init")
+	return repo
 }
 
 func newStore(t *testing.T) *store.Store {
@@ -73,13 +69,160 @@ func newStore(t *testing.T) *store.Store {
 	return s
 }
 
-func newRunner(t *testing.T, s *store.Store, reposDir string, agent runner.Agent, mutate func(*runner.Config)) *runner.Runner {
+func addTask(t *testing.T, s *store.Store, task store.NewTask) *store.Task {
+	t.Helper()
+	if task.Workspace == "" {
+		task.Workspace = "taskflow"
+	}
+	id, err := s.Add(context.Background(), task)
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	got, err := s.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	return got
+}
+
+// fakeBackend is a session stand-in: it makes real git worktrees so commit
+// judgement is real, and lets each test decide what the agent does.
+type fakeBackend struct {
+	mu        sync.Mutex
+	repo      string
+	worktrees string
+
+	// openErr makes Open fail, as an unresolvable workspace label does.
+	openErr error
+	// agent runs in the worktree; it returns the text the agent finished with.
+	agent func(ctx context.Context, dir string) (string, error)
+	// orphans are workspaces the backend reports as existing for tasks.
+	orphans []runner.TaskWorkspace
+
+	opened      map[string]string // workspace id → worktree path
+	closed      map[string]bool
+	interrupted []string
+	opens       []runner.OpenRequest
+	output      map[string]string
+}
+
+func newFakeBackend(t *testing.T, repo string) *fakeBackend {
+	t.Helper()
+	return &fakeBackend{
+		repo:      repo,
+		worktrees: filepath.Join(t.TempDir(), "unused"),
+		agent: func(context.Context, string) (string, error) {
+			return "", nil
+		},
+		opened: map[string]string{},
+		closed: map[string]bool{},
+		output: map[string]string{},
+	}
+}
+
+func (f *fakeBackend) Label(taskID int64) string { return fmt.Sprintf("taskflow #%d", taskID) }
+
+func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Handle, error) {
+	f.mu.Lock()
+	f.opens = append(f.opens, req)
+	err := f.openErr
+	f.mu.Unlock()
+	if err != nil {
+		return runner.Handle{}, err
+	}
+
+	base, err := gitE(f.repo, "rev-parse", "--verify", req.Base+"^{commit}")
+	if err != nil {
+		return runner.Handle{}, err
+	}
+	path := req.WorktreePath
+	if _, err := gitE(f.repo, "worktree", "add", "-b", req.Branch, path, base); err != nil {
+		return runner.Handle{}, err
+	}
+
+	workspace := fmt.Sprintf("w%d", req.TaskID)
+	f.mu.Lock()
+	f.opened[workspace] = path
+	f.mu.Unlock()
+
+	return runner.Handle{
+		TaskID:      req.TaskID,
+		AgentName:   req.AgentName,
+		WorkspaceID: workspace,
+		PaneID:      workspace + ":p1",
+		Worktree:    path,
+		Repo:        f.repo,
+		Base:        base,
+		Branch:      req.Branch,
+	}, nil
+}
+
+func (f *fakeBackend) Prompt(ctx context.Context, h runner.Handle, _ string, _ time.Duration) error {
+	f.mu.Lock()
+	agent := f.agent
+	f.mu.Unlock()
+
+	out, err := agent(ctx, h.Worktree)
+	f.mu.Lock()
+	f.output[h.WorkspaceID] = out
+	f.mu.Unlock()
+	return err
+}
+
+func (f *fakeBackend) Read(_ context.Context, h runner.Handle, _ int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.output[h.WorkspaceID], nil
+}
+
+func (f *fakeBackend) Interrupt(_ context.Context, h runner.Handle) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.interrupted = append(f.interrupted, h.WorkspaceID)
+	return nil
+}
+
+func (f *fakeBackend) Close(_ context.Context, h runner.Handle) error {
+	f.mu.Lock()
+	path, ok := f.opened[h.WorkspaceID]
+	f.closed[h.WorkspaceID] = true
+	f.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	_, err := gitE(f.repo, "worktree", "remove", "--force", path)
+	return err
+}
+
+func (f *fakeBackend) TaskWorkspaces(context.Context) ([]runner.TaskWorkspace, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.orphans, nil
+}
+
+func (f *fakeBackend) wasClosed(workspace string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed[workspace]
+}
+
+func (f *fakeBackend) wasInterrupted(workspace string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range f.interrupted {
+		if id == workspace {
+			return true
+		}
+	}
+	return false
+}
+
+func newRunner(t *testing.T, s *store.Store, b runner.Backend, mutate func(*runner.Config)) *runner.Runner {
 	t.Helper()
 	cfg := runner.Config{
 		Store:       s,
-		Agent:       agent,
-		ReposDir:    reposDir,
-		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"),
+		Backend:     b,
+		Worktrees:   filepath.Join(t.TempDir(), "worktrees"),
 		Workers:     2,
 		MaxTasks:    10,
 		LeaseTTL:    time.Hour,
@@ -96,38 +239,31 @@ func newRunner(t *testing.T, s *store.Store, reposDir string, agent runner.Agent
 	return r
 }
 
-func addTask(t *testing.T, s *store.Store, task store.NewTask) *store.Task {
-	t.Helper()
-	id, err := s.Add(context.Background(), task)
-	if err != nil {
-		t.Fatalf("add: %v", err)
+// committer writes a file and commits it, which is what a successful worker
+// leaves behind.
+func committer(_ *testing.T) func(context.Context, string) (string, error) {
+	return func(_ context.Context, dir string) (string, error) {
+		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
+			return "", err
+		}
+		if _, err := gitE(dir, "add", "-A"); err != nil {
+			return "", err
+		}
+		if _, err := gitE(dir, "commit", "-q", "-m", "work"); err != nil {
+			return "", err
+		}
+		return "did the thing", nil
 	}
-	got, err := s.Get(context.Background(), id)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	return got
 }
 
 func TestRunCompletesTaskThatCommits(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = committer(t)
+	task := addTask(t, s, store.NewTask{Title: "add a file", Body: "make it"})
 
-	var sawDir, sawPrompt string
-	agent := fakeAgent{fn: func(_ context.Context, dir, p string) (string, error) {
-		sawDir, sawPrompt = dir, p
-		if err := os.WriteFile(filepath.Join(dir, "out.txt"), []byte("done\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "add out.txt")
-		return "wrote out.txt", nil
-	}}
-
-	task := addTask(t, s, store.NewTask{Title: "add out.txt", Body: "make the file", Scopes: []string{"repo:demo"}})
-	r := newRunner(t, s, repos, agent, nil)
-
-	stats, err := r.Run(ctx)
+	stats, err := newRunner(t, s, b, nil).Run(ctx)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -139,131 +275,137 @@ func TestRunCompletesTaskThatCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status != store.Done {
-		t.Fatalf("status = %s, want done", got.Status)
+	if got.Status != store.Done || got.Branch != "taskflow/1.1" {
+		t.Fatalf("task = %+v", got)
 	}
-	if got.Branch != "taskflow/1.1" {
-		t.Errorf("branch = %q, want taskflow/1.1", got.Branch)
-	}
-	if !strings.Contains(got.Result, "wrote out.txt") {
+	if !strings.Contains(got.Result, "did the thing") {
 		t.Errorf("result = %q", got.Result)
 	}
-
-	if !strings.Contains(sawPrompt, "add out.txt") || !strings.Contains(sawPrompt, sawDir) {
-		t.Errorf("prompt did not describe the task and its worktree: %q", sawPrompt)
+	if !b.wasClosed("w1") {
+		t.Error("the workspace was left open after a successful task")
 	}
-	// The agent works in its own checkout, and the branch outlives it.
-	if filepath.Dir(sawDir) == repos {
-		t.Errorf("agent ran in the main checkout: %s", sawDir)
-	}
-	if _, err := os.Stat(sawDir); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("worktree %s was not removed", sawDir)
-	}
-	runCmd(t, filepath.Join(repos, "demo"), "git", "rev-parse", "--verify", "taskflow/1.1")
+	// The branch outlives the workspace; that is the deliverable.
+	gitRun(t, b.repo, "rev-parse", "--verify", "taskflow/1.1")
 }
 
 func TestRunFailsWhenNothingIsCommitted(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = func(context.Context, string) (string, error) { return "looked around", nil }
+	task := addTask(t, s, store.NewTask{Title: "explore"})
 
-	agent := fakeAgent{fn: func(context.Context, string, string) (string, error) {
-		return "I had a look around and changed nothing", nil
-	}}
-	task := addTask(t, s, store.NewTask{Title: "explore", Scopes: []string{"repo:demo"}})
-
-	if _, err := newRunner(t, s, repos, agent, nil).Run(ctx); err != nil {
+	stats, err := newRunner(t, s, b, nil).Run(ctx)
+	if err != nil {
 		t.Fatalf("run: %v", err)
+	}
+	if stats.Failed != 1 {
+		t.Errorf("stats = %+v", stats)
 	}
 
 	got, err := s.Get(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status != store.New {
-		t.Errorf("status = %s, want new (retryable)", got.Status)
+	if got.Status != store.New || !strings.Contains(got.Result, "without committing") {
+		t.Errorf("task = %+v", got)
 	}
-	if !strings.Contains(got.Result, "without committing") {
-		t.Errorf("result = %q", got.Result)
+	if !b.wasClosed("w1") {
+		t.Error("the workspace was left open after a failed task")
 	}
-	// The abandoned attempt leaves no branch behind.
-	if out, err := exec.Command("git", "-C", filepath.Join(repos, "demo"), "branch", "--list", "taskflow/*").Output(); err != nil {
-		t.Fatalf("list branches: %v", err)
-	} else if len(strings.TrimSpace(string(out))) != 0 {
+	// An attempt that produced nothing leaves no branch behind.
+	if out, _ := gitE(b.repo, "branch", "--list", "taskflow/*"); strings.TrimSpace(out) != "" {
 		t.Errorf("branches left behind: %s", out)
 	}
 }
 
-func TestRunRejectsUnusableRepoNames(t *testing.T) {
+func TestUnknownWorkspaceFailsTheTask(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.openErr = errors.New(`no Herdr workspace is labelled "taskflow"`)
+	task := addTask(t, s, store.NewTask{Title: "nowhere", Workspace: "nope"})
 
-	agent := fakeAgent{fn: func(context.Context, string, string) (string, error) {
-		t.Error("agent ran for a task it should have rejected")
-		return "", nil
-	}}
-	r := newRunner(t, s, repos, agent, nil)
-
-	cases := map[string]string{
-		"no repo scope": "no repo: scope",
-		"escaping name": "not a plain repository name",
-		"several repos": "expected exactly one",
-	}
-	tasks := map[string]*store.Task{
-		"no repo scope": addTask(t, s, store.NewTask{Title: "a", Scopes: []string{"docs"}}),
-		"escaping name": addTask(t, s, store.NewTask{Title: "b", Scopes: []string{"repo:../../etc"}}),
-		"several repos": addTask(t, s, store.NewTask{Title: "c", Scopes: []string{"repo:demo", "repo:other"}}),
-	}
-
-	if _, err := r.Run(ctx); err != nil {
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
-	}
-	for name, want := range cases {
-		got, err := s.Get(ctx, tasks[name].ID)
-		if err != nil {
-			t.Fatalf("get: %v", err)
-		}
-		if !strings.Contains(got.Result, want) {
-			t.Errorf("%s: result = %q, want it to mention %q", name, got.Result, want)
-		}
-	}
-}
-
-func TestRunRecordsAgentError(t *testing.T) {
-	ctx := context.Background()
-	repos := newRepo(t, "demo")
-	s := newStore(t)
-
-	agent := fakeAgent{fn: func(context.Context, string, string) (string, error) {
-		return "", errors.New("model exploded")
-	}}
-	task := addTask(t, s, store.NewTask{Title: "doomed", Scopes: []string{"repo:demo"}})
-
-	stats, err := newRunner(t, s, repos, agent, nil).Run(ctx)
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if stats != (runner.Stats{Tasks: 1, Failed: 1}) {
-		t.Errorf("stats = %+v", stats)
 	}
 	got, err := s.Get(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status != store.New || !strings.Contains(got.Result, "model exploded") {
-		t.Errorf("task = %+v", got)
+	if !strings.Contains(got.Result, "no Herdr workspace is labelled") {
+		t.Errorf("result = %q", got.Result)
+	}
+}
+
+func TestBlockedAgentIsLeftForTheHuman(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = func(context.Context, string) (string, error) {
+		return "waiting for approval", runner.ErrBlocked
+	}
+	task := addTask(t, s, store.NewTask{Title: "needs a decision"})
+
+	stats, err := newRunner(t, s, b, nil).Run(ctx)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if stats.Failed != 1 {
+		t.Errorf("stats = %+v", stats)
+	}
+
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(got.Result, "w1") || !strings.Contains(got.Result, "w1:p1") {
+		t.Errorf("result does not name the pane: %q", got.Result)
+	}
+	if b.wasClosed("w1") {
+		t.Error("a blocked task's workspace was torn down; the human needs it")
+	}
+	if b.wasInterrupted("w1") {
+		t.Error("a blocked agent was interrupted instead of left waiting")
+	}
+}
+
+func TestPromptFailureStopsAndCloses(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = func(context.Context, string) (string, error) {
+		return "", errors.New("timeout after 45000ms")
+	}
+	task := addTask(t, s, store.NewTask{Title: "slow"})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(got.Result, "timeout") {
+		t.Errorf("result = %q", got.Result)
+	}
+	if !b.wasInterrupted("w1") {
+		t.Error("a failed agent was left running")
+	}
+	if !b.wasClosed("w1") {
+		t.Error("a failed workspace was left open")
 	}
 }
 
 func TestSharedScopeSerialisesExecution(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
 
+	commit := committer(t)
 	var mu sync.Mutex
 	active, peak := 0, 0
-	agent := fakeAgent{fn: func(_ context.Context, dir, _ string) (string, error) {
+	b.agent = func(ctx context.Context, dir string) (string, error) {
 		mu.Lock()
 		active++
 		if active > peak {
@@ -275,20 +417,15 @@ func TestSharedScopeSerialisesExecution(t *testing.T) {
 			active--
 			mu.Unlock()
 		}()
-
 		time.Sleep(20 * time.Millisecond)
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "work")
-		return "done", nil
-	}}
+		return commit(ctx, dir)
+	}
 
 	scope := []string{"repo:demo"}
 	addTask(t, s, store.NewTask{Title: "one", Scopes: scope})
 	addTask(t, s, store.NewTask{Title: "two", Scopes: scope})
 
-	r := newRunner(t, s, repos, agent, func(c *runner.Config) { c.Workers = 4 })
+	r := newRunner(t, s, b, func(c *runner.Config) { c.Workers = 4 })
 	stats, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -303,24 +440,15 @@ func TestSharedScopeSerialisesExecution(t *testing.T) {
 
 func TestRoundsPickUpTasksFreedBySiblings(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = committer(t)
 
-	agent := fakeAgent{fn: func(_ context.Context, dir, _ string) (string, error) {
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "work")
-		return "done", nil
-	}}
-
-	// Two tasks contend for the same scope, and a third waits on the first.
 	first := addTask(t, s, store.NewTask{Title: "first", Scopes: []string{"repo:demo"}})
 	addTask(t, s, store.NewTask{Title: "sibling", Scopes: []string{"repo:demo"}})
 	addTask(t, s, store.NewTask{Title: "dependent", Scopes: []string{"repo:demo"}, Deps: []int64{first.ID}})
 
-	// One worker at a time forces the queue to be re-examined between rounds.
-	r := newRunner(t, s, repos, agent, func(c *runner.Config) { c.Workers = 1 })
+	r := newRunner(t, s, b, func(c *runner.Config) { c.Workers = 1 })
 	stats, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -332,22 +460,15 @@ func TestRoundsPickUpTasksFreedBySiblings(t *testing.T) {
 
 func TestMaxTasksIsABudget(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
-
-	agent := fakeAgent{fn: func(_ context.Context, dir, _ string) (string, error) {
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "work")
-		return "done", nil
-	}}
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = committer(t)
 
 	for i := 0; i < 5; i++ {
-		addTask(t, s, store.NewTask{Title: "task", Scopes: []string{"repo:demo"}})
+		addTask(t, s, store.NewTask{Title: "task"})
 	}
 
-	r := newRunner(t, s, repos, agent, func(c *runner.Config) { c.MaxTasks = 2 })
+	r := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 2 })
 	stats, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -368,9 +489,8 @@ func TestMaxTasksIsABudget(t *testing.T) {
 func TestLeaseMustOutlastTimeout(t *testing.T) {
 	_, err := runner.New(runner.Config{
 		Store:       newStore(t),
-		Agent:       fakeAgent{fn: func(context.Context, string, string) (string, error) { return "", nil }},
-		ReposDir:    t.TempDir(),
-		WorktreeDir: t.TempDir(),
+		Backend:     newFakeBackend(t, newRepo(t, "demo")),
+		Worktrees:   t.TempDir(),
 		LeaseTTL:    time.Minute,
 		TaskTimeout: time.Hour,
 	})
@@ -379,90 +499,19 @@ func TestLeaseMustOutlastTimeout(t *testing.T) {
 	}
 }
 
-func TestTimeoutKillsTheAgentAndItsChildren(t *testing.T) {
-	ctx := context.Background()
-	repos := newRepo(t, "demo")
+func TestCancelledRunClosesTheWorkspaceAndLeavesTheLease(t *testing.T) {
 	s := newStore(t)
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
-
-	// The worker spawns something long-lived, then hangs. Both must die at the
-	// timeout, or the leftover keeps the worktree and the port.
-	script := filepath.Join(t.TempDir(), "hanging-pi")
-	body := "#!/bin/sh\nsleep 60 &\necho $! > " + pidFile + "\nsleep 60\n"
-	// The fixture has to be executable.
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil { //nolint:gosec // G306: must be executable
-		t.Fatalf("write agent: %v", err)
-	}
-
-	task := addTask(t, s, store.NewTask{Title: "hang", Scopes: []string{"repo:demo"}})
-	r := newRunner(t, s, repos, runner.Pi{Bin: script}, func(c *runner.Config) {
-		c.TaskTimeout = 300 * time.Millisecond
-	})
-
-	stats, err := r.Run(ctx)
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if stats.Failed != 1 {
-		t.Fatalf("stats = %+v", stats)
-	}
-	got, err := s.Get(ctx, task.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.Status != store.New {
-		t.Errorf("status = %s, want new", got.Status)
-	}
-
-	raw, err := os.ReadFile(pidFile) //nolint:gosec // G304: path built by the test
-	if err != nil {
-		t.Fatalf("agent never started its child: %v", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatalf("child pid %q: %v", raw, err)
-	}
-	if alive(pid, 2*time.Second) {
-		t.Errorf("child process %d outlived the agent", pid)
-	}
-}
-
-// alive reports whether pid still exists, giving the kernel a moment to reap
-// a killed process.
-func alive(pid int, within time.Duration) bool {
-	deadline := time.Now().Add(within)
-	for {
-		err := syscall.Kill(pid, 0)
-		if errors.Is(err, syscall.ESRCH) {
-			return false
-		}
-		if time.Now().After(deadline) {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func TestCancelledRunCleansUpAndLeavesTheLease(t *testing.T) {
-	repos := newRepo(t, "demo")
-	s := newStore(t)
-	worktrees := filepath.Join(t.TempDir(), "worktrees")
+	b := newFakeBackend(t, newRepo(t, "demo"))
 
 	started := make(chan struct{})
-	agent := fakeAgent{fn: func(ctx context.Context, _, _ string) (string, error) {
+	b.agent = func(ctx context.Context, _ string) (string, error) {
 		close(started)
 		<-ctx.Done()
 		return "", ctx.Err()
-	}}
-	task := addTask(t, s, store.NewTask{Title: "interrupted", Scopes: []string{"repo:demo"}})
+	}
+	task := addTask(t, s, store.NewTask{Title: "interrupted"})
 
-	var logged bytes.Buffer
-	r := newRunner(t, s, repos, agent, func(c *runner.Config) {
-		c.WorktreeDir = worktrees
-		c.TaskTimeout = time.Minute
-		c.Logger = log.New(&logged, "", 0)
-	})
-
+	r := newRunner(t, s, b, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-started
@@ -472,16 +521,9 @@ func TestCancelledRunCleansUpAndLeavesTheLease(t *testing.T) {
 		t.Fatal("a cancelled run reported success")
 	}
 
-	// The checkout is scratch space and must not outlive the run.
-	entries, err := os.ReadDir(worktrees)
-	if err != nil {
-		t.Fatalf("read worktrees: %v", err)
+	if !b.wasClosed("w1") {
+		t.Error("the workspace outlived the run")
 	}
-	if len(entries) != 0 {
-		t.Errorf("worktrees left behind: %v (runner log: %s)", entries, logged.String())
-	}
-
-	// Nothing was written, so the task stays leased and expires on its own.
 	got, err := s.Get(context.Background(), task.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -493,31 +535,25 @@ func TestCancelledRunCleansUpAndLeavesTheLease(t *testing.T) {
 
 func TestLostLeaseDoesNotClobberTheNewOwner(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
-	task := addTask(t, s, store.NewTask{Title: "contested", Scopes: []string{"repo:demo"}})
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	task := addTask(t, s, store.NewTask{Title: "contested"})
 
-	// Something else takes the task away while the worker is busy.
-	agent := fakeAgent{fn: func(_ context.Context, dir, _ string) (string, error) {
+	commit := committer(t)
+	b.agent = func(ctx context.Context, dir string) (string, error) {
 		if err := s.Fail(ctx, task.ID, "reclaimed by a newer run"); err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "work")
-		return "done, but no longer mine", nil
-	}}
+		return commit(ctx, dir)
+	}
 
-	r := newRunner(t, s, repos, agent, nil)
-	stats, err := r.Run(ctx)
+	stats, err := newRunner(t, s, b, nil).Run(ctx)
 	if err != nil {
 		t.Fatalf("a lost lease failed the whole run: %v", err)
 	}
 	if stats.Failed != 1 {
 		t.Errorf("stats = %+v", stats)
 	}
-
 	got, err := s.Get(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -527,44 +563,60 @@ func TestLostLeaseDoesNotClobberTheNewOwner(t *testing.T) {
 	}
 }
 
-func TestStaleWorktreeRegistrationIsRecovered(t *testing.T) {
+func TestReconcileClosesOrphanWorkspacesOnly(t *testing.T) {
 	ctx := context.Background()
-	repos := newRepo(t, "demo")
 	s := newStore(t)
-	worktrees := filepath.Join(t.TempDir(), "worktrees")
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = committer(t)
 
-	task := addTask(t, s, store.NewTask{Title: "after a crash", Scopes: []string{"repo:demo"}})
-	repo := filepath.Join(repos, "demo")
+	live := addTask(t, s, store.NewTask{Title: "live", Scopes: []string{"repo:a"}})
+	// One workspace for a task that is gone, one for a task that is currently
+	// leased to the run about to start.
+	b.orphans = []runner.TaskWorkspace{
+		{TaskID: 999, WorkspaceID: "wDead"},
+		{TaskID: live.ID, WorkspaceID: "wLive"},
+	}
+	b.opened["wDead"] = filepath.Join(b.worktrees, "dead")
 
-	// A previous run registered this path and died; git refuses to reuse it
-	// until the registration is pruned.
-	stale := filepath.Join(worktrees, "demo-1.1")
-	runCmd(t, repo, "git", "worktree", "add", "-q", "-b", "stale", stale, "HEAD")
-	if err := os.RemoveAll(stale); err != nil {
-		t.Fatalf("remove stale worktree: %v", err)
+	// The live task's workspace has to look leased before the run starts.
+	if _, err := s.Lease(ctx, "someone", time.Hour, time.Now()); err != nil {
+		t.Fatalf("lease: %v", err)
 	}
 
-	agent := fakeAgent{fn: func(_ context.Context, dir, _ string) (string, error) {
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
-			return "", err
-		}
-		commitAll(t, dir, "work")
-		return "done", nil
-	}}
-	r := newRunner(t, s, repos, agent, func(c *runner.Config) { c.WorktreeDir = worktrees })
-
-	stats, err := r.Run(ctx)
-	if err != nil {
+	r := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1; c.Workers = 1 })
+	if _, err := r.Run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if stats.Completed != 1 {
-		t.Fatalf("stats = %+v", stats)
+	if !b.wasClosed("wDead") {
+		t.Error("an orphaned workspace was left open")
 	}
-	got, err := s.Get(ctx, task.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	if b.wasClosed("wLive") {
+		t.Error("a workspace for a leased task was closed")
 	}
-	if got.Status != store.Done {
-		t.Errorf("status = %s, want done", got.Status)
+}
+
+// A pane is a screen, not a transcript: the stored result has to be the agent's
+// own words, not the TUI around them.
+func TestSummaryKeepsTheAgentsWords(t *testing.T) {
+	screen := strings.Join([]string{
+		"─────────────────────────────────────────",
+		"[Skills]",
+		"  herdr",
+		"",
+		" Task #2: add note.txt",
+		"",
+		" Created note.txt and committed it.",
+		" Verify: git show 745c4b1",
+		"",
+		"─────────────────────────────────────────",
+		"↑6.4k ↓326 $0.001 deepseek/deepseek-v4.1-flash • medium",
+	}, "\n")
+
+	got := runner.SummaryOf(screen, 4)
+	if strings.Contains(got, "───") {
+		t.Errorf("summary kept box drawing: %q", got)
+	}
+	if !strings.Contains(got, "Verify: git show") {
+		t.Errorf("summary = %q, want the tail of the transcript", got)
 	}
 }

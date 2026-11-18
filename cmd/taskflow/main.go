@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"taskflow/internal/herdr"
 	"taskflow/internal/runner"
 	"taskflow/internal/store"
 )
@@ -24,7 +25,7 @@ import (
 const usage = `taskflow — task queue for a multi-agent workflow
 
 usage:
-  taskflow add   -title TEXT [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
+  taskflow add   -title TEXT -workspace LABEL [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
   taskflow list  [-status STATUS]...
   taskflow show  ID
   taskflow lease [-owner NAME] [-ttl 1h]
@@ -125,14 +126,16 @@ func cmdAdd(ctx context.Context, args []string) error {
 	var scopes listFlag
 	var deps listFlag
 	var (
-		title    string
-		body     string
-		priority int
-		maxTries int
+		title     string
+		body      string
+		workspace string
+		priority  int
+		maxTries  int
 	)
 	s, _, err := open(ctx, "add", args, func(fs *flag.FlagSet) {
 		fs.StringVar(&title, "title", "", "task title")
 		fs.StringVar(&body, "body", "", "task body handed to the agent")
+		fs.StringVar(&workspace, "workspace", "", "Herdr workspace label the task belongs to")
 		fs.IntVar(&priority, "priority", 0, "higher runs first")
 		fs.IntVar(&maxTries, "max", 2, "attempts before the task is blocked")
 		fs.Var(&scopes, "scope", "mutual-exclusion domain; repeatable")
@@ -153,7 +156,7 @@ func cmdAdd(ctx context.Context, args []string) error {
 	}
 
 	id, err := s.Add(ctx, store.NewTask{
-		Title: title, Body: body, Priority: priority, MaxTries: maxTries,
+		Title: title, Body: body, Workspace: workspace, Priority: priority, MaxTries: maxTries,
 		Scopes: scopes, Deps: ids,
 	})
 	if err != nil {
@@ -191,7 +194,7 @@ func cmdList(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tWORKSPACE\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
 		return err
 	}
 	for _, t := range tasks {
@@ -199,8 +202,8 @@ func cmdList(ctx context.Context, args []string) error {
 		if len(t.Scopes) > 0 {
 			scopes = strings.Join(t.Scopes, ",")
 		}
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%d\t%d/%d\t%s\t%s\n",
-			t.ID, t.Status, t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d/%d\t%s\t%s\n",
+			t.ID, t.Status, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
 			return err
 		}
 	}
@@ -305,30 +308,41 @@ func defaultOwner() string {
 	return fmt.Sprintf("%s/%d", host, os.Getpid())
 }
 
+// workspaceOf keeps an unset workspace visible rather than printing nothing.
+func workspaceOf(task *store.Task) string {
+	if task.Workspace == "" {
+		return "(unset)"
+	}
+	return task.Workspace
+}
+
+// allowlist is the tool set a worker gets. It is named here rather than
+// inherited from the human's settings, so a change there cannot silently widen
+// what an autonomous agent may do.
+var allowlist = []string{"read", "edit", "write", "bash", "grep", "find", "ls"}
+
 func cmdRun(ctx context.Context, args []string) error {
 	var (
 		workers  int
 		maxTasks int
-		repos    string
 		trees    string
 		base     string
 		timeout  time.Duration
 		ttl      time.Duration
 		owner    string
 		model    string
-		bin      string
+		kind     string
 	)
 	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) {
 		fs.IntVar(&workers, "workers", 2, "tasks run concurrently")
 		fs.IntVar(&maxTasks, "max", 5, "tasks this run may start; the budget")
-		fs.StringVar(&repos, "repos", "", "directory holding repo: checkouts (default ~/Repositories)")
-		fs.StringVar(&trees, "worktrees", "", "where worktrees are created (default $XDG_STATE_HOME/taskflow/worktrees)")
+		fs.StringVar(&trees, "worktrees", "", "where task worktrees are created (default $XDG_STATE_HOME/taskflow/worktrees)")
 		fs.StringVar(&base, "base", "HEAD", "commit or ref worktrees branch from")
 		fs.DurationVar(&timeout, "timeout", 45*time.Minute, "limit for one agent run")
 		fs.DurationVar(&ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
 		fs.StringVar(&owner, "owner", defaultOwner(), "who holds the leases")
-		fs.StringVar(&model, "model", "", "model passed to pi")
-		fs.StringVar(&bin, "pi", "pi", "pi binary")
+		fs.StringVar(&model, "model", "", "model passed to the agent")
+		fs.StringVar(&kind, "kind", "pi", "agent kind Herdr starts")
 	})
 	if err != nil {
 		return err
@@ -338,19 +352,32 @@ func cmdRun(ctx context.Context, args []string) error {
 	if len(positional) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
-	if repos == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("cannot derive the repos dir: %w", err)
-		}
-		repos = filepath.Join(home, "Repositories")
+	if !herdr.InSession() {
+		return errors.New("run: not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
+	}
+	if trees == "" {
+		trees = defaultWorktreeDir()
+	}
+
+	client := &herdr.Client{}
+	status, err := client.CheckStatus(ctx)
+	if err != nil {
+		return err
+	}
+
+	agentArgs := []string{"--no-session", "--tools", strings.Join(allowlist, ",")}
+	if model != "" {
+		agentArgs = append(agentArgs, "--model", model)
 	}
 
 	r, err := runner.New(runner.Config{
-		Store:       s,
-		Agent:       runner.Pi{Bin: bin, Model: model},
-		ReposDir:    repos,
-		WorktreeDir: trees,
+		Store: s,
+		Backend: &runner.Herdr{
+			Client:    client,
+			AgentKind: kind,
+			AgentArgs: agentArgs,
+		},
+		Worktrees:   trees,
 		Base:        base,
 		Workers:     workers,
 		MaxTasks:    maxTasks,
@@ -362,12 +389,26 @@ func cmdRun(ctx context.Context, args []string) error {
 		return err
 	}
 
+	fmt.Fprintf(os.Stderr, "taskflow: herdr %s, protocol %d\n", status.Server.Version, status.Server.Protocol)
 	stats, err := r.Run(ctx)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 	return nil
+}
+
+// defaultWorktreeDir is where task worktrees live. They are scratch space, so
+// they belong under the state directory rather than next to the repositories.
+func defaultWorktreeDir() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "taskflow", "worktrees")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "taskflow", "worktrees")
+	}
+	return filepath.Join(home, ".local", "state", "taskflow", "worktrees")
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {

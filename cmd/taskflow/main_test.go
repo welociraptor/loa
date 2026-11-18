@@ -74,7 +74,7 @@ func (c *cli) mustRun(args ...string) string {
 func TestAddListLeaseDone(t *testing.T) {
 	c := newCLI(t)
 
-	if out := c.mustRun("add", "-title", "ship it", "-priority", "3", "-scope", "repo:demo"); strings.TrimSpace(out) != "1" {
+	if out := c.mustRun("add", "-workspace", "taskflow", "-title", "ship it", "-priority", "3", "-scope", "repo:demo"); strings.TrimSpace(out) != "1" {
 		t.Fatalf("add printed %q, want the new id", out)
 	}
 
@@ -118,8 +118,8 @@ func TestAddListLeaseDone(t *testing.T) {
 
 func TestShowExplainsWhyATaskIsNotRunning(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-title", "schema", "-scope", "repo:demo")
-	c.mustRun("add", "-title", "writer", "-scope", "repo:demo", "-dep", "1")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "schema", "-scope", "repo:demo")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "writer", "-scope", "repo:demo", "-dep", "1")
 	c.mustRun("lease", "-owner", "cli-test")
 
 	show := c.mustRun("show", "2")
@@ -144,7 +144,7 @@ func TestShowRejectsUnknownTask(t *testing.T) {
 
 func TestDoneRequiresALease(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-title", "unclaimed")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "unclaimed")
 
 	_, errOut, code := c.run("done", "1")
 	if code != 1 || !strings.Contains(errOut, "not leased") {
@@ -154,7 +154,7 @@ func TestDoneRequiresALease(t *testing.T) {
 
 func TestFailRequeuesAndReportsRetry(t *testing.T) {
 	c := newCLI(t)
-	c.mustRun("add", "-title", "flaky")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "flaky")
 	c.mustRun("lease", "-owner", "cli-test")
 	c.mustRun("fail", "1", "-result", "tests were red")
 

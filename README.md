@@ -1,9 +1,9 @@
 # taskflow
 
 Task queue for a multi-agent daily workflow. The SQLite database is the only
-shared state: the runner leases one task at a time, hands it to an agent, and
-records the outcome. Agents never write to the store, so a crashed or
-misbehaving worker cannot corrupt the queue.
+shared state: the runner leases one task at a time, hands it to an agent in a
+Herdr worktree workspace, and records the outcome. Agents never write to the
+store, so a crashed or misbehaving worker cannot corrupt the queue.
 
 ## The lease is the whole design
 
@@ -32,13 +32,13 @@ order, and a database newer than the binary is refused rather than opened.
 nix develop
 go build ./cmd/taskflow
 
-taskflow add -title "..." -body "..." -priority 5 -scope repo:taskflow [-dep ID]...
+taskflow add -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:taskflow]... [-dep ID]...
 taskflow list [-status new]...
 taskflow show ID                      # fields, and why it is not running
 taskflow lease -owner runner-1 -ttl 1h    # prints the task as JSON, or null
 taskflow done ID -branch b/thing -result "shipped"
 taskflow fail ID -result "test suite red"
-taskflow run -workers 2 -max 5           # works the queue
+taskflow run -workers 2 -max 5           # works the queue, inside Herdr
 ```
 
 `TASKFLOW_DB` selects the database (default `./taskflow.db`); every command
@@ -46,36 +46,49 @@ also takes `-db`.
 
 ## The runner
 
-`taskflow run` is meant to be started by a timer, not by hand, so it has to be
-safe to interrupt and safe to run twice:
+Everything runs inside Herdr: the runner itself is started in a pane, creates a
+worktree workspace per task with `herdr worktree create`, starts the agent in
+that workspace's pane, prompts it and reads its terminal. Nothing is exec'd
+except the `herdr` client and `git`, and no worktree is created by this code.
+It has to be safe to interrupt and safe to run twice:
 
 - **Success is read from the repository, not from the agent.** A task is done
   only if its branch gained a commit. An agent that reports success and
   commits nothing fails, and its review text is recorded as the failure
   reason.
-- **Scopes are the concurrency control.** `repo:<name>` is the checkout the
-  task works in; every other scope is a plain exclusion domain. A task needs
-  exactly one `repo:` scope and is rejected otherwise. Names are validated, so a
-  machine-authored task cannot name a path outside the repos directory.
-- **Each attempt gets its own worktree and branch** (`taskflow/<id>.<attempt>`),
-  branched from `-base`. The worktree is deleted afterwards; the branch is the
-  deliverable. Attempts that commit nothing also delete their branch, so a bad
-  day does not litter the repository.
+- **The workspace is where the work happens.** A task names a Herdr workspace
+  *label*, resolved to an id at dispatch: exact match, or the task fails. No
+  filesystem path comes from task text at all — Herdr owns the repository.
+- **Scopes are the concurrency control.** Every scope, `repo:` included, is an
+  exclusion domain: two leased tasks never share one, so two workers never
+  fight over the same repository.
+- **Each attempt gets its own worktree workspace and branch**
+  (`taskflow/<id>.<attempt>`), branched from `-base`, labelled
+  `taskflow #<id>` so it can be found again. `herdr worktree remove` deletes the
+  checkout and the workspace; the branch is the deliverable. Attempts that
+  commit nothing also delete their branch, so a bad day does not litter the
+  repository.
 - **Rounds, not a worker pool.** Each round leases up to `-workers` runnable
   tasks and runs them together. A task freed by a finishing sibling is picked
   up by the next round instead of being missed by a worker that already gave
   up.
-- **`-max` is the budget** for one run, so a daily timer gets a daily cap.
-  Combined with the store's retry delay, a failure cannot be retried in the
-  same run.
+- **`-max` is the budget** for one run. Combined with the store's retry delay,
+  a failure cannot be retried in the same run.
 - **`-ttl` must exceed `-timeout`**, or a lease would lapse while the task is
   still running and a second worker would pick it up.
-- **The agent runs in its own process group**, and cancellation kills the
-  group. Killing only the direct child would leave whatever it spawned
-  (a dev server, a test run) holding the worktree.
+- **A blocked agent is left alone.** If Herdr reports `agent_blocked`, or the
+  prompt is rejected because the agent is waiting for input, the task fails with
+  the workspace and pane in its result and the pane stays open. The runner never
+  answers an approval dialog; the human does, in that pane.
+- **Every run reconciles first.** Any workspace labelled `taskflow #N` whose
+  task is missing, finished, or holding an expired lease is closed before new
+  work starts. That is what a crashed run leaves behind.
 
-Defaults: `~/Repositories` for checkouts,
-`$XDG_STATE_HOME/taskflow/worktrees` for scratch checkouts, `HEAD` as the base.
+Defaults: `$XDG_STATE_HOME/taskflow/worktrees` for checkouts, `HEAD` as the base.
+
+`taskflow run` refuses to start outside a Herdr pane, and checks
+`herdr status` first: a protocol or version mismatch fails the run before it
+does anything.
 
 ## What bounds a worker, and what does not
 
@@ -91,7 +104,8 @@ What is bounded:
   rather than whatever the human's settings happen to be
 - no push, no merge, no branch switching: a worker cannot publish or reach
   another checkout through the tools it is told to use
-- `repo:` names are validated, so a scope cannot point outside `-repos`
+- the task cannot name a filesystem path: it names a workspace label, and Herdr
+  resolves it
 - `-timeout` and `-max` bound how long and how often a worker runs
 
 What is not bounded:
@@ -106,8 +120,22 @@ What is not bounded:
   the agent runs as you do.
 
 So the posture that follows: run the runner as a user whose credentials you are
-willing to have an agent use, keep `-repos` to source code, and review branches
-before merging them.
+willing to have an agent use, point tasks at workspaces that hold source code,
+and review branches before merging them.
+
+## Checking it against a live session
+
+The gate cannot run Herdr, so the transport is a manual check after each Herdr
+upgrade:
+
+1. `herdr status` reports the same protocol the client was written against (22).
+2. One task end to end: `taskflow run -max 1` produces a branch, and its
+   workspace disappears.
+3. One blocked task: the agent waits for approval, the task fails naming the
+   pane, and the workspace is still there to answer it in.
+
+The rest — argument construction and every JSON shape the client parses — is
+covered by recorded fixtures in `internal/herdr/testdata/`.
 
 ## Checks
 
