@@ -180,3 +180,51 @@ func TestUsageErrorsExitWithTwo(t *testing.T) {
 		t.Errorf("show without an id exited %d, want 1", code)
 	}
 }
+
+func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "taskflow", "-title", "queued", "-scope", "repo:demo")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "running", "-scope", "repo:other")
+	c.mustRun("lease", "-owner", "cli-test")
+
+	// With a session: the leased row names its workspace, if not yet its agent.
+	out := c.mustRun("ps")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("ps = %q", out)
+	}
+	if !strings.Contains(lines[0], "SESSION") || !strings.Contains(lines[0], "WORKSPACE") {
+		t.Errorf("header = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "leased") || !strings.Contains(lines[2], "new") {
+		t.Errorf("rows = %q", lines[1:])
+	}
+}
+
+func TestPsJSONCarriesTheJoin(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "taskflow", "-title", "queued")
+	c.mustRun("lease", "-owner", "cli-test")
+
+	var snap struct {
+		Rows []struct {
+			ID        int64  `json:"id"`
+			Status    string `json:"status"`
+			Workspace string `json:"workspace"`
+			Session   string `json:"session"`
+		} `json:"rows"`
+		Orphans            []struct{ WorkspaceID string } `json:"orphans"`
+		SessionUnavailable string                         `json:"session_unavailable"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
+		t.Fatalf("ps -json: %v", err)
+	}
+	if len(snap.Rows) != 1 || snap.Rows[0].Status != "leased" || snap.Rows[0].Workspace != "taskflow" {
+		t.Fatalf("rows = %+v", snap.Rows)
+	}
+	// "closed" would be a lie here: nothing was ever dispatched, so there is no
+	// workspace to be closed.
+	if snap.Rows[0].Session != "-" {
+		t.Errorf("session = %q, want -", snap.Rows[0].Session)
+	}
+}

@@ -16,7 +16,11 @@ import (
 	"text/tabwriter"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
+	"taskflow/internal/dash"
 	"taskflow/internal/herdr"
+	"taskflow/internal/live"
 	"taskflow/internal/runner"
 	"taskflow/internal/store"
 )
@@ -27,10 +31,12 @@ usage:
   taskflow add   -title TEXT -workspace LABEL [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
   taskflow list  [-status STATUS]...
   taskflow show  ID
+  taskflow ps    [-json]                # the queue joined with the live session
   taskflow lease [-owner NAME] [-ttl 1h]
   taskflow done  ID [-branch BRANCH] [-result TEXT]
   taskflow fail  ID [-result TEXT]
-  taskflow run   [-workers N] [-max N] [-repos DIR] [-timeout 45m]
+  taskflow run   [-workers N] [-max N] [-timeout 45m]
+  taskflow dash  [-workers N] [-max N]      # the tab: state, and the keys to act
 
 all commands accept -db PATH (default $TASKFLOW_DB, else taskflow.db)`
 
@@ -49,6 +55,8 @@ func main() {
 		err = cmdList(ctx, os.Args[2:])
 	case "show":
 		err = cmdShow(ctx, os.Args[2:])
+	case "ps":
+		err = cmdPs(ctx, os.Args[2:])
 	case "lease":
 		err = cmdLease(ctx, os.Args[2:])
 	case "done":
@@ -57,6 +65,8 @@ func main() {
 		err = cmdFinish(ctx, os.Args[2:], false)
 	case "run":
 		err = cmdRun(ctx, os.Args[2:])
+	case "dash":
+		err = cmdDash(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 		return
@@ -274,6 +284,101 @@ func cmdShow(ctx context.Context, args []string) error {
 	return w.Flush()
 }
 
+type psJSON struct {
+	Rows               []psRow    `json:"rows"`
+	Orphans            []psOrphan `json:"orphans"`
+	SessionUnavailable string     `json:"session_unavailable,omitempty"`
+}
+
+type psRow struct {
+	ID          int64  `json:"id"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+	Workspace   string `json:"workspace"`
+	Priority    int    `json:"priority"`
+	Attempts    int    `json:"attempts"`
+	MaxAttempts int    `json:"max_attempts"`
+	Branch      string `json:"branch,omitempty"`
+	Session     string `json:"session"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	AgentName   string `json:"agent_name,omitempty"`
+	AgentState  string `json:"agent_state,omitempty"`
+	Result      string `json:"result,omitempty"`
+}
+
+type psOrphan struct {
+	TaskID      int64  `json:"task_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
+}
+
+// cmdPs is the read the dashboard will sit on: the queue, joined with what the
+// session says is happening to each task right now.
+func cmdPs(ctx context.Context, args []string) error {
+	var asJSON bool
+	s, positional, err := open(ctx, "ps", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&asJSON, "json", false, "emit the snapshot as JSON")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+
+	// Without a session the store half is still worth printing; live.Read says so.
+	session := &herdr.Client{}
+	snap, err := live.Read(ctx, s, session)
+	if err != nil {
+		return err
+	}
+
+	if asJSON {
+		out := psJSON{SessionUnavailable: snap.Unavailable}
+		for _, row := range snap.Rows {
+			out.Rows = append(out.Rows, psRow{
+				ID: row.Task.ID, Title: row.Task.Title, Status: string(row.Task.Status),
+				Workspace: row.Task.Workspace, Priority: row.Task.Priority,
+				Attempts: row.Task.Attempts, MaxAttempts: row.Task.MaxAttempts,
+				Branch: row.Task.Branch, Session: row.Session(),
+				WorkspaceID: row.WorkspaceID, AgentName: row.AgentName, AgentState: row.AgentState,
+				Result: row.Task.Result,
+			})
+		}
+		for _, o := range snap.Orphans {
+			out.Orphans = append(out.Orphans, psOrphan(o))
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	if snap.Unavailable != "" {
+		fmt.Fprintf(os.Stderr, "taskflow: %s\n", snap.Unavailable)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tWORKSPACE\tTRIES\tSESSION\tTITLE"); err != nil {
+		return err
+	}
+	for _, row := range snap.Rows {
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d/%d\t%s\t%s\n",
+			row.Task.ID, row.Task.Status, workspaceOf(&row.Task),
+			row.Task.Attempts, row.Task.MaxAttempts, row.Session(), row.Task.Title); err != nil {
+			return err
+		}
+	}
+	for _, o := range snap.Orphans {
+		if _, err := fmt.Fprintf(w, "-\torphan\t%s\t-\t%s\t(no task)\n",
+			o.Label, o.WorkspaceID); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
 func cmdLease(ctx context.Context, args []string) error {
 	var (
 		owner string
@@ -320,27 +425,64 @@ func workspaceOf(task *store.Task) string {
 // what an autonomous agent may do.
 var allowlist = []string{"read", "edit", "write", "bash", "grep", "find", "ls"}
 
-func cmdRun(ctx context.Context, args []string) error {
-	var (
-		workers  int
-		maxTasks int
-		base     string
-		timeout  time.Duration
-		ttl      time.Duration
-		owner    string
-		model    string
-		kind     string
-	)
-	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) {
-		fs.IntVar(&workers, "workers", 2, "tasks run concurrently")
-		fs.IntVar(&maxTasks, "max", 5, "tasks this run may start; the budget")
-		fs.StringVar(&base, "base", "HEAD", "commit or ref worktrees branch from")
-		fs.DurationVar(&timeout, "timeout", 45*time.Minute, "limit for one agent run")
-		fs.DurationVar(&ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
-		fs.StringVar(&owner, "owner", defaultOwner(), "who holds the leases")
-		fs.StringVar(&model, "model", "", "model passed to the agent")
-		fs.StringVar(&kind, "kind", "pi", "agent kind Herdr starts")
+// runFlags is what both `run` and `dash` need to start a run of the queue.
+type runFlags struct {
+	workers  int
+	maxTasks int
+	base     string
+	timeout  time.Duration
+	ttl      time.Duration
+	owner    string
+	model    string
+	kind     string
+}
+
+func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
+	fs.IntVar(&f.workers, "workers", 2, "tasks run concurrently")
+	fs.IntVar(&f.maxTasks, "max", 5, "tasks this run may start; the budget")
+	fs.StringVar(&f.base, "base", "HEAD", "commit or ref worktrees branch from")
+	fs.DurationVar(&f.timeout, "timeout", 45*time.Minute, "limit for one agent run")
+	fs.DurationVar(&f.ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
+	fs.StringVar(&f.owner, "owner", defaultOwner(), "who holds the leases")
+	fs.StringVar(&f.model, "model", "", "model passed to the agent")
+	fs.StringVar(&f.kind, "kind", "pi", "agent kind Herdr starts")
+}
+
+// buildRunner assembles the runner both commands use. One binary, one way to
+// work the queue.
+func buildRunner(ctx context.Context, s *store.Store, f runFlags) (*runner.Runner, error) {
+	if !herdr.InSession() {
+		return nil, errors.New("not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
+	}
+	client := &herdr.Client{}
+	if _, err := client.CheckStatus(ctx); err != nil {
+		return nil, err
+	}
+
+	agentArgs := []string{"--no-session", "--tools", strings.Join(allowlist, ",")}
+	if f.model != "" {
+		agentArgs = append(agentArgs, "--model", f.model)
+	}
+
+	return runner.New(runner.Config{
+		Store: s,
+		Backend: &runner.Herdr{
+			Client:    client,
+			AgentKind: f.kind,
+			AgentArgs: agentArgs,
+		},
+		Base:        f.base,
+		Workers:     f.workers,
+		MaxTasks:    f.maxTasks,
+		LeaseTTL:    f.ttl,
+		TaskTimeout: f.timeout,
+		Logger:      log.New(os.Stderr, "taskflow: ", log.LstdFlags),
 	})
+}
+
+func cmdRun(ctx context.Context, args []string) error {
+	var flags runFlags
+	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
 	if err != nil {
 		return err
 	}
@@ -349,46 +491,86 @@ func cmdRun(ctx context.Context, args []string) error {
 	if len(positional) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
-	if !herdr.InSession() {
-		return errors.New("run: not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
-	}
 
-	client := &herdr.Client{}
-	status, err := client.CheckStatus(ctx)
+	r, err := buildRunner(ctx, s, flags)
 	if err != nil {
 		return err
 	}
-
-	agentArgs := []string{"--no-session", "--tools", strings.Join(allowlist, ",")}
-	if model != "" {
-		agentArgs = append(agentArgs, "--model", model)
-	}
-
-	r, err := runner.New(runner.Config{
-		Store: s,
-		Backend: &runner.Herdr{
-			Client:    client,
-			AgentKind: kind,
-			AgentArgs: agentArgs,
-		},
-		Base:        base,
-		Workers:     workers,
-		MaxTasks:    maxTasks,
-		LeaseTTL:    ttl,
-		TaskTimeout: timeout,
-		Logger:      log.New(os.Stderr, "taskflow: ", log.LstdFlags),
-	})
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stderr, "taskflow: herdr %s, protocol %d\n", status.Server.Version, status.Server.Protocol)
 	stats, err := r.Run(ctx)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 	return nil
+}
+
+// controls is what the dashboard tab may do. Each method is a call that exists
+// elsewhere; the tab adds no policy of its own.
+type controls struct {
+	client *herdr.Client
+	store  *store.Store
+	runFn  func(ctx context.Context) error
+}
+
+func (c controls) Focus(ctx context.Context, row live.Row) error {
+	if row.AgentName != "" {
+		return c.client.FocusAgent(ctx, row.AgentName)
+	}
+	if row.WorkspaceID != "" {
+		return c.client.FocusWorkspace(ctx, row.WorkspaceID)
+	}
+	return errors.New("nothing to focus: this task has never been dispatched")
+}
+
+func (c controls) Interrupt(ctx context.Context, row live.Row) error {
+	return c.client.SendKeys(ctx, row.AgentName, "ctrl+c")
+}
+
+func (c controls) RemoveWorkspace(ctx context.Context, row live.Row) error {
+	return c.client.RemoveWorktree(ctx, row.WorkspaceID)
+}
+
+func (c controls) Unblock(ctx context.Context, taskID int64) error {
+	return c.store.Unblock(ctx, taskID)
+}
+
+func (c controls) Resolve(ctx context.Context, taskID int64, done bool, result string) error {
+	return c.store.Resolve(ctx, taskID, done, result)
+}
+
+func (c controls) Run(ctx context.Context) error { return c.runFn(ctx) }
+
+func cmdDash(ctx context.Context, args []string) error {
+	var flags runFlags
+	s, positional, err := open(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+
+	client := &herdr.Client{}
+	r, err := buildRunner(ctx, s, flags)
+	if err != nil {
+		return err
+	}
+
+	c := controls{client: client, store: s}
+	c.runFn = func(ctx context.Context) error {
+		stats, err := r.Run(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
+		return nil
+	}
+
+	program := tea.NewProgram(dash.New(s, client, c), tea.WithAltScreen(), tea.WithContext(ctx))
+	_, err = program.Run()
+	return err
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {

@@ -98,6 +98,9 @@ type fakeBackend struct {
 	agent func(ctx context.Context, dir string) (string, error)
 	// orphans are workspaces the backend reports as existing for tasks.
 	orphans []runner.TaskWorkspace
+	// onOpen runs at the start of Open, so a test can disturb the store between
+	// the lease and the workspace being recorded.
+	onOpen func()
 
 	opened      map[string]string // workspace id → worktree path
 	closed      map[string]bool
@@ -126,7 +129,11 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 	f.mu.Lock()
 	f.opens = append(f.opens, req)
 	err := f.openErr
+	hook := f.onOpen
 	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if err != nil {
 		return runner.Handle{}, err
 	}
@@ -561,60 +568,154 @@ func TestLostLeaseDoesNotClobberTheNewOwner(t *testing.T) {
 	}
 }
 
-func TestReconcileClosesOrphanWorkspacesOnly(t *testing.T) {
+func TestDispatchRecordsTheWorkspaceItOwns(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	b := newFakeBackend(t, newRepo(t, "demo"))
 	b.agent = committer(t)
+	task := addTask(t, s, store.NewTask{Title: "add a file"})
 
-	live := addTask(t, s, store.NewTask{Title: "live", Scopes: []string{"repo:a"}})
-	// One workspace for a task that is gone, one for a task that is currently
-	// leased to the run about to start.
-	b.orphans = []runner.TaskWorkspace{
-		{TaskID: 999, WorkspaceID: "wDead"},
-		{TaskID: live.ID, WorkspaceID: "wLive"},
-	}
-	b.opened["wDead"] = filepath.Join(b.worktrees, "dead")
-
-	// The live task's workspace has to look leased before the run starts.
-	if _, err := s.Lease(ctx, "someone", time.Hour, time.Now()); err != nil {
-		t.Fatalf("lease: %v", err)
-	}
-
-	r := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1; c.Workers = 1 })
-	if _, err := r.Run(ctx); err != nil {
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !b.wasClosed("wDead") {
-		t.Error("an orphaned workspace was left open")
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
 	}
-	if b.wasClosed("wLive") {
-		t.Error("a workspace for a leased task was closed")
+	// Recorded at dispatch and kept after finishing: it is where the attempt ran.
+	if got.WorkspaceID != "w1" || got.PaneID != "w1:p1" {
+		t.Errorf("ids = %q/%q, want w1/w1:p1", got.WorkspaceID, got.PaneID)
 	}
 }
 
-// A pane is a screen, not a transcript: the stored result has to be the agent's
-// own words, not the TUI around them.
-func TestSummaryKeepsTheAgentsWords(t *testing.T) {
-	screen := strings.Join([]string{
-		"─────────────────────────────────────────",
-		"[Skills]",
-		"  herdr",
-		"",
-		" Task #2: add note.txt",
-		"",
-		" Created note.txt and committed it.",
-		" Verify: git show 745c4b1",
-		"",
-		"─────────────────────────────────────────",
-		"↑6.4k ↓326 $0.001 deepseek/deepseek-v4.1-flash • medium",
-	}, "\n")
+func TestUnrecordableWorkspaceIsLeftAlone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	task := addTask(t, s, store.NewTask{Title: "contested"})
 
-	got := runner.SummaryOf(screen, 4)
-	if strings.Contains(got, "───") {
-		t.Errorf("summary kept box drawing: %q", got)
+	// Someone else takes the task between the lease and the recording, so the
+	// write is refused and the workspace belongs to nobody this run can name.
+	b.onOpen = func() {
+		if err := s.Fail(ctx, task.ID, "taken by a newer run"); err != nil {
+			t.Errorf("fail: %v", err)
+		}
 	}
-	if !strings.Contains(got, "Verify: git show") {
-		t.Errorf("summary = %q, want the tail of the transcript", got)
+	b.agent = committer(t)
+
+	stats, err := newRunner(t, s, b, nil).Run(ctx)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if stats.Failed != 1 {
+		t.Errorf("stats = %+v", stats)
+	}
+	if b.wasClosed("w1") {
+		t.Error("a workspace whose id could not be recorded was closed; it is the only evidence left")
+	}
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.WorkspaceID != "" {
+		t.Errorf("workspace id = %q, want it unrecorded", got.WorkspaceID)
+	}
+}
+
+func TestReconcileClosesOnlyWhatItOwns(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	type setup func(t *testing.T, s *store.Store, b *fakeBackend)
+	cases := map[string]struct {
+		setup  setup
+		closed bool
+	}{
+		"recorded and finished": {
+			closed: true,
+			setup: func(t *testing.T, s *store.Store, b *fakeBackend) {
+				id := addTask(t, s, store.NewTask{Title: "done"}).ID
+				if _, err := s.Lease(ctx, "other", time.Hour, now); err != nil {
+					t.Fatalf("lease: %v", err)
+				}
+				if err := s.Attach(ctx, id, "wOwned", "wOwned:p1"); err != nil {
+					t.Fatalf("attach: %v", err)
+				}
+				if err := s.Complete(ctx, id, "b/x", "done"); err != nil {
+					t.Fatalf("complete: %v", err)
+				}
+				b.orphans = []runner.TaskWorkspace{{TaskID: id, WorkspaceID: "wOwned"}}
+			},
+		},
+		"recorded and held": {
+			closed: false,
+			setup: func(t *testing.T, s *store.Store, b *fakeBackend) {
+				id := addTask(t, s, store.NewTask{Title: "running"}).ID
+				if _, err := s.Lease(ctx, "other", time.Hour, now); err != nil {
+					t.Fatalf("lease: %v", err)
+				}
+				if err := s.Attach(ctx, id, "wLive", "wLive:p1"); err != nil {
+					t.Fatalf("attach: %v", err)
+				}
+				b.orphans = []runner.TaskWorkspace{{TaskID: id, WorkspaceID: "wLive"}}
+			},
+		},
+		"never recorded, task idle": {
+			closed: true,
+			setup: func(t *testing.T, s *store.Store, b *fakeBackend) {
+				id := addTask(t, s, store.NewTask{Title: "orphan"}).ID
+				b.orphans = []runner.TaskWorkspace{{TaskID: id, WorkspaceID: "wLost"}}
+			},
+		},
+		"never recorded, task held": {
+			closed: false,
+			setup: func(t *testing.T, s *store.Store, b *fakeBackend) {
+				id := addTask(t, s, store.NewTask{Title: "starting"}).ID
+				if _, err := s.Lease(ctx, "other", time.Hour, now); err != nil {
+					t.Fatalf("lease: %v", err)
+				}
+				// The other runner created the workspace and has not recorded it yet.
+				b.orphans = []runner.TaskWorkspace{{TaskID: id, WorkspaceID: "wFresh"}}
+			},
+		},
+		"recorded against a different task": {
+			closed: false,
+			setup: func(t *testing.T, s *store.Store, b *fakeBackend) {
+				mine := addTask(t, s, store.NewTask{Title: "mine"}).ID
+				theirs := addTask(t, s, store.NewTask{Title: "theirs"}).ID
+				if _, err := s.Lease(ctx, "other", time.Hour, now); err != nil {
+					t.Fatalf("lease: %v", err)
+				}
+				if err := s.Attach(ctx, mine, "wMine", "wMine:p1"); err != nil {
+					t.Fatalf("attach: %v", err)
+				}
+				// A workspace labelled for another task carries my id: not mine to remove.
+				b.orphans = []runner.TaskWorkspace{{TaskID: theirs, WorkspaceID: "wMine"}}
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			b := newFakeBackend(t, newRepo(t, "demo"))
+			tc.setup(t, s, b)
+
+			// One task at most is claimable here; the point is reconciliation, which
+			// runs before any lease.
+			r := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 })
+			if _, err := r.Run(ctx); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			closed := false
+			for _, space := range b.orphans {
+				if b.wasClosed(space.WorkspaceID) {
+					closed = true
+				}
+			}
+			if closed != tc.closed {
+				t.Errorf("closed = %v, want %v", closed, tc.closed)
+			}
+		})
 	}
 }

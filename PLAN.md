@@ -25,7 +25,10 @@ is something to look at rather than a timeout to interpret.
     internal/runner/herdr_backend.go 207   resolve, worktree, agent, blocked, close
     internal/runner/git.go       80   commit count, screen-to-summary
     internal/runner/prompt.go    34
-    tests                     1,674   49 tests, `-race` clean
+    internal/live/live.go       187   queue joined with the session (`ps`)
+    internal/dash/dash.go       364   the tab: model, keys, view (bubbletea)
+    internal/store/migrations/   73   0001–0003
+    tests                     2,526   68 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -103,9 +106,13 @@ What it costs, and why the trade still holds:
 - **One dependency:** `modernc.org/sqlite`. Pure Go, no cgo, static binary.
 - **One binary:** the runner and the dashboard are `taskflow` subcommands, not
   separate services, and the dashboard *is* where a run starts.
-- **Two dependencies:** `modernc.org/sqlite`, and `golang.org/x/term` for raw
-  mode and window size. No TUI framework: the view is a pure function and the
-  ANSI is ours.
+- **Three dependencies:** `modernc.org/sqlite`, and `github.com/charmbracelet/bubbletea`
+  for the tab — a real TUI framework rather than hand-rolled raw mode, which
+  brings its own input loop, resize handling and alt-screen. It also brings
+  eighteen packages of renderer (lipgloss, termenv, term, cellbuf, colorprofile,
+  uniseg, runewidth, …), measured with `go list -deps`. That is the price of not
+  writing a terminal loop; the view is still a plain string built by a pure
+  function, so it is testable without a terminal.
 - **One run at a time per dashboard.** The queue would survive two, but the
   budget would be spent twice.
 - **The queue is the contract:** every rule above is enforced in SQL, not in Go
@@ -334,7 +341,7 @@ until someone looks. `report` (step 24) covers that by naming the gap —
 "nothing leased since Tuesday" is a finding, and it is the right place for it.
 Revisit only if the workflow stops being supervised.
 
-## Phase 3 — the dashboard
+## Phase 3 — the dashboard (done)
 
 The tab answers one question — what is running, and where is it — and every key
 on it is a call that already exists. Nothing here adds policy to the queue, and
@@ -350,7 +357,7 @@ reconciliation decides what it may close. A task's live state is joined as:
 | the workspace | `workspace_id` stored at dispatch; the `taskflow #N` label when the column is empty |
 | the agent | `agent list` by `workspace_id`; its `name` and `agent_status` are decoration |
 
-- [ ] **18. Own the workspaces.** `0003_task_workspace_ids.sql` adds
+- [x] **18. Own the workspaces.** `0003_task_workspace_ids.sql` adds
   `workspace_id` and `pane_id`, both `TEXT NOT NULL DEFAULT ''`. `store.Attach`
   records them at dispatch, applying only while the task is leased; it does
   **not** clear them when the task finishes, so the row keeps the last attempt's
@@ -358,18 +365,23 @@ reconciliation decides what it may close. A task's live state is joined as:
   being a label scan: it closes a workspace whose id matches a stored id for a
   task nobody holds, **or** whose label matches while no row claims an id (the
   window between `worktree create` and the row write, which is the only reason
-  the label has to stay). A labelled workspace whose id matches no row is left
-  alone and logged as unowned. Ids are not reused — three create/close cycles
+  the label has to stay). Three cases, in full: an id recorded for a task nobody
+  holds is closed; an id recorded for one task but carried by a workspace
+  labelled for another is left alone and logged, because it was not this
+  runner's to make; an id nobody recorded is closed only when the task its label
+  names is not held, since a live runner may be inside exactly that window. Ids are not reused — three create/close cycles
   gave `wD`, `wE`, `wF` — so a stale id names a dead workspace, never a
   different one, which is what makes storing them safe at all. If `Attach`
   itself fails, the task is failed and the workspace is left where it is:
   closing it would throw away the only proof of what the attempt was doing, and
-  the next run's label fallback will find it. Test:
-  `Attach` is refused on an unleased task; a workspace whose id is recorded
-  against a finished task is closed; one labelled for an idle task but claimed
-  by no row survives; the unclaimed case is logged.
+  the next run's label fallback will find it. The label parser lives in
+  `internal/herdr` (`TaskLabel`, `ParseTaskLabel`) so the reconciler and `ps`
+  cannot disagree about what a label means. Test:
+  `TestAttachRecordsWhatTheAttemptOwns`, `TestClaimsListWhatTheStoreCanProve`,
+  `TestDispatchRecordsTheWorkspaceItOwns`, `TestUnrecordableWorkspaceIsLeftAlone`,
+  and `TestReconcileClosesOnlyWhatItOwns` — five cases, one per rule above.
 
-- [ ] **19. `taskflow ps`.** One read that answers what is running: each task's
+- [x] **19. `taskflow ps`.** One read that answers what is running: each task's
   store state, its workspace (from `workspace_id`, or from the label when the
   column is empty), and the agent Herdr reports in it (`working`, `idle`,
   `blocked`, `done`, `unknown`). One `agent list` and one `workspace list` per
@@ -378,48 +390,71 @@ reconciliation decides what it may close. A task's live state is joined as:
   agent inside it and that is precisely the state worth showing. Two unlinked
   cases are reported differently: leased with no workspace at all ("never
   started"), and a workspace with no live row ("orphan"). `--json` feeds the
-  dashboard and `report`; the table is for a shell. Test: a fake client returns
-  a leased task with a `blocked` agent, a leased task whose agent is gone but
-  whose workspace is not, and a workspace for a task that is not leased; the
-  three rows read blocked / "workspace w1, no agent" / orphan. With Herdr
-  absent, `ps` still prints the store half and marks the session columns
-  "unavailable", because the queue is the truth.
+  dashboard and `report`; the table is for a shell. It lives in
+  `internal/live`, which depends on `internal/herdr` through a two-method
+  `Session` interface, so the join is tested without a session. Test:
+  `TestReadJoinsTasksWithTheirSession` (blocked agent / workspace with no agent /
+  closed / never dispatched), `TestReadFindsAWorkspaceByLabelWhenNothingIsRecorded`,
+  `TestReadReportsOrphanWorkspaces`, `TestReadDegradesWhenTheSessionIsUnreadable`,
+  `TestSortPutsLiveWorkFirst`, plus CLI tests against the built binary.
 
-- [ ] **20. `taskflow dash`.** Full screen in one pane. Raw mode and the window
+  Two things came out of building it. A workspace labelled for a task that is
+  merely undispatched is that task's row ("untracked"), not an orphan — the
+  orphan section is only for labels nothing in the queue accounts for. And a
+  recorded id whose workspace is gone reads "closed", which is why storing ids
+  was worth doing: the alternative was claiming the attempt never ran.
+
+- [x] **20. `taskflow dash`.** Full screen in one pane. Raw mode and the window
   size come from `golang.org/x/term`; everything else is plain ANSI. Rows sort
   by what is live first: leased, then blocked, then new by priority, then the
   day's finished work collapsed to a count. Redraw on a one-second tick and
   after every action. It shows state and never announces it. Test: the renderer
   is a pure `(rows, selection, size) → string` function, tested for sort order,
-  selection at both edges, and 80×24 versus 200×50.
+  selection at both edges, and 80×24 versus 200×50. What shipped is
+  `internal/dash`: an 80-line-wide view with the header counts, a windowed row
+  list, an orphan section, a message line and a key footer — plain text, no
+  styling beyond what the column padding does. `Update` handles keys, ticks and
+  results; every store or session call is a `tea.Cmd`, so the view never
+  blocks. Refresh is a one-second tick, and `SnapshotMsg` is exported so a
+  caller can prime the view with a read it already has (which is how the tests
+  work without a terminal).
 
-- [ ] **21. Actions.** `enter` focuses the task's agent or workspace (`agent
+- [x] **21. Actions.** `enter` focuses the task's agent or workspace (`agent
   focus`, `workspace focus`); `x` interrupts a working agent (`send-keys
   ctrl+c`); `s`/`S` start and stop a run; `d`/`f` complete or fail the selected
   task with a one-line result prompt; `c` closes the task's workspace; `u`
   unblocks. Adding tasks stays in the CLI: a form in a TUI is not worth the
   keys. Focus uses the stored `workspace_id`/`pane_id` (falling back to the
-  label), so it works for a blocked task whose agent has already exited. `u`
-  needs one new store method — `Unblock`: blocked → new,
-  `not_before` cleared, attempts kept. It buys exactly one more attempt,
-  because the next lease increments the counter and a second failure blocks
-  again. Test: `Unblock` makes a blocked task claimable once, and failing it
-  re-blocks; no other key writes to the store.
+  label), so it works for a blocked task whose agent has already exited. The
+  keys are `enter` focus, `x` interrupt, `u` unblock, `c` remove the workspace,
+  `d`/`f` resolve with a one-line result prompt, `s`/`S` start and stop a run,
+  `q` quit.
 
-- [ ] **22. One run at a time.** The dashboard starts the runner in a goroutine
+  Two store methods were missing, and both are the *human's* override rather
+  than the runner's: `Unblock` (blocked → new, `not_before` cleared, attempts
+  kept, so it buys exactly one more attempt) and `Resolve` (done or blocked,
+  unconditionally — `Complete`/`Fail` require a lease, and a human answering a
+  blocked agent does so hours after the run let go, so the old path could not
+  finish the task at all). Test: `TestUnblockOnlyAppliesToBlockedTasks`,
+  `TestResolvePromptTakesAResult`, `TestEscapeAbandonsThePrompt`,
+  `TestXInterruptsTheAgentOfTheSelectedTask`, `TestEnterFocusesAndXInterrupts`,
+  and `TestControlsErrorsLandInTheMessageLine`.
+
+- [x] **22. One run at a time.** The dashboard starts the runner in a goroutine
   with a cancel function. The UI never holds a lease or a transaction, and the
   store's single connection serialises the short statements, so a running task
   does not freeze the table. A second `s` while a run is in flight is refused
   and says so, rather than queued or duplicated. Test: the refusal, and that
   stopping a run leaves the in-flight task leased and expiring on its own.
 
-- [ ] **23. The tab.** Documented, not coded: create the control workspace once
+- [x] **23. The tab.** Documented, not coded: create the control workspace once
   (`herdr workspace create --cwd $XDG_STATE_HOME/taskflow --label taskflow`),
   run `taskflow dash` in its root pane, and leave it open. Task worktrees are
   linked worktree workspaces under the repository's own workspace, so the
   dashboard is an index rather than a container — closing a task's workspace
-  never touches the tab. Test: the README sequence, followed from scratch,
-  reaches a drawn dashboard in one step.
+  never touches the tab. `README.md` carries the sequence, and a live check
+  against this session drew the tab in a real pane: header counts, the three
+  rows in live-first order, and the key footer.
 
 ## Phase 4 — oversight
 
@@ -455,6 +490,9 @@ reconciliation decides what it may close. A task's live state is joined as:
   path would double every failure mode to save one attach.
 - **No web UI.** The dashboard is a pane because the workers are panes; a
   browser tab would be further from the work than the terminal already is.
+- **No styling beyond bubbletea itself.** No `bubbles` widgets, no `lipgloss`
+  calls: the view is padded strings, which is what keeps it testable and what
+  keeps the dependency at one framework.
 - **No worktrees created by the runner.** Anything that touches `git worktree`
   belongs in Herdr, where the stale-registration bug is already someone else's.
 - **No agent-to-agent messaging.** Coordination goes through the queue; two

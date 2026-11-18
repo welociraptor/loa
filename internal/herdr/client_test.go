@@ -23,7 +23,7 @@ case "$1 $2" in
   "pane list")     fixture pane_list.json ;;
   "agent list")    fixture agent_list.json ;;
   "worktree create") fixture worktree_create.json ;;
-  "worktree remove"|"workspace close"|"agent send-keys") echo '{"id":"x","result":{"type":"ok"}}' ;;
+  "worktree remove"|"workspace close"|"agent send-keys"|"agent focus"|"workspace focus") echo '{"id":"x","result":{"type":"ok"}}' ;;
   "agent start")   echo '{"id":"x","result":{"type":"ok"}}' ;;
   "agent prompt")
     if [ -n "$BLOCK_PROMPT" ]; then cat "$TESTDATA/error_blocked.json" >&2; exit 1; fi
@@ -239,5 +239,24 @@ func TestSendKeysRejectsNothing(t *testing.T) {
 	}
 	if calls := h.calls(t); len(calls) != 0 {
 		t.Errorf("the client ran %v", calls)
+	}
+}
+
+func TestFocusTargetsTheAgentOrTheWorkspace(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if err := h.client.FocusAgent(ctx, "tf-7-1"); err != nil {
+		t.Fatalf("focus agent: %v", err)
+	}
+	if err := h.client.FocusWorkspace(ctx, "w3"); err != nil {
+		t.Fatalf("focus workspace: %v", err)
+	}
+	calls := h.calls(t)
+	if calls[0] != "agent focus tf-7-1" {
+		t.Errorf("calls[0] = %q", calls[0])
+	}
+	if calls[1] != "workspace focus w3" {
+		t.Errorf("calls[1] = %q", calls[1])
 	}
 }

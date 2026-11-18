@@ -322,6 +322,16 @@ func (c *Client) SendKeys(ctx context.Context, target string, keys ...string) er
 	return c.call(ctx, nil, append([]string{"agent", "send-keys", target}, keys...)...)
 }
 
+// FocusAgent brings an agent's pane to the foreground.
+func (c *Client) FocusAgent(ctx context.Context, target string) error {
+	return c.call(ctx, nil, "agent", "focus", target)
+}
+
+// FocusWorkspace brings a workspace to the foreground, agent or not.
+func (c *Client) FocusWorkspace(ctx context.Context, workspaceID string) error {
+	return c.call(ctx, nil, "workspace", "focus", workspaceID)
+}
+
 // Wait blocks until the agent reports one of the given states.
 func (c *Client) Wait(ctx context.Context, target string, timeout time.Duration, states ...string) error {
 	args := []string{"agent", "wait", target}

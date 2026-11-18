@@ -19,7 +19,7 @@
             pname = "taskflow";
             version = "0.0.0";
             src = self;
-            vendorHash = "sha256-n+WU7qcF6NauBw9DFU4VG1fnDQ387+nibJ/uzApqehk=";
+            vendorHash = "sha256-EwpoH+Thk8bplM8mjWEbMO1dAwvcA/gn+dZVJjtunbU=";
 
             nativeCheckInputs = [ pkgs.git pkgs.golangci-lint ];
             checkPhase = ''

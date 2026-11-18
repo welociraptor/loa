@@ -35,6 +35,8 @@ go build ./cmd/taskflow
 taskflow add -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:taskflow]... [-dep ID]...
 taskflow list [-status new]...
 taskflow show ID                      # fields, and why it is not running
+taskflow ps [-json]                   # the queue joined with the live session
+taskflow dash                         # the tab: state, and the keys to act on it
 taskflow lease -owner runner-1 -ttl 1h    # prints the task as JSON, or null
 taskflow done ID -branch b/thing -result "shipped"
 taskflow fail ID -result "test suite red"
@@ -43,6 +45,11 @@ taskflow run -workers 2 -max 5           # works the queue, inside Herdr
 
 `TASKFLOW_DB` selects the database (default `./taskflow.db`); every command
 also takes `-db`.
+
+Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
+`github.com/charmbracelet/bubbletea` for the tab. The second brings a renderer
+stack with it — that is the price of a real terminal loop instead of hand-rolled
+raw mode.
 
 ## The runner
 
@@ -80,9 +87,16 @@ It has to be safe to interrupt and safe to run twice:
   prompt is rejected because the agent is waiting for input, the task fails with
   the workspace and pane in its result and the pane stays open. The runner never
   answers an approval dialog; the human does, in that pane.
-- **Every run reconciles first.** Any workspace labelled `taskflow #N` whose
-  task is missing, finished, or holding an expired lease is closed before new
-  work starts. That is what a crashed run leaves behind.
+- **Every run reconciles first.** A workspace whose recorded id belongs to a
+  task nobody is holding is closed before new work starts; so is one labelled
+  `taskflow #N` that no row recorded, provided that task is not being worked on
+  — the window a crashed run leaves behind. A workspace carrying an id recorded
+  for a *different* task is left alone and logged: it was not this runner's to
+  create, so removing it is not this runner's decision.
+- **The ids are recorded, not derived.** `workspace_id` and `pane_id` are written
+  at dispatch and kept after the task finishes, so `ps` can say where an attempt
+  ran and reconciliation can prove it owns a workspace. The `taskflow #N` label
+  is the fallback, not the authority.
 
 Defaults: `HEAD` as the base, and Herdr's own configuration decides where the
 checkout lives — the runner passes no `--path`, and reads the created path back
@@ -91,6 +105,39 @@ from the result.
 `taskflow run` refuses to start outside a Herdr pane, and checks
 `herdr status` first: a protocol or version mismatch fails the run before it
 does anything.
+
+## The tab
+
+`taskflow dash` is a full-screen view of the queue joined with the session, and
+the only place a run is started from:
+
+```
+taskflow  1 running  0 blocked  2 queued
+
+  ID   STATUS   WORKSPACE    SESSION            TITLE
+> 1    leased   nixos        w3 working tf-1-1  wire the report command
+  2    new      nixos        -                  needs a decision on the timer
+  3    new      nixos        -                  bump the flake
+
+enter focus  x interrupt  d/f resolve  u unblock  c close  s/S run  q quit
+```
+
+`enter` jumps to the task's pane (`agent focus`, or `workspace focus` when the
+agent has already exited), `x` interrupts, `u` returns a blocked task to the
+queue, `c` removes its workspace, `d`/`f` resolve it with a one-line result,
+`s`/`S` start and stop a run, `q` quits. It shows state and never announces it:
+Herdr already marks an agent that needs input.
+
+One tab, set up once:
+
+```
+herdr workspace create --cwd "$XDG_STATE_HOME/taskflow" --label taskflow
+# then, in that workspace's root pane:
+TASKFLOW_DB="$XDG_STATE_HOME/taskflow/tasks.db" taskflow dash
+```
+
+Task worktrees are separate linked workspaces under the repository's own
+workspace, so the tab is an index rather than a container.
 
 ## What bounds a worker, and what does not
 

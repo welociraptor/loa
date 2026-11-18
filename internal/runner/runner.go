@@ -184,6 +184,15 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	logf("working in %s on %s (workspace %s, agent %s)",
 		handle.Worktree, handle.Branch, handle.WorkspaceID, handle.AgentName)
 
+	// The workspace exists from here on. Recording it is what lets the dashboard
+	// address it and reconciliation know it is ours; if the write fails, the
+	// workspace is left alone rather than destroyed — it is the only evidence of
+	// what the attempt was doing, and the next run's label fallback finds it.
+	if err := r.cfg.Store.Attach(ctx, task.ID, handle.WorkspaceID, handle.PaneID); err != nil {
+		logf("cannot record workspace %s: %v", handle.WorkspaceID, err)
+		return r.record(task, err)
+	}
+
 	// The prompt is bounded twice: the backend's own wait, and this context, so a
 	// backend that ignores its timeout still cannot hold the run.
 	taskCtx, cancel := context.WithTimeout(ctx, r.cfg.TaskTimeout)
@@ -246,39 +255,81 @@ func (r *Runner) stopAndClose(handle Handle, logf func(string, ...any)) {
 	}
 }
 
-// reconcile closes task workspaces nobody is holding any more. It replaces the
-// stale-worktree pruning the subprocess runner needed: the residue is visible in
-// the session, so it can be tidied up on the way in instead of guessed at.
+// reconcile closes workspaces the runner owns but nobody is holding, plus the
+// ones a dead run created before it could record them. Ownership is the stored
+// id; the `taskflow #N` label is only trusted for the window where a workspace
+// exists and no row claims it, and never while that task is being worked on.
 func (r *Runner) reconcile(ctx context.Context, now time.Time) {
 	spaces, err := r.cfg.Backend.TaskWorkspaces(ctx)
 	if err != nil {
 		r.log.Printf("reconcile: %v", err)
 		return
 	}
+	claims, err := r.cfg.Store.Claims(ctx)
+	if err != nil {
+		r.log.Printf("reconcile: %v", err)
+		return
+	}
+
+	owner := make(map[string]int64, len(claims))
+	for _, c := range claims {
+		owner[c.WorkspaceID] = c.TaskID
+	}
+	held := make(map[int64]bool)
+
 	for _, space := range spaces {
-		if r.held(ctx, space.TaskID, now) {
-			continue
+		claimedBy, claimed := owner[space.WorkspaceID]
+		switch {
+		case claimed && claimedBy != space.TaskID:
+			// Recorded against one task, labelled for another: not made by this
+			// runner, so it is not this runner's to remove.
+			r.log.Printf("reconcile: workspace %s is labelled for task %d but recorded for task %d; leaving it alone",
+				space.WorkspaceID, space.TaskID, claimedBy)
+		case claimed:
+			if r.isHeld(ctx, claimedBy, now, held) {
+				continue
+			}
+			r.closeWorkspace(ctx, space, fmt.Sprintf("task %d is no longer held", claimedBy))
+		default:
+			// Nothing claims this id: the run that created it died before it could
+			// record it. The label is the only evidence, so it is trusted only while
+			// nobody is working on that task — a live runner may be in exactly this
+			// window right now.
+			if r.isHeld(ctx, space.TaskID, now, held) {
+				continue
+			}
+			r.closeWorkspace(ctx, space, fmt.Sprintf("task %d has no record of it", space.TaskID))
 		}
-		if err := r.cfg.Backend.Close(ctx, Handle{TaskID: space.TaskID, WorkspaceID: space.WorkspaceID}); err != nil {
-			r.log.Printf("reconcile: close %s: %v", space.WorkspaceID, err)
-			continue
-		}
-		r.log.Printf("reconcile: closed workspace %s for task %d", space.WorkspaceID, space.TaskID)
 	}
 }
 
-// held reports whether a task's lease is still good. When in doubt it answers
-// yes: closing a live worker's pane is worse than leaving a tab behind.
-func (r *Runner) held(ctx context.Context, taskID int64, now time.Time) bool {
+func (r *Runner) closeWorkspace(ctx context.Context, space TaskWorkspace, why string) {
+	if err := r.cfg.Backend.Close(ctx, Handle{TaskID: space.TaskID, WorkspaceID: space.WorkspaceID}); err != nil {
+		r.log.Printf("reconcile: close %s: %v", space.WorkspaceID, err)
+		return
+	}
+	r.log.Printf("reconcile: closed workspace %s: %s", space.WorkspaceID, why)
+}
+
+// isHeld reports whether a task's lease is still good, remembering answers for
+// the length of one reconciliation. When in doubt it answers yes: closing a live
+// worker's pane is worse than leaving a tab behind.
+func (r *Runner) isHeld(ctx context.Context, taskID int64, now time.Time, cache map[int64]bool) bool {
+	if answer, ok := cache[taskID]; ok {
+		return answer
+	}
+
 	task, err := r.cfg.Store.Get(ctx, taskID)
-	if errors.Is(err, store.ErrNotFound) {
-		return false
-	}
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		cache[taskID] = false
+	case err != nil:
 		r.log.Printf("reconcile: task %d: %v", taskID, err)
-		return true
+		cache[taskID] = true
+	default:
+		cache[taskID] = task.Status == store.Leased && task.LeaseExpiry.After(now)
 	}
-	return task.Status == store.Leased && task.LeaseExpiry.After(now)
+	return cache[taskID]
 }
 
 // fail charges a failure to the task: the store decides whether it is retried

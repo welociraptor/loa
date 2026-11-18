@@ -58,6 +58,10 @@ type Task struct {
 	LeaseExpiry time.Time
 	NotBefore   time.Time // claimable again after a failure; zero means now
 	Scopes      []string
+
+	// What the current attempt produced. Empty before the first dispatch.
+	WorkspaceID string
+	PaneID      string
 }
 
 // NewTask is the caller-supplied part of a task.
@@ -208,7 +212,7 @@ const taskColumns = `id, title, body, workspace, status, priority, attempts, max
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
-	coalesce(not_before, '')`
+	coalesce(not_before, ''), workspace_id, pane_id`
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -223,7 +227,8 @@ func scanTask(sc scanner) (*Task, error) {
 	t := Task{}
 	var status, created, updated, expiry, notBefore string
 	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
-		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore)
+		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
+		&t.WorkspaceID, &t.PaneID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -423,6 +428,87 @@ func (s *Store) Fail(ctx context.Context, id int64, result string) error {
 		 WHERE id = ? AND status = 'leased'`,
 		result, formatTime(now.Add(RetryDelay)), formatTime(now), id)
 	return finished(res, err, id)
+}
+
+// Attach records the workspace and pane an attempt owns. It is refused once the
+// task is no longer leased: the ids belong to whoever holds the task now.
+func (s *Store) Attach(ctx context.Context, id int64, workspaceID, paneID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET workspace_id = ?, pane_id = ?, updated_at = ?
+		 WHERE id = ? AND status = 'leased'`,
+		workspaceID, paneID, formatTime(time.Now()), id)
+	return finished(res, err, id)
+}
+
+// Unblock puts a blocked task back in the queue, keeping its attempt count. A
+// human decided it deserves another go, so it gets exactly one: the next lease
+// increments the count, and a second failure blocks it again.
+func (s *Store) Unblock(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks
+		 SET status = 'new', not_before = NULL, lease_owner = NULL,
+		     lease_expires_at = NULL, updated_at = ?
+		 WHERE id = ? AND status = 'blocked'`,
+		formatTime(time.Now()), id)
+	return finished(res, err, id)
+}
+
+// Resolve is the human's answer to a task the runner cannot settle: an approved
+// dialog that finished, or a decision that it did not work. Unlike Complete and
+// Fail it does not require the lease, because the human may be answering hours
+// after the run let go.
+func (s *Store) Resolve(ctx context.Context, id int64, done bool, result string) error {
+	status := Blocked
+	if done {
+		status = Done
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks
+		 SET status = ?, result = ?, lease_owner = NULL, lease_expires_at = NULL,
+		     not_before = NULL, updated_at = ?
+		 WHERE id = ? AND status <> 'leased'`,
+		string(status), result, formatTime(time.Now()), id)
+	if err != nil {
+		return fmt.Errorf("store: resolve %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: resolve %d: %w", id, err)
+	}
+	if n == 0 {
+		return ErrNotLeased
+	}
+	return nil
+}
+
+// Claim is the workspace one task's current attempt owns.
+type Claim struct {
+	TaskID      int64
+	WorkspaceID string
+}
+
+// Claims returns every recorded workspace id, which is what reconciliation
+// treats as proof that a workspace was created by the runner.
+func (s *Store) Claims(ctx context.Context) ([]Claim, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, workspace_id FROM tasks WHERE workspace_id <> ''`)
+	if err != nil {
+		return nil, fmt.Errorf("store: claims: %w", err)
+	}
+	defer rows.Close()
+
+	var claims []Claim
+	for rows.Next() {
+		var c Claim
+		if err := rows.Scan(&c.TaskID, &c.WorkspaceID); err != nil {
+			return nil, fmt.Errorf("store: claims: %w", err)
+		}
+		claims = append(claims, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: claims: %w", err)
+	}
+	return claims, nil
 }
 
 func finished(res sql.Result, err error, id int64) error {

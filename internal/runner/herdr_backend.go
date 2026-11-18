@@ -3,8 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"taskflow/internal/herdr"
@@ -23,13 +21,9 @@ type Herdr struct {
 	ReadyTimeout time.Duration
 }
 
-// The label prefix is the whole link between a task and live session state: the
-// dashboard and the reconcile step both read it back instead of keeping memory.
-const labelPrefix = "taskflow #"
-
 // Label is the workspace label a task's worktree carries.
 func (h *Herdr) Label(taskID int64) string {
-	return fmt.Sprintf("%s%d", labelPrefix, taskID)
+	return herdr.TaskLabel(taskID)
 }
 
 // Open resolves the task's workspace, creates the worktree, and starts the
@@ -174,15 +168,9 @@ func (h *Herdr) TaskWorkspaces(ctx context.Context) ([]TaskWorkspace, error) {
 
 	var out []TaskWorkspace
 	for _, w := range workspaces {
-		rest, ok := strings.CutPrefix(w.Label, labelPrefix)
-		if !ok {
-			continue
+		if id, ok := herdr.ParseTaskLabel(w.Label); ok {
+			out = append(out, TaskWorkspace{TaskID: id, WorkspaceID: w.ID})
 		}
-		id, err := strconv.ParseInt(rest, 10, 64)
-		if err != nil {
-			continue
-		}
-		out = append(out, TaskWorkspace{TaskID: id, WorkspaceID: w.ID})
 	}
 	return out, nil
 }

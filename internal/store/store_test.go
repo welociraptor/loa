@@ -500,3 +500,68 @@ func TestBlockersNameTheReason(t *testing.T) {
 		t.Fatalf("blockers = %v, want it to mention %q", blockers, want)
 	}
 }
+
+func TestAttachRecordsWhatTheAttemptOwns(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	now := time.Now()
+
+	id := add(t, s, store.NewTask{Title: "work", Workspace: "taskflow"})
+	if err := s.Attach(ctx, id, "w1", "w1:p1"); !errors.Is(err, store.ErrNotLeased) {
+		t.Fatalf("attach before leasing: %v, want ErrNotLeased", err)
+	}
+
+	lease(t, s, now)
+	if err := s.Attach(ctx, id, "w2", "w2:p1"); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.WorkspaceID != "w2" || task.PaneID != "w2:p1" {
+		t.Fatalf("ids = %q/%q", task.WorkspaceID, task.PaneID)
+	}
+
+	// The ids are history, not lease state: finishing keeps them.
+	if err := s.Complete(ctx, id, "b/x", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if err := s.Attach(ctx, id, "w3", "w3:p1"); !errors.Is(err, store.ErrNotLeased) {
+		t.Errorf("attach after finishing: %v, want ErrNotLeased", err)
+	}
+
+	task, err = s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.WorkspaceID != "w2" {
+		t.Errorf("workspace id = %q after finishing, want w2", task.WorkspaceID)
+	}
+}
+
+func TestClaimsListWhatTheStoreCanProve(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	now := time.Now()
+
+	claimed := add(t, s, store.NewTask{Title: "claimed", Workspace: "taskflow"})
+	unclaimed := add(t, s, store.NewTask{Title: "never dispatched", Workspace: "taskflow"})
+	if got := lease(t, s, now); got == nil || got.ID != claimed {
+		t.Fatalf("leased %v, want task %d", got, claimed)
+	}
+	if err := s.Attach(ctx, claimed, "w7", "w7:p1"); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	claims, err := s.Claims(ctx)
+	if err != nil {
+		t.Fatalf("claims: %v", err)
+	}
+	if len(claims) != 1 || claims[0].TaskID != claimed || claims[0].WorkspaceID != "w7" {
+		t.Fatalf("claims = %+v", claims)
+	}
+	if _, err := s.Get(ctx, unclaimed); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+}
