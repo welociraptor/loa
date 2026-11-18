@@ -40,6 +40,8 @@ usage:
   loa import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
   loa triage [-timeout 10m]        # ask an agent to propose one
   loa lease  [-owner NAME] [-ttl 1h]
+  loa unblock ID
+  loa resolve ID [-fail] [-result TEXT]
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
   loa run    [-workers N] [-max N] [-timeout 45m]
@@ -72,6 +74,10 @@ func main() {
 		err = cmdTriage(ctx, os.Args[2:])
 	case "lease":
 		err = cmdLease(ctx, os.Args[2:])
+	case "unblock":
+		err = cmdUnblock(ctx, os.Args[2:])
+	case "resolve":
+		err = cmdResolve(ctx, os.Args[2:])
 	case "done":
 		err = cmdFinish(ctx, os.Args[2:], true)
 	case "fail":
@@ -240,12 +246,9 @@ func cmdShow(ctx context.Context, args []string) error {
 	}
 	defer s.Close()
 
-	if len(positional) != 1 {
-		return errors.New("show: need exactly one task id")
-	}
-	id, err := strconv.ParseInt(positional[0], 10, 64)
+	id, err := taskID("show", positional)
 	if err != nil {
-		return fmt.Errorf("show: %w", err)
+		return err
 	}
 
 	task, err := s.Get(ctx, id)
@@ -876,16 +879,64 @@ func cmdFinish(ctx context.Context, args []string, done bool) error {
 	}
 	defer s.Close()
 
-	if len(positional) != 1 {
-		return fmt.Errorf("%s: need exactly one task id", name)
-	}
-	id, err := strconv.ParseInt(positional[0], 10, 64)
+	id, err := taskID(name, positional)
 	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+		return err
 	}
 
 	if done {
 		return s.Complete(ctx, id, branch, result)
 	}
 	return s.Fail(ctx, id, result)
+}
+
+// cmdUnblock returns a blocked task to the queue without waiting for a run.
+func cmdUnblock(ctx context.Context, args []string) error {
+	s, positional, err := open(ctx, "unblock", args, func(*flag.FlagSet) {})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	id, err := taskID("unblock", positional)
+	if err != nil {
+		return err
+	}
+	return s.Unblock(ctx, id)
+}
+
+// cmdResolve settles a task a human had to answer: done by default, or blocked
+// with -fail.
+func cmdResolve(ctx context.Context, args []string) error {
+	var (
+		fail   bool
+		result string
+	)
+	s, positional, err := open(ctx, "resolve", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&fail, "fail", false, "mark the task blocked instead of done")
+		fs.StringVar(&result, "result", "", "outcome or failure reason")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	id, err := taskID("resolve", positional)
+	if err != nil {
+		return err
+	}
+	return s.Resolve(ctx, id, !fail, result)
+}
+
+// taskID reads the one positional argument shared by the commands that act on
+// a task.
+func taskID(name string, positional []string) (int64, error) {
+	if len(positional) != 1 {
+		return 0, fmt.Errorf("%s: need exactly one task id", name)
+	}
+	id, err := strconv.ParseInt(positional[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	return id, nil
 }

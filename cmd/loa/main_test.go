@@ -47,7 +47,17 @@ func newCLI(t *testing.T) *cli {
 func (c *cli) run(args ...string) (stdout, stderr string, code int) {
 	c.t.Helper()
 	cmd := exec.Command(binary, args...)
-	cmd.Env = append(os.Environ(), "LOA_DB="+c.db)
+	// The tests describe a machine with no Herdr session. Keeping the caller's
+	// environment would join rows to real workspaces, and a herdr on PATH would
+	// answer ps with this machine's session.
+	env := []string{"LOA_DB=" + c.db, "PATH=" + c.t.TempDir()}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "HERDR_") || strings.HasPrefix(kv, "LOA_DB=") || strings.HasPrefix(kv, "PATH=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	cmd.Env = env
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -165,6 +175,67 @@ func TestFailRequeuesAndReportsRetry(t *testing.T) {
 	show := c.mustRun("show", "1")
 	if !strings.Contains(show, "retry delayed until") || !strings.Contains(show, "tests were red") {
 		t.Errorf("show = %q", show)
+	}
+}
+
+func TestUnblockRequeuesABlockedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "needs a nudge", "-max", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("fail", "1", "-result", "waiting for approval")
+
+	if list := c.mustRun("list", "-status", "blocked"); !strings.Contains(list, "needs a nudge") {
+		t.Fatalf("the task did not block: %q", list)
+	}
+	c.mustRun("unblock", "1")
+
+	var leased struct {
+		ID     int64
+		Status string
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("lease", "-owner", "cli-test")), &leased); err != nil {
+		t.Fatalf("lease output is not JSON: %v", err)
+	}
+	if leased.ID != 1 || leased.Status != "leased" {
+		t.Errorf("lease after unblock = %+v", leased)
+	}
+}
+
+func TestUnblockRejectsATaskThatIsNotBlocked(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "already queued")
+
+	_, errOut, code := c.run("unblock", "1")
+	if code != 1 || !strings.Contains(errOut, "not leased") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestResolveFailKeepsTheResultOnABlockedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "approval needed", "-max", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("fail", "1", "-result", "waiting for approval")
+
+	c.mustRun("resolve", "1", "-fail", "-result", "the change was rejected")
+
+	show := c.mustRun("show", "1")
+	if list := c.mustRun("list", "-status", "blocked"); !strings.Contains(list, "approval needed") {
+		t.Errorf("the task is not blocked: %q", list)
+	}
+	if !strings.Contains(show, "the change was rejected") {
+		t.Errorf("show = %q, missing the result", show)
+	}
+}
+
+func TestResolveRejectsALeasedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "still running")
+	c.mustRun("lease", "-owner", "cli-test")
+
+	_, errOut, code := c.run("resolve", "1")
+	if code != 1 || !strings.Contains(errOut, "not leased") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
 	}
 }
 
