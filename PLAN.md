@@ -27,8 +27,9 @@ is something to look at rather than a timeout to interpret.
     internal/runner/prompt.go    34
     internal/live/live.go       187   queue joined with the session (`ps`)
     internal/dash/dash.go       364   the tab: model, keys, view (bubbletea)
-    internal/store/migrations/   73   0001–0003
-    tests                     2,526   68 tests, `-race` clean
+    internal/report/report.go   187   the day: done, blocked, queued, open, gap
+    internal/store/migrations/   72   0001–0004
+    tests                     2,785   76 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -456,21 +457,33 @@ reconciliation decides what it may close. A task's live state is joined as:
   against this session drew the tab in a real pane: header counts, the three
   rows in live-first order, and the key footer.
 
-## Phase 4 — oversight
+## Phase 4 — oversight (done)
 
-- [ ] **24. `taskflow report`.** Deterministic, no model: what was completed,
+- [x] **24. `taskflow report`.** Deterministic, no model: what was completed,
   failed, blocked and left new since a given time; the branch of each finished
   task; the workspace of anything left open; and the gap — how long since
   anything was leased, so an unsupervised week is visible rather than silent.
   The reporter *agent* is then only for prose, and the daily summary still
-  exists on the day the model is unavailable. Test: a fabricated queue and
-  session render the four sections, including the empty-day case.
+  exists on the day the model is unavailable. `-since` takes a duration (`24h`)
+  or a date (`2026-11-18`); `-json` carries the same sections. Workspaces are
+  reported regardless of the window — one left open yesterday is still open
+  today — while tasks are counted only when they changed inside it. Test:
+  `TestBuildGroupsTheDay`, `TestTextRendersEverySectionAndTheGap`,
+  `TestAnEmptyQueueStillStatesTheGap`, `TestWindowExcludesOlderWorkButNotOpenWorkspaces`,
+  plus CLI tests for the window parsing and the JSON.
 
-- [ ] **25. Spend visibility.** `-max` caps tasks per run, but not cost. Record
-  each agent invocation's wall time in the store (one column, `runs` table if
-  it earns its keep), so the first week shows what a day actually costs before
-  any budget logic is designed. The dashboard's count line is the natural place
-  to read it.
+- [x] **25. Spend visibility.** `0004_run_time.sql` adds `run_ms`, measured at
+  completion inside the same UPDATE: SQLite evaluates the right-hand side
+  against the row's pre-update values, so `updated_at` there is still the moment
+  the attempt was leased. No extra write, no Go-side timing, and an attempt that
+  crashed still shows as time spent. Resolution is one second, because that is
+  what the stored timestamps carry; the first run measured 16 s against 16 s of
+  wall clock in the log.
+
+  It is read in `report` (per task, plus "time in agents" for the window) and in
+  `show`. The plan guessed the dashboard's count line; that was wrong — a total
+  for "the day" needs a window, and the tab shows *now*. Test:
+  `TestRunTimeIsMeasuredAtFinish`.
 
 ## Phase 5 — triage
 
@@ -528,7 +541,9 @@ reconciliation decides what it may close. A task's live state is joined as:
   expires.
 - **The real transport is not in the gate.** Its JSON is (step 17); its
   behaviour with a live Herdr is a manual checklist.
-- **Cost is visible only as wall time** (step 25); tokens are not counted.
+- **Cost is visible only as wall time**, to the second, and not as tokens. It is
+  also the attempt's duration, not the model's thinking time — a worker that
+  spent three minutes running tests reports three minutes.
 - **One Herdr session.** Two runners in two sessions pointed at one database
   would each lease distinct tasks and create their own worktrees, so they no
   longer collide by path — but nothing stops that configuration from being a

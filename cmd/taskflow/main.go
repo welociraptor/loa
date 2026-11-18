@@ -21,6 +21,7 @@ import (
 	"taskflow/internal/dash"
 	"taskflow/internal/herdr"
 	"taskflow/internal/live"
+	"taskflow/internal/report"
 	"taskflow/internal/runner"
 	"taskflow/internal/store"
 )
@@ -32,6 +33,7 @@ usage:
   taskflow list  [-status STATUS]...
   taskflow show  ID
   taskflow ps    [-json]                # the queue joined with the live session
+  taskflow report [-since 24h|-since 2026-11-18] [-json]   # what the day did
   taskflow lease [-owner NAME] [-ttl 1h]
   taskflow done  ID [-branch BRANCH] [-result TEXT]
   taskflow fail  ID [-result TEXT]
@@ -57,6 +59,8 @@ func main() {
 		err = cmdShow(ctx, os.Args[2:])
 	case "ps":
 		err = cmdPs(ctx, os.Args[2:])
+	case "report":
+		err = cmdReport(ctx, os.Args[2:])
 	case "lease":
 		err = cmdLease(ctx, os.Args[2:])
 	case "done":
@@ -263,6 +267,9 @@ func cmdShow(ctx context.Context, args []string) error {
 	if task.Branch != "" {
 		lines = append(lines, fmt.Sprintf("branch:\t%s", task.Branch))
 	}
+	if task.RunMS > 0 {
+		lines = append(lines, fmt.Sprintf("ran:\t%s", (time.Duration(task.RunMS)*time.Millisecond).Round(time.Second)))
+	}
 	if task.Result != "" {
 		lines = append(lines, fmt.Sprintf("result:\t%s", task.Result))
 	}
@@ -377,6 +384,60 @@ func cmdPs(ctx context.Context, args []string) error {
 		}
 	}
 	return w.Flush()
+}
+
+// cmdReport is the page a person reads after a day away: deterministic, no model.
+func cmdReport(ctx context.Context, args []string) error {
+	var (
+		asJSON bool
+		since  string
+	)
+	s, positional, err := open(ctx, "report", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&asJSON, "json", false, "emit the report as JSON")
+		fs.StringVar(&since, "since", "24h", "window: a duration like 24h, or a date like 2026-11-18")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+
+	now := time.Now()
+	start, err := parseSince(since, now)
+	if err != nil {
+		return err
+	}
+
+	snap, err := live.Read(ctx, s, &herdr.Client{})
+	if err != nil {
+		return err
+	}
+	r := report.Build(snap, start, now)
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(r)
+	}
+	fmt.Print(r.Text())
+	return nil
+}
+
+// parseSince accepts a duration ("24h") or a date ("2026-11-18").
+func parseSince(value string, now time.Time) (time.Time, error) {
+	if d, err := time.ParseDuration(value); err == nil {
+		if d <= 0 {
+			return time.Time{}, fmt.Errorf("-since %q: the window must be positive", value)
+		}
+		return now.Add(-d), nil
+	}
+	if day, err := time.Parse("2006-01-02", value); err == nil {
+		return day, nil
+	}
+	return time.Time{}, fmt.Errorf("-since %q: use a duration like 24h, or a date like 2026-11-18", value)
 }
 
 func cmdLease(ctx context.Context, args []string) error {

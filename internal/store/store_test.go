@@ -565,3 +565,37 @@ func TestClaimsListWhatTheStoreCanProve(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 }
+
+func TestRunTimeIsMeasuredAtFinish(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	now := time.Now()
+
+	id := add(t, s, store.NewTask{Title: "slow", Workspace: "taskflow"})
+	lease(t, s, now)
+	// Timestamps are stored to the second, so a shorter attempt would measure 0.
+	time.Sleep(1100 * time.Millisecond)
+	if err := s.Complete(ctx, id, "b/x", "ok"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.RunMS < 900 {
+		t.Errorf("run time = %dms, want about a second", task.RunMS)
+	}
+
+	// A human resolving a task settles it without pretending to have timed it.
+	if err := s.Resolve(ctx, id, true, "approved by hand"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	task, err = s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.RunMS < 900 {
+		t.Errorf("resolving changed the run time to %dms", task.RunMS)
+	}
+}

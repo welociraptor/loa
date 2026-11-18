@@ -62,6 +62,9 @@ type Task struct {
 	// What the current attempt produced. Empty before the first dispatch.
 	WorkspaceID string
 	PaneID      string
+
+	// RunMS is how long the last attempt held the task, in milliseconds.
+	RunMS int64
 }
 
 // NewTask is the caller-supplied part of a task.
@@ -212,7 +215,7 @@ const taskColumns = `id, title, body, workspace, status, priority, attempts, max
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
-	coalesce(not_before, ''), workspace_id, pane_id`
+	coalesce(not_before, ''), workspace_id, pane_id, run_ms`
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -228,7 +231,7 @@ func scanTask(sc scanner) (*Task, error) {
 	var status, created, updated, expiry, notBefore string
 	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
-		&t.WorkspaceID, &t.PaneID)
+		&t.WorkspaceID, &t.PaneID, &t.RunMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -406,12 +409,13 @@ func (s *Store) Lease(ctx context.Context, owner string, ttl time.Duration, now 
 
 // Complete marks a leased task done.
 func (s *Store) Complete(ctx context.Context, id int64, branch, result string) error {
+	now := time.Now()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE tasks
 		 SET status = 'done', branch = ?, result = ?, lease_owner = NULL,
-		     lease_expires_at = NULL, updated_at = ?
+		     lease_expires_at = NULL, run_ms = `+runTime+`, updated_at = ?
 		 WHERE id = ? AND status = 'leased'`,
-		branch, result, formatTime(time.Now()), id)
+		branch, result, formatTime(now), formatTime(now), id)
 	return finished(res, err, id)
 }
 
@@ -424,9 +428,9 @@ func (s *Store) Fail(ctx context.Context, id int64, result string) error {
 		 SET status = CASE WHEN attempts >= max_attempts THEN 'blocked' ELSE 'new' END,
 		     result = ?, lease_owner = NULL, lease_expires_at = NULL,
 		     not_before = CASE WHEN attempts >= max_attempts THEN NULL ELSE ? END,
-		     updated_at = ?
+		     run_ms = `+runTime+`, updated_at = ?
 		 WHERE id = ? AND status = 'leased'`,
-		result, formatTime(now.Add(RetryDelay)), formatTime(now), id)
+		result, formatTime(now.Add(RetryDelay)), formatTime(now), formatTime(now), id)
 	return finished(res, err, id)
 }
 
@@ -439,6 +443,13 @@ func (s *Store) Attach(ctx context.Context, id int64, workspaceID, paneID string
 		workspaceID, paneID, formatTime(time.Now()), id)
 	return finished(res, err, id)
 }
+
+// runTime measures how long the attempt held the task. SQLite evaluates the
+// right-hand side against the row's pre-update values, so updated_at here is
+// still the moment the attempt started. Resolution is one second, because that
+// is what the stored timestamps carry — plenty for "what did a day cost".
+// The extra parameter is the same timestamp written to updated_at.
+const runTime = `CAST((julianday(?) - julianday(updated_at)) * 86400000 AS INTEGER)`
 
 // Unblock puts a blocked task back in the queue, keeping its attempt count. A
 // human decided it deserves another go, so it gets exactly one: the next lease

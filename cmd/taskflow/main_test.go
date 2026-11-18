@@ -228,3 +228,49 @@ func TestPsJSONCarriesTheJoin(t *testing.T) {
 		t.Errorf("session = %q, want -", snap.Rows[0].Session)
 	}
 }
+
+func TestReportPrintsTheDayAndTheGap(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "taskflow", "-title", "ship the report")
+	c.mustRun("add", "-workspace", "taskflow", "-title", "waiting")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "1", "-branch", "taskflow/1.1", "-result", "shipped it")
+
+	out := c.mustRun("report")
+	for _, want := range []string{"since ", "done: 1", "taskflow/1.1", "queued: 1", "activity:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestReportAcceptsADateWindow(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "taskflow", "-title", "yesterday")
+	if out := c.mustRun("report", "-since", "2026-01-01"); !strings.Contains(out, "since ") {
+		t.Errorf("report = %q", out)
+	}
+	if _, errOut, code := c.run("report", "-since", "tuesday"); code != 1 || !strings.Contains(errOut, "use a duration") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestReportJSONCarriesTheSections(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "taskflow", "-title", "queued")
+
+	var r struct {
+		Queued []struct {
+			ID    int64  `json:"id"`
+			Title string `json:"title"`
+		} `json:"queued"`
+		Done []struct{ ID int64 } `json:"done"`
+		Idle int64                `json:"idle_ns"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("report", "-json")), &r); err != nil {
+		t.Fatalf("report -json: %v", err)
+	}
+	if len(r.Queued) != 1 || r.Queued[0].Title != "queued" || len(r.Done) != 0 {
+		t.Fatalf("report = %+v", r)
+	}
+}

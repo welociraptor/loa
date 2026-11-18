@@ -37,6 +37,7 @@ taskflow list [-status new]...
 taskflow show ID                      # fields, and why it is not running
 taskflow ps [-json]                   # the queue joined with the live session
 taskflow dash                         # the tab: state, and the keys to act on it
+taskflow report [-since 24h|-json]    # what the day did, and how long it has been still
 taskflow lease -owner runner-1 -ttl 1h    # prints the task as JSON, or null
 taskflow done ID -branch b/thing -result "shipped"
 taskflow fail ID -result "test suite red"
@@ -138,6 +139,29 @@ TASKFLOW_DB="$XDG_STATE_HOME/taskflow/tasks.db" taskflow dash
 
 Task worktrees are separate linked workspaces under the repository's own
 workspace, so the tab is an index rather than a container.
+
+## The day
+
+`taskflow report` is the page to read after a day away, and it needs no model:
+
+```
+since 2026-11-17T18:43:33Z, 24h0m0s ago
+
+done: 1
+  #1  add note.txt   taskflow/1.1   ran 16s   note.txt [taskflow/1.1 f640919] feat: add note.txt
+
+queued: 1
+  #2  decide the timer question
+
+time in agents: 16s
+activity: just now
+```
+
+Tasks are counted when they changed inside the window; workspaces are reported
+whatever the window, because one left open yesterday is still open today. The
+last line is the point: with no timer, an unsupervised week has to *say* that
+nothing moved, or it looks exactly like a quiet one. `-since` takes a duration
+or a date, `-json` gives the same sections.
 
 ## What bounds a worker, and what does not
 
