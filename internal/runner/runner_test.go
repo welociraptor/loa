@@ -102,6 +102,7 @@ type fakeBackend struct {
 	// the lease and the workspace being recorded.
 	onOpen func()
 
+	gitMu       sync.Mutex        // serialises worktree creation in the shared repo
 	opened      map[string]string // workspace id → worktree path
 	closed      map[string]bool
 	interrupted []string
@@ -143,7 +144,13 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 		return runner.Handle{}, err
 	}
 	path := filepath.Join(f.worktrees, fmt.Sprintf("%d.%d", req.TaskID, req.Attempt))
-	if _, err := gitE(f.repo, "worktree", "add", "-b", req.Branch, path, base); err != nil {
+
+	// git worktree add writes shared metadata in the repo; two concurrent adds
+	// race there. Herdr serialises this for the real backend.
+	f.gitMu.Lock()
+	_, err = gitE(f.repo, "worktree", "add", "-b", req.Branch, path, base)
+	f.gitMu.Unlock()
+	if err != nil {
 		return runner.Handle{}, err
 	}
 
@@ -488,7 +495,11 @@ func TestMaxTasksIsABudget(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(remaining) != 3 {
-		t.Errorf("%d tasks left, want 3", len(remaining))
+		var detail []string
+		for _, task := range remaining {
+			detail = append(detail, fmt.Sprintf("#%d %s: %s", task.ID, task.Status, task.Result))
+		}
+		t.Errorf("%d tasks left, want 3 (completed %d): %s", len(remaining), stats.Completed, strings.Join(detail, "; "))
 	}
 }
 

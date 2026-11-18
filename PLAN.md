@@ -527,6 +527,25 @@ reconciliation decides what it may close. A task's live state is joined as:
   Notes are printed by `import` as well as by `triage`, because they are the part
   a person has to act on.
 
+## Phase 6 — what dogfooding found
+
+`loa` was used to add `QUICKSTART.md` and the `unblock`/`resolve` commands. The
+loop worked — two tasks, two commits, four minutes — and it surfaced one design
+limit worth fixing rather than documenting.
+
+- [ ] **28. Dependencies order work; they do not stack it.** A dependent task
+  branches from the base commit, not from its dependency's branch, so it cannot
+  see what the earlier task committed. A doc task that depends on a code task
+  therefore describes the pre-merge world: the QUICKSTART written this way claims
+  a blocked task is settled "from the dashboard" and does not mention the `loa
+  unblock` / `loa resolve` that the task it depends on had just added. The
+  branch names are deterministic and `Complete` records them, so the fix is to
+  branch from the newest *done* dependency's branch when the task has one:
+  `Base` is already a parameter, so this is a lookup, not a new concept. Test: a
+  task with a done dependency opens a worktree whose HEAD contains that
+  dependency's commit; a task whose dependency was re-queued still branches from
+  the base.
+
 ## Not planned, on purpose
 
 - **No timer, no daemon, no scheduler.** A run is something a person starts,
@@ -582,6 +601,8 @@ reconciliation decides what it may close. A task's live state is joined as:
   would each lease distinct tasks and create their own worktrees, so they no
   longer collide by path — but nothing stops that configuration from being a
   surprise.
+- **Dependencies order execution, not content** (step 28): two tasks in a chain
+  do not share a base, so the later one cannot build on the earlier one's commit.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It
   is found by `report` (step 24) or by the dashboard's blocked row — both of
   which require someone to look.
