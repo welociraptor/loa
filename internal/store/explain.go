@@ -1,0 +1,121 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Dep is a task that another task waits on.
+type Dep struct {
+	ID     int64
+	Title  string
+	Status Status
+}
+
+// Deps returns the tasks id waits for, in id order.
+func (s *Store) Deps(ctx context.Context, id int64) ([]Dep, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT t.id, t.title, t.status
+		 FROM task_deps d
+		 JOIN tasks t ON t.id = d.depends_on
+		 WHERE d.task_id = ?
+		 ORDER BY t.id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("store: deps of %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	var deps []Dep
+	for rows.Next() {
+		var d Dep
+		var status string
+		if err := rows.Scan(&d.ID, &d.Title, &status); err != nil {
+			return nil, fmt.Errorf("store: deps of %d: %w", id, err)
+		}
+		d.Status = Status(status)
+		deps = append(deps, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: deps of %d: %w", id, err)
+	}
+	return deps, nil
+}
+
+// Blockers explains why a task cannot be claimed at now. An empty result means
+// it is runnable. The checks mirror the claim predicate in Lease; when one
+// changes, the other changes with it.
+func (s *Store) Blockers(ctx context.Context, id int64, now time.Time) ([]string, error) {
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	switch task.Status {
+	case Leased:
+		return []string{fmt.Sprintf("leased by %s until %s", task.LeaseOwner, task.LeaseExpiry.Format(time.RFC3339))}, nil
+	case Done:
+		return []string{"already done"}, nil
+	case Blocked:
+		return []string{fmt.Sprintf("blocked, needs a human: %s", task.Result)}, nil
+	}
+
+	var reasons []string
+
+	if !task.NotBefore.IsZero() && task.NotBefore.After(now) {
+		reasons = append(reasons, fmt.Sprintf("retry delayed until %s", task.NotBefore.Format(time.RFC3339)))
+	}
+
+	deps, err := s.Deps(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range deps {
+		if d.Status != Done {
+			reasons = append(reasons, fmt.Sprintf("waiting on #%d (%s) %q", d.ID, d.Status, d.Title))
+		}
+	}
+
+	contenders, err := s.scopeContenders(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range contenders {
+		reasons = append(reasons, fmt.Sprintf("scope %q is held by #%d (%s)", c.scope, c.id, c.owner))
+	}
+
+	return reasons, nil
+}
+
+type contender struct {
+	scope string
+	id    int64
+	owner string
+}
+
+func (s *Store) scopeContenders(ctx context.Context, id int64) ([]contender, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT mine.scope, other.id, coalesce(other.lease_owner, '')
+		 FROM task_scopes mine
+		 JOIN task_scopes theirs ON theirs.scope = mine.scope
+		 JOIN tasks other ON other.id = theirs.task_id
+		 WHERE mine.task_id = ? AND other.id <> ? AND other.status = 'leased'
+		 ORDER BY mine.scope, other.id`, id, id)
+	if err != nil {
+		return nil, fmt.Errorf("store: scope contenders for %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	var contenders []contender
+	for rows.Next() {
+		var c contender
+		if err := rows.Scan(&c.scope, &c.id, &c.owner); err != nil {
+			return nil, fmt.Errorf("store: scope contenders for %d: %w", id, err)
+		}
+		contenders = append(contenders, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: scope contenders for %d: %w", id, err)
+	}
+	return contenders, nil
+}

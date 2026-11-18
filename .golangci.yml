@@ -1,0 +1,52 @@
+version: "2"
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      # Groups this module's imports apart from third-party ones.
+      local-prefixes:
+        - taskflow
+
+linters:
+  # Listed one by one rather than "standard", so an upgrade cannot silently
+  # change what runs.
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - errorlint
+    - bodyclose
+    - gosec
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # Cleanup calls on handles that are already going away cannot report
+      # anything the caller could act on; the handles are checked by the
+      # operations that follow them. Everything else is still enforced.
+      exclude-functions:
+        - (*database/sql.DB).Close
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.Rows).Close
+        - (*taskflow/internal/store.Store).Close
+    gosec:
+      excludes:
+        # Commands are run through exec with an argument slice and no shell, so
+        # there is no injection surface for a variable command line.
+        - G204
+        # Redundant with errcheck, which is enabled and configured above.
+        - G104
+  exclusions:
+    # Only honour "Code generated ... DO NOT EDIT" at the top of a file.
+    generated: strict
+
+issues:
+  # golangci-lint hides repeats by default, which hides real problems.
+  max-issues-per-linter: 0
+  max-same-issues: 0
