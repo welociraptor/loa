@@ -84,7 +84,9 @@ It has to be safe to interrupt and safe to run twice:
   task is missing, finished, or holding an expired lease is closed before new
   work starts. That is what a crashed run leaves behind.
 
-Defaults: `$XDG_STATE_HOME/taskflow/worktrees` for checkouts, `HEAD` as the base.
+Defaults: `HEAD` as the base, and Herdr's own configuration decides where the
+checkout lives — the runner passes no `--path`, and reads the created path back
+from the result.
 
 `taskflow run` refuses to start outside a Herdr pane, and checks
 `herdr status` first: a protocol or version mismatch fails the run before it

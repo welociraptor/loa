@@ -110,7 +110,7 @@ func newFakeBackend(t *testing.T, repo string) *fakeBackend {
 	t.Helper()
 	return &fakeBackend{
 		repo:      repo,
-		worktrees: filepath.Join(t.TempDir(), "unused"),
+		worktrees: filepath.Join(t.TempDir(), "worktrees"),
 		agent: func(context.Context, string) (string, error) {
 			return "", nil
 		},
@@ -135,7 +135,7 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 	if err != nil {
 		return runner.Handle{}, err
 	}
-	path := req.WorktreePath
+	path := filepath.Join(f.worktrees, fmt.Sprintf("%d.%d", req.TaskID, req.Attempt))
 	if _, err := gitE(f.repo, "worktree", "add", "-b", req.Branch, path, base); err != nil {
 		return runner.Handle{}, err
 	}
@@ -222,7 +222,6 @@ func newRunner(t *testing.T, s *store.Store, b runner.Backend, mutate func(*runn
 	cfg := runner.Config{
 		Store:       s,
 		Backend:     b,
-		Worktrees:   filepath.Join(t.TempDir(), "worktrees"),
 		Workers:     2,
 		MaxTasks:    10,
 		LeaseTTL:    time.Hour,
@@ -490,7 +489,6 @@ func TestLeaseMustOutlastTimeout(t *testing.T) {
 	_, err := runner.New(runner.Config{
 		Store:       newStore(t),
 		Backend:     newFakeBackend(t, newRepo(t, "demo")),
-		Worktrees:   t.TempDir(),
 		LeaseTTL:    time.Minute,
 		TaskTimeout: time.Hour,
 	})

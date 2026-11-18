@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -41,12 +40,8 @@ func (h *Herdr) Open(ctx context.Context, req OpenRequest) (Handle, error) {
 		return Handle{}, err
 	}
 
-	if req.WorktreePath == "" {
-		return Handle{}, errors.New("no worktree path: the runner decides where checkouts live")
-	}
 	created, err := h.Client.CreateWorktree(ctx, herdr.WorktreeRequest{
 		WorkspaceID: workspaceID,
-		Path:        req.WorktreePath,
 		Branch:      req.Branch,
 		Base:        req.Base,
 		Label:       h.Label(req.TaskID),

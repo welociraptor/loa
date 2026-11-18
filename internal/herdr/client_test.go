@@ -114,7 +114,6 @@ func TestCreateWorktreeBuildsTheCommandAndDecodesIds(t *testing.T) {
 
 	wt, err := h.client.CreateWorktree(ctx, herdr.WorktreeRequest{
 		WorkspaceID: "w1",
-		Path:        "/home/u/.local/state/taskflow/wt/nixos-7.1",
 		Branch:      "taskflow/7.1",
 		Base:        "HEAD",
 		Label:       "taskflow #7",
@@ -131,10 +130,12 @@ func TestCreateWorktreeBuildsTheCommandAndDecodesIds(t *testing.T) {
 	if strings.Contains(got, "--cwd") {
 		t.Errorf("command %q passes --cwd, which Herdr rejects next to --workspace", got)
 	}
+	if strings.Contains(got, "--path") {
+		t.Errorf("command %q passes --path; the worktree directory is Herdr's configuration", got)
+	}
 	for _, want := range []string{
 		"worktree create",
 		"--workspace w1",
-		"--path /home/u/.local/state/taskflow/wt/nixos-7.1",
 		"--branch taskflow/7.1",
 		"--base HEAD",
 		"--label taskflow #7",
@@ -149,7 +150,7 @@ func TestCreateWorktreeBuildsTheCommandAndDecodesIds(t *testing.T) {
 func TestCreateWorktreeNeedsAWorkspace(t *testing.T) {
 	h := newHarness(t)
 	if _, err := h.client.CreateWorktree(context.Background(), herdr.WorktreeRequest{
-		Path: "/tmp/x", Branch: "b", Base: "HEAD", Label: "l",
+		Branch: "b", Base: "HEAD", Label: "l",
 	}); err == nil {
 		t.Fatal("a worktree without a workspace was accepted")
 	}

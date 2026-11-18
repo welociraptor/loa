@@ -189,11 +189,10 @@ func (c *Client) Agents(ctx context.Context) ([]Agent, error) {
 }
 
 // WorktreeRequest is one task's worktree. The workspace picks the repository
-// (Herdr rejects --workspace together with --cwd), and the path is ours so the
-// branch can be inspected with git afterwards.
+// (Herdr rejects --workspace together with --cwd) and Herdr's own configuration
+// picks the directory; the created path comes back in the result.
 type WorktreeRequest struct {
 	WorkspaceID string
-	Path        string
 	Branch      string
 	Base        string
 	Label       string
@@ -219,7 +218,6 @@ func (c *Client) CreateWorktree(ctx context.Context, req WorktreeRequest) (Workt
 	args := []string{
 		"worktree", "create",
 		"--workspace", req.WorkspaceID,
-		"--path", req.Path,
 		"--branch", req.Branch,
 		"--base", req.Base,
 		"--label", req.Label,

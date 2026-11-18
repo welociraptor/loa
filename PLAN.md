@@ -111,9 +111,15 @@ What it costs, and why the trade still holds:
 - **The queue is the contract:** every rule above is enforced in SQL, not in Go
   call ordering, so a second process cannot bypass it.
 - **Herdr is the execution substrate.** The runner does not exec agents and
-  does not create worktrees. Herdr's state is a cache of the queue, never the
+  does not create worktrees. Herdr's *state* is a cache of the queue, never the
   other way round: a task's fate is decided by its branch, not by an agent
-  saying `done`.
+  saying `done`. What the queue does store about an attempt is what the attempt
+  produced — `branch`, `workspace_id`, `pane_id` — not what Herdr currently
+  thinks about it.
+- **Never close a workspace the runner cannot prove it created.** A stored id is
+  the proof; a matching label is the fallback for the one window where the
+  workspace exists but no row does. A label match with no stored id anywhere is
+  somebody else's workspace.
 - **Never `workspace close --group`.** The worktree workspace is linked to the
   primary one it came from; `--group` would close the human's project.
 - **`nixpkgs` unstable** for Go and the shell; `go.mod` pins the toolchain
@@ -269,7 +275,8 @@ written and checked by hand against a live session.
   disappears. Never `--group`. At the start of a run, any workspace labelled
   `taskflow #N` whose task is missing, finished, or holding an expired lease is
   closed. Test: `TestReconcileClosesOrphanWorkspacesOnly` — an orphan is closed,
-  a leased task's workspace is not.
+  a leased task's workspace is not. *(Superseded in part by step 18: what
+  shipped is the label scan; the ownership check arrives with the stored ids.)*
 
 - [x] **16. Retire the subprocess backend.** `Pi`, `killProcessGroup`,
   `procgroup_*.go`, `repoFor`/`checkRepoName`, `addWorktree`/`removeWorktree`,
@@ -297,6 +304,10 @@ written and checked by hand against a live session.
 - **A worktree's base is the commit it starts at.** Reading `HEAD` in the fresh
   worktree is simpler and safer than resolving the ref in the source checkout
   and carrying it across.
+- **The worktree directory belongs to Herdr.** Passing `--path` made the runner
+  responsible for a layout decision with no upside; without it the checkout
+  lands where the session is configured to put it, and the path is read back
+  from the result. One flag and one default directory disappeared with it.
 - **`agent read` is a screen, not a transcript.** The first stored result was
   the whole pi TUI: skills banner, prompt, box drawing, status bar. `SummaryOf`
   drops decoration and keeps the last dozen lines, which is where the agent's
@@ -319,7 +330,7 @@ or `taskflow run` in any pane. Three reasons, in order of weight:
 3. "Daily" is a habit plus a legible record, not an alarm clock.
 
 What it costs: a forgotten day is a day with no work done, and nothing says so
-until someone looks. `report` (step 23) covers that by naming the gap —
+until someone looks. `report` (step 24) covers that by naming the gap —
 "nothing leased since Tuesday" is a finding, and it is the right place for it.
 Revisit only if the workflow stops being supervised.
 
@@ -329,18 +340,52 @@ The tab answers one question — what is running, and where is it — and every 
 on it is a call that already exists. Nothing here adds policy to the queue, and
 nothing here alerts: Herdr already marks an agent that needs input.
 
-- [ ] **18. `taskflow ps`.** One read that answers what is running: each task's
-  store state plus, when leased, the agent name
-  (`tf-<id>-<n>`), its worktree workspace, and the state Herdr reports
-  (`working`, `idle`, `blocked`, `done`, `unknown`). One `agent list` and one
-  `workspace list` per refresh, joined in Go — never one CLI call per row.
-  `--json` feeds the dashboard and `report`; the table is for a shell. Test: a
-  fake client returns a leased task with a `blocked` agent and a leased task
-  with no agent; the first row says blocked and names the pane, the second says
-  "no agent". With Herdr absent, `ps` still prints the store half and marks the
-  session column "unavailable", because the queue is the truth.
+The ownership record comes first (step 18) because everything after it reads it:
+`ps` shows where an attempt ran, the actions address that workspace by id, and
+reconciliation decides what it may close. A task's live state is joined as:
 
-- [ ] **19. `taskflow dash`.** Full screen in one pane. Raw mode and the window
+| what | from |
+|---|---|
+| the row | the store, which is authoritative about status |
+| the workspace | `workspace_id` stored at dispatch; the `taskflow #N` label when the column is empty |
+| the agent | `agent list` by `workspace_id`; its `name` and `agent_status` are decoration |
+
+- [ ] **18. Own the workspaces.** `0003_task_workspace_ids.sql` adds
+  `workspace_id` and `pane_id`, both `TEXT NOT NULL DEFAULT ''`. `store.Attach`
+  records them at dispatch, applying only while the task is leased; it does
+  **not** clear them when the task finishes, so the row keeps the last attempt's
+  ids as history and the next attempt overwrites them. Reconciliation stops
+  being a label scan: it closes a workspace whose id matches a stored id for a
+  task nobody holds, **or** whose label matches while no row claims an id (the
+  window between `worktree create` and the row write, which is the only reason
+  the label has to stay). A labelled workspace whose id matches no row is left
+  alone and logged as unowned. Ids are not reused — three create/close cycles
+  gave `wD`, `wE`, `wF` — so a stale id names a dead workspace, never a
+  different one, which is what makes storing them safe at all. If `Attach`
+  itself fails, the task is failed and the workspace is left where it is:
+  closing it would throw away the only proof of what the attempt was doing, and
+  the next run's label fallback will find it. Test:
+  `Attach` is refused on an unleased task; a workspace whose id is recorded
+  against a finished task is closed; one labelled for an idle task but claimed
+  by no row survives; the unclaimed case is logged.
+
+- [ ] **19. `taskflow ps`.** One read that answers what is running: each task's
+  store state, its workspace (from `workspace_id`, or from the label when the
+  column is empty), and the agent Herdr reports in it (`working`, `idle`,
+  `blocked`, `done`, `unknown`). One `agent list` and one `workspace list` per
+  refresh, joined in Go — never one CLI call per row. The agent's name is
+  decoration; the workspace id is the join, because a workspace outlives the
+  agent inside it and that is precisely the state worth showing. Two unlinked
+  cases are reported differently: leased with no workspace at all ("never
+  started"), and a workspace with no live row ("orphan"). `--json` feeds the
+  dashboard and `report`; the table is for a shell. Test: a fake client returns
+  a leased task with a `blocked` agent, a leased task whose agent is gone but
+  whose workspace is not, and a workspace for a task that is not leased; the
+  three rows read blocked / "workspace w1, no agent" / orphan. With Herdr
+  absent, `ps` still prints the store half and marks the session columns
+  "unavailable", because the queue is the truth.
+
+- [ ] **20. `taskflow dash`.** Full screen in one pane. Raw mode and the window
   size come from `golang.org/x/term`; everything else is plain ANSI. Rows sort
   by what is live first: leased, then blocked, then new by priority, then the
   day's finished work collapsed to a count. Redraw on a one-second tick and
@@ -348,25 +393,27 @@ nothing here alerts: Herdr already marks an agent that needs input.
   is a pure `(rows, selection, size) → string` function, tested for sort order,
   selection at both edges, and 80×24 versus 200×50.
 
-- [ ] **20. Actions.** `enter` focuses the task's agent or workspace (`agent
+- [ ] **21. Actions.** `enter` focuses the task's agent or workspace (`agent
   focus`, `workspace focus`); `x` interrupts a working agent (`send-keys
   ctrl+c`); `s`/`S` start and stop a run; `d`/`f` complete or fail the selected
   task with a one-line result prompt; `c` closes the task's workspace; `u`
   unblocks. Adding tasks stays in the CLI: a form in a TUI is not worth the
-  keys. `u` needs one new store method — `Unblock`: blocked → new,
+  keys. Focus uses the stored `workspace_id`/`pane_id` (falling back to the
+  label), so it works for a blocked task whose agent has already exited. `u`
+  needs one new store method — `Unblock`: blocked → new,
   `not_before` cleared, attempts kept. It buys exactly one more attempt,
   because the next lease increments the counter and a second failure blocks
   again. Test: `Unblock` makes a blocked task claimable once, and failing it
   re-blocks; no other key writes to the store.
 
-- [ ] **21. One run at a time.** The dashboard starts the runner in a goroutine
+- [ ] **22. One run at a time.** The dashboard starts the runner in a goroutine
   with a cancel function. The UI never holds a lease or a transaction, and the
   store's single connection serialises the short statements, so a running task
   does not freeze the table. A second `s` while a run is in flight is refused
   and says so, rather than queued or duplicated. Test: the refusal, and that
   stopping a run leaves the in-flight task leased and expiring on its own.
 
-- [ ] **22. The tab.** Documented, not coded: create the control workspace once
+- [ ] **23. The tab.** Documented, not coded: create the control workspace once
   (`herdr workspace create --cwd $XDG_STATE_HOME/taskflow --label taskflow`),
   run `taskflow dash` in its root pane, and leave it open. Task worktrees are
   linked worktree workspaces under the repository's own workspace, so the
@@ -376,7 +423,7 @@ nothing here alerts: Herdr already marks an agent that needs input.
 
 ## Phase 4 — oversight
 
-- [ ] **23. `taskflow report`.** Deterministic, no model: what was completed,
+- [ ] **24. `taskflow report`.** Deterministic, no model: what was completed,
   failed, blocked and left new since a given time; the branch of each finished
   task; the workspace of anything left open; and the gap — how long since
   anything was leased, so an unsupervised week is visible rather than silent.
@@ -384,7 +431,7 @@ nothing here alerts: Herdr already marks an agent that needs input.
   exists on the day the model is unavailable. Test: a fabricated queue and
   session render the four sections, including the empty-day case.
 
-- [ ] **24. Spend visibility.** `-max` caps tasks per run, but not cost. Record
+- [ ] **25. Spend visibility.** `-max` caps tasks per run, but not cost. Record
   each agent invocation's wall time in the store (one column, `runs` table if
   it earns its keep), so the first week shows what a day actually costs before
   any budget logic is designed. The dashboard's count line is the natural place
@@ -392,10 +439,10 @@ nothing here alerts: Herdr already marks an agent that needs input.
 
 ## Phase 5 — triage
 
-- [ ] **25. `taskflow import FILE`.** Read tasks from JSON, validate workspace,
+- [ ] **26. `taskflow import FILE`.** Read tasks from JSON, validate workspace,
   scopes and dependencies, create nothing on any error. The boundary exists so
   an agent can *propose* work without the ability to write the queue directly.
-- [ ] **26. Triage agent.** Read-only allowlist, runs before the workers, writes
+- [ ] **27. Triage agent.** Read-only allowlist, runs before the workers, writes
   a proposal file: reorder priorities, split oversized tasks, flag what needs a
   human, never touch `body` of an existing task. Human approval stays manual
   until the proposals have been boring for a week.
@@ -424,7 +471,7 @@ nothing here alerts: Herdr already marks an agent that needs input.
 ## Known limitations
 
 - **Nothing runs unless someone starts it.** A missed day is a real gap; step
-  23 reports it, but nothing reminds you beforehand.
+  24 reports it, but nothing reminds you beforehand.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
@@ -432,6 +479,9 @@ nothing here alerts: Herdr already marks an agent that needs input.
   `agent prompt` flags will fail a run before it damages one.
 - **Focus actions need a live session.** `ps` and `dash` still show the queue
   without Herdr; only the actions that address a pane are disabled.
+- **A stored workspace id can outlive its workspace.** Then the row says
+  "closed" rather than pretending it is live — the honest answer, and the reason
+  ids are worth storing at all.
 - **Leftover state is possible.** A runner that dies between `worktree create`
   and cleanup leaves a workspace open. Step 15 reconciles that at the next
   start, so the residue is one tab, not a stuck queue.
@@ -440,12 +490,12 @@ nothing here alerts: Herdr already marks an agent that needs input.
   expires.
 - **The real transport is not in the gate.** Its JSON is (step 17); its
   behaviour with a live Herdr is a manual checklist.
-- **Cost is visible only as wall time** (step 24); tokens are not counted.
+- **Cost is visible only as wall time** (step 25); tokens are not counted.
 - **One Herdr session.** Two runners in two sessions pointed at one database
   would each lease distinct tasks and create their own worktrees, so they no
   longer collide by path — but nothing stops that configuration from being a
   surprise.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It
-  is found by `report` (step 23) or by the dashboard's blocked row — both of
+  is found by `report` (step 24) or by the dashboard's blocked row — both of
   which require someone to look.
 

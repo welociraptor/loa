@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -325,7 +324,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	var (
 		workers  int
 		maxTasks int
-		trees    string
 		base     string
 		timeout  time.Duration
 		ttl      time.Duration
@@ -336,7 +334,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) {
 		fs.IntVar(&workers, "workers", 2, "tasks run concurrently")
 		fs.IntVar(&maxTasks, "max", 5, "tasks this run may start; the budget")
-		fs.StringVar(&trees, "worktrees", "", "where task worktrees are created (default $XDG_STATE_HOME/taskflow/worktrees)")
 		fs.StringVar(&base, "base", "HEAD", "commit or ref worktrees branch from")
 		fs.DurationVar(&timeout, "timeout", 45*time.Minute, "limit for one agent run")
 		fs.DurationVar(&ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
@@ -354,9 +351,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	if !herdr.InSession() {
 		return errors.New("run: not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
-	}
-	if trees == "" {
-		trees = defaultWorktreeDir()
 	}
 
 	client := &herdr.Client{}
@@ -377,7 +371,6 @@ func cmdRun(ctx context.Context, args []string) error {
 			AgentKind: kind,
 			AgentArgs: agentArgs,
 		},
-		Worktrees:   trees,
 		Base:        base,
 		Workers:     workers,
 		MaxTasks:    maxTasks,
@@ -396,19 +389,6 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "taskflow: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
 	return nil
-}
-
-// defaultWorktreeDir is where task worktrees live. They are scratch space, so
-// they belong under the state directory rather than next to the repositories.
-func defaultWorktreeDir() string {
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "taskflow", "worktrees")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "taskflow", "worktrees")
-	}
-	return filepath.Join(home, ".local", "state", "taskflow", "worktrees")
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +23,6 @@ import (
 type Config struct {
 	Store        *store.Store
 	Backend      Backend
-	Worktrees    string // where task worktrees are created
 	Base         string // ref each worktree branches from
 	BranchPrefix string
 	Workers      int
@@ -57,16 +55,7 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.Backend == nil {
 		return nil, errors.New("runner: no backend")
 	}
-	var err error
-	if cfg.Worktrees == "" {
-		return nil, errors.New("runner: no worktree directory")
-	}
-	if cfg.Worktrees, err = filepath.Abs(cfg.Worktrees); err != nil {
-		return nil, fmt.Errorf("runner: worktree dir: %w", err)
-	}
-	if err := os.MkdirAll(cfg.Worktrees, 0o700); err != nil {
-		return nil, fmt.Errorf("runner: worktree dir: %w", err)
-	}
+
 	if cfg.Base == "" {
 		cfg.Base = "HEAD"
 	}
@@ -186,7 +175,6 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		Attempt:        task.Attempts,
 		WorkspaceLabel: task.Workspace,
 		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
-		WorktreePath:   filepath.Join(r.cfg.Worktrees, fmt.Sprintf("%d.%d", task.ID, task.Attempts)),
 		Base:           r.cfg.Base,
 		AgentName:      fmt.Sprintf("tf-%d-%d", task.ID, task.Attempts),
 	})

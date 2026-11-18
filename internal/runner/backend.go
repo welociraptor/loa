@@ -40,7 +40,6 @@ type OpenRequest struct {
 	WorkspaceLabel string // the Herdr workspace the task belongs to
 	Branch         string
 	Base           string // ref to branch from
-	WorktreePath   string
 	AgentName      string
 }
 
