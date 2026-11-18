@@ -599,3 +599,66 @@ func TestRunTimeIsMeasuredAtFinish(t *testing.T) {
 		t.Errorf("resolving changed the run time to %dms", task.RunMS)
 	}
 }
+
+func TestApplyCreatesTheBatchInOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	existing := add(t, s, store.NewTask{Title: "existing", Workspace: "taskflow", Priority: 1})
+
+	ids, err := s.Apply(ctx, []store.BatchItem{
+		{NewTask: store.NewTask{Title: "first", Workspace: "taskflow", Scopes: []string{"repo:a"}}},
+		{NewTask: store.NewTask{Title: "second", Workspace: "taskflow"},
+			After: []int{0}, Deps: []int64{existing}},
+	}, []store.Priority{{ID: existing, Priority: 9}})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("ids = %v", ids)
+	}
+
+	second, err := s.Get(ctx, ids[1])
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	deps, err := s.Deps(ctx, ids[1])
+	if err != nil {
+		t.Fatalf("deps: %v", err)
+	}
+	if second.Title != "second" || len(deps) != 2 {
+		t.Fatalf("second = %+v deps = %+v", second, deps)
+	}
+	first, err := s.Get(ctx, existing)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if first.Priority != 9 {
+		t.Errorf("priority = %d, want 9", first.Priority)
+	}
+}
+
+func TestApplyRollsBackWhenAnyPartFails(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	before, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	_, err = s.Apply(ctx,
+		[]store.BatchItem{{NewTask: store.NewTask{Title: "would be created", Workspace: "taskflow"}}},
+		[]store.Priority{{ID: 404, Priority: 3}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("apply: %v, want a refusal", err)
+	}
+
+	after, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("a failed apply created %d task(s)", len(after)-len(before))
+	}
+}

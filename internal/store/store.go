@@ -169,16 +169,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (title, body, workspace, priority, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.Title, t.Body, t.Workspace, t.Priority, maxTries(t.MaxTries), now, now)
+	id, err := insertTask(ctx, tx, t, now)
 	if err != nil {
-		return 0, fmt.Errorf("store: add: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("store: add: %w", err)
+		return 0, err
 	}
 
 	for _, scope := range t.Scopes {
@@ -202,6 +195,110 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 		return 0, fmt.Errorf("store: add: %w", err)
 	}
 	return id, nil
+}
+
+func insertTask(ctx context.Context, tx *sql.Tx, t NewTask, now string) (int64, error) {
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO tasks (title, body, workspace, priority, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		t.Title, t.Body, t.Workspace, t.Priority, maxTries(t.MaxTries), now, now)
+	if err != nil {
+		return 0, fmt.Errorf("store: insert task: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("store: insert task: %w", err)
+	}
+	return id, nil
+}
+
+// BatchItem is one task in an applied document. After refers to positions in
+// the same batch, which is how a proposal says "this one comes after that one"
+// before either has an id.
+type BatchItem struct {
+	NewTask
+	Deps  []int64 // existing tasks
+	After []int   // positions in this batch
+}
+
+// Priority is a change to a task that already exists.
+type Priority struct {
+	ID       int64
+	Priority int
+}
+
+// Apply creates a batch of tasks and reprioritises existing ones in a single
+// transaction: a document is either applied whole or not at all.
+func (s *Store) Apply(ctx context.Context, items []BatchItem, priorities []Priority) ([]int64, error) {
+	now := formatTime(time.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: apply: %w", err)
+	}
+	defer tx.Rollback()
+
+	if len(items) == 0 && len(priorities) == 0 {
+		return nil, errors.New("store: apply: nothing to do")
+	}
+
+	ids := make([]int64, len(items))
+	for i, item := range items {
+		if strings.TrimSpace(item.Title) == "" {
+			return nil, errors.New("store: task title is required")
+		}
+		if strings.TrimSpace(item.Workspace) == "" {
+			return nil, errors.New("store: task workspace is required")
+		}
+		if ids[i], err = insertTask(ctx, tx, item.NewTask, now); err != nil {
+			return nil, err
+		}
+	}
+
+	// Dependencies come second, so a task may refer forward in the batch.
+	for i, item := range items {
+		for _, scope := range item.Scopes {
+			if strings.TrimSpace(scope) == "" {
+				return nil, errors.New("store: empty scope")
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO task_scopes (task_id, scope) VALUES (?, ?)`, ids[i], scope); err != nil {
+				return nil, fmt.Errorf("store: apply scope %q: %w", scope, err)
+			}
+		}
+
+		deps := append([]int64(nil), item.Deps...)
+		for _, position := range item.After {
+			if position < 0 || position >= len(ids) {
+				return nil, fmt.Errorf("store: apply: dependency position %d is outside the batch", position)
+			}
+			deps = append(deps, ids[position])
+		}
+		for _, dep := range deps {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)`, ids[i], dep); err != nil {
+				return nil, fmt.Errorf("store: apply dep %d: %w", dep, err)
+			}
+		}
+	}
+
+	for _, change := range priorities {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?`,
+			change.Priority, now, change.ID)
+		if err != nil {
+			return nil, fmt.Errorf("store: apply priority %d: %w", change.ID, err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("store: apply priority %d: %w", change.ID, err)
+		} else if n == 0 {
+			return nil, fmt.Errorf("store: apply priority: task %d does not exist", change.ID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: apply: %w", err)
+	}
+	return ids, nil
 }
 
 func maxTries(n int) int {

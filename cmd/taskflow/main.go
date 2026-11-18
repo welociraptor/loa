@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -24,6 +25,8 @@ import (
 	"taskflow/internal/report"
 	"taskflow/internal/runner"
 	"taskflow/internal/store"
+	"taskflow/internal/taskspec"
+	"taskflow/internal/triage"
 )
 
 const usage = `taskflow — task queue for a multi-agent workflow
@@ -34,6 +37,8 @@ usage:
   taskflow show  ID
   taskflow ps    [-json]                # the queue joined with the live session
   taskflow report [-since 24h|-since 2026-11-18] [-json]   # what the day did
+  taskflow import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
+  taskflow triage [-timeout 10m]        # ask an agent to propose one
   taskflow lease [-owner NAME] [-ttl 1h]
   taskflow done  ID [-branch BRANCH] [-result TEXT]
   taskflow fail  ID [-result TEXT]
@@ -61,6 +66,10 @@ func main() {
 		err = cmdPs(ctx, os.Args[2:])
 	case "report":
 		err = cmdReport(ctx, os.Args[2:])
+	case "import":
+		err = cmdImport(ctx, os.Args[2:])
+	case "triage":
+		err = cmdTriage(ctx, os.Args[2:])
 	case "lease":
 		err = cmdLease(ctx, os.Args[2:])
 	case "done":
@@ -384,6 +393,221 @@ func cmdPs(ctx context.Context, args []string) error {
 		}
 	}
 	return w.Flush()
+}
+
+// cmdTriage runs one read-only agent against the queue and keeps the proposal it
+// writes. It never applies it: a person does that with `taskflow import`.
+func cmdTriage(ctx context.Context, args []string) error {
+	var (
+		timeout time.Duration
+		model   string
+		kind    string
+		outDir  string
+	)
+	s, positional, err := open(ctx, "triage", args, func(fs *flag.FlagSet) {
+		fs.DurationVar(&timeout, "timeout", 10*time.Minute, "limit for the triage agent")
+		fs.StringVar(&model, "model", "", "model passed to the agent")
+		fs.StringVar(&kind, "kind", "pi", "agent kind Herdr starts")
+		fs.StringVar(&outDir, "out", "", "where proposals are kept (default $XDG_STATE_HOME/taskflow/proposals)")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+	if !herdr.InSession() {
+		return errors.New("triage: not inside a Herdr pane, so there is no session to run an agent in")
+	}
+	if outDir == "" {
+		outDir = defaultProposalDir()
+	}
+
+	client := &herdr.Client{}
+	if _, err := client.CheckStatus(ctx); err != nil {
+		return err
+	}
+
+	// The agent reads the queue from a file, so its context is one document rather
+	// than whatever the model would have inferred from a command.
+	tasks, err := s.List(ctx)
+	if err != nil {
+		return err
+	}
+	deps := make(map[int64][]store.Dep, len(tasks))
+	for _, task := range tasks {
+		got, err := s.Deps(ctx, task.ID)
+		if err != nil {
+			return err
+		}
+		deps[task.ID] = got
+	}
+	queue := triage.Build(time.Now(), tasks, deps)
+
+	scratch, err := os.MkdirTemp("", "taskflow-triage-")
+	if err != nil {
+		return fmt.Errorf("triage: scratch dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+
+	queuePath, err := triage.Context(scratch, queue)
+	if err != nil {
+		return err
+	}
+
+	workspace, err := client.CreateWorkspace(ctx, scratch, "taskflow triage")
+	if err != nil {
+		return fmt.Errorf("triage: %w", err)
+	}
+	// The scratch directory outlives the workspace, so a failed proposal can still
+	// be read; the pane is what needs closing.
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := client.CloseWorkspace(cleanup, workspace.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "triage: close workspace %s: %v\n", workspace.ID, err)
+		}
+	}()
+
+	agentName := "tf-triage"
+	agentArgs := []string{"--no-session", "--tools", "read,grep,find,ls,write"}
+	if model != "" {
+		agentArgs = append(agentArgs, "--model", model)
+	}
+	if err := client.StartAgent(ctx, herdr.StartAgentRequest{
+		Name: agentName, Kind: kind, PaneID: workspace.PaneID,
+		Args: agentArgs, Timeout: time.Minute,
+	}); err != nil {
+		return fmt.Errorf("triage: %w", err)
+	}
+
+	if err := client.Prompt(ctx, agentName, triage.Prompt(queuePath), timeout); err != nil {
+		if herdr.CodeOf(err) == "agent_blocked" {
+			return fmt.Errorf("triage: the agent is waiting for input in workspace %s (pane %s); answer it there, then run triage again",
+				workspace.ID, workspace.PaneID)
+		}
+		return fmt.Errorf("triage: %w", err)
+	}
+
+	doc, err := triage.Read(scratch)
+	if err != nil {
+		return fmt.Errorf("%w (the agent's scratch directory is %s)", err, scratch)
+	}
+	path, err := triage.Save(outDir, doc, time.Now())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(path)
+	fmt.Fprintf(os.Stderr, "triage: %d proposed task(s), %d priority change(s), %d note(s)\n",
+		len(doc.Tasks), len(doc.Reprioritise), len(doc.Notes))
+	for _, note := range doc.Notes {
+		fmt.Fprintf(os.Stderr, "note: %s\n", note)
+	}
+	if len(doc.Tasks) > 0 || len(doc.Reprioritise) > 0 {
+		fmt.Fprintf(os.Stderr, "apply with: taskflow import %s\n", path)
+	}
+	return nil
+}
+
+// defaultProposalDir is where triage keeps what it proposes.
+func defaultProposalDir() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "taskflow", "proposals")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "taskflow", "proposals")
+	}
+	return filepath.Join(home, ".local", "state", "taskflow", "proposals")
+}
+
+// cmdImport applies a proposal. It is the only door through which a
+// machine-authored file becomes queue changes, and it opens whole or not at all.
+func cmdImport(ctx context.Context, args []string) error {
+	var dryRun bool
+	s, positional, err := open(ctx, "import", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&dryRun, "dry-run", false, "validate and print, creating nothing")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) > 1 {
+		return fmt.Errorf("import: at most one file")
+	}
+	source := "-"
+	if len(positional) == 1 {
+		source = positional[0]
+	}
+
+	var input io.Reader = os.Stdin
+	if source != "-" {
+		// The path is the caller's own argument, like -db.
+		file, err := os.Open(source) //nolint:gosec // G703: the file to import is named by the user
+		if err != nil {
+			return fmt.Errorf("import: %w", err)
+		}
+		defer func() { _ = file.Close() }()
+		input = file
+	}
+
+	doc, err := taskspec.Parse(input)
+	if err != nil {
+		return err
+	}
+	applied, err := taskspec.Validate(doc)
+	if err != nil {
+		return err
+	}
+
+	items := make([]store.BatchItem, len(applied.Tasks))
+	for i, task := range applied.Tasks {
+		items[i] = store.BatchItem{
+			NewTask: store.NewTask{
+				Title: task.Title, Body: task.Body, Workspace: task.Workspace,
+				Priority: task.Priority, MaxTries: task.MaxAttempts, Scopes: task.Scopes,
+			},
+			Deps:  task.Deps,
+			After: applied.After[i],
+		}
+	}
+	priorities := make([]store.Priority, len(applied.Reprioritise))
+	for i, change := range applied.Reprioritise {
+		priorities[i] = store.Priority{ID: change.ID, Priority: change.Priority}
+	}
+
+	if dryRun {
+		out := struct {
+			Tasks        []taskspec.Task     `json:"tasks"`
+			Reprioritise []taskspec.Priority `json:"reprioritise"`
+			Notes        []string            `json:"notes,omitempty"`
+		}{doc.Tasks, doc.Reprioritise, doc.Notes}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(out); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "import: would create %d task(s) and change %d priority(ies)\n",
+			len(items), len(priorities))
+		return nil
+	}
+
+	ids, err := s.Apply(ctx, items, priorities)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		fmt.Println(id)
+	}
+	fmt.Fprintf(os.Stderr, "import: created %d task(s), changed %d priority(ies)\n", len(ids), len(priorities))
+	for _, note := range applied.Notes {
+		fmt.Fprintf(os.Stderr, "note: %s\n", note)
+	}
+	return nil
 }
 
 // cmdReport is the page a person reads after a day away: deterministic, no model.

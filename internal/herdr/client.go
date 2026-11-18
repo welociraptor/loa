@@ -265,6 +265,32 @@ func (c *Client) RemoveWorktree(ctx context.Context, workspaceID string) error {
 	return c.call(ctx, nil, "worktree", "remove", "--workspace", workspaceID, "--force")
 }
 
+// CreatedWorkspace is a workspace and the pane it was opened with.
+type CreatedWorkspace struct {
+	ID     string
+	PaneID string
+}
+
+// CreateWorkspace opens a workspace at cwd. It is not a worktree: triage needs a
+// scratch directory, not a checkout.
+func (c *Client) CreateWorkspace(ctx context.Context, cwd, label string) (CreatedWorkspace, error) {
+	var out struct {
+		Workspace struct {
+			ID string `json:"workspace_id"`
+		} `json:"workspace"`
+		RootPane struct {
+			ID string `json:"pane_id"`
+		} `json:"root_pane"`
+	}
+	if err := c.call(ctx, &out, "workspace", "create", "--cwd", cwd, "--label", label); err != nil {
+		return CreatedWorkspace{}, err
+	}
+	if out.Workspace.ID == "" || out.RootPane.ID == "" {
+		return CreatedWorkspace{}, errors.New("herdr: workspace create returned no workspace or pane")
+	}
+	return CreatedWorkspace{ID: out.Workspace.ID, PaneID: out.RootPane.ID}, nil
+}
+
 // CloseWorkspace closes one workspace, never its group: the worktree workspace
 // is linked to the repository's, and closing the group would take that too.
 func (c *Client) CloseWorkspace(ctx context.Context, workspaceID string) error {

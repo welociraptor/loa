@@ -274,3 +274,62 @@ func TestReportJSONCarriesTheSections(t *testing.T) {
 		t.Fatalf("report = %+v", r)
 	}
 }
+
+func TestImportCreatesTasksWithDependencies(t *testing.T) {
+	c := newCLI(t)
+	file := filepath.Join(t.TempDir(), "proposal.json")
+	doc := `{"tasks":[
+		{"title":"schema","workspace":"taskflow","priority":3},
+		{"title":"writer","workspace":"taskflow","after":["schema"]}
+	]}`
+	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	out := c.mustRun("import", file)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("import printed %q, want two ids", out)
+	}
+	// The second task waits on the first, by title, before either had an id.
+	show := c.mustRun("show", lines[1])
+	if !strings.Contains(show, "waiting on #"+lines[0]) {
+		t.Errorf("show = %q", show)
+	}
+}
+
+func TestImportAppliesNothingWhenAnythingIsWrong(t *testing.T) {
+	c := newCLI(t)
+	file := filepath.Join(t.TempDir(), "proposal.json")
+	doc := `{"tasks":[
+		{"title":"fine","workspace":"taskflow"},
+		{"title":"broken"}
+	]}`
+	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, errOut, code := c.run("import", file)
+	if code != 1 || !strings.Contains(errOut, "workspace is required") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "fine") {
+		t.Errorf("a rejected document still created tasks:\n%s", list)
+	}
+}
+
+func TestImportDryRunCreatesNothing(t *testing.T) {
+	c := newCLI(t)
+	file := filepath.Join(t.TempDir(), "proposal.json")
+	if err := os.WriteFile(file, []byte(`[{"title":"later","workspace":"taskflow"}]`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	out := c.mustRun("import", "-dry-run", file)
+	if !strings.Contains(out, "later") {
+		t.Errorf("dry run printed %q", out)
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "later") {
+		t.Errorf("the dry run created a task:\n%s", list)
+	}
+}

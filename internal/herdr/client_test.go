@@ -23,6 +23,7 @@ case "$1 $2" in
   "pane list")     fixture pane_list.json ;;
   "agent list")    fixture agent_list.json ;;
   "worktree create") fixture worktree_create.json ;;
+  "workspace create") fixture workspace_create.json ;;
   "worktree remove"|"workspace close"|"agent send-keys"|"agent focus"|"workspace focus") echo '{"id":"x","result":{"type":"ok"}}' ;;
   "agent start")   echo '{"id":"x","result":{"type":"ok"}}' ;;
   "agent prompt")
@@ -258,5 +259,19 @@ func TestFocusTargetsTheAgentOrTheWorkspace(t *testing.T) {
 	}
 	if calls[1] != "workspace focus w3" {
 		t.Errorf("calls[1] = %q", calls[1])
+	}
+}
+
+func TestCreateWorkspace(t *testing.T) {
+	h := newHarness(t)
+	ws, err := h.client.CreateWorkspace(context.Background(), "/home/u/.local/state/taskflow/triage/1", "taskflow triage")
+	if err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if ws.ID != "w4" || ws.PaneID != "w4:p1" {
+		t.Fatalf("workspace = %+v", ws)
+	}
+	if got := h.calls(t)[0]; got != "workspace create --cwd /home/u/.local/state/taskflow/triage/1 --label taskflow triage" {
+		t.Errorf("command = %q", got)
 	}
 }

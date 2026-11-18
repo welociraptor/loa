@@ -28,8 +28,10 @@ is something to look at rather than a timeout to interpret.
     internal/live/live.go       187   queue joined with the session (`ps`)
     internal/dash/dash.go       364   the tab: model, keys, view (bubbletea)
     internal/report/report.go   187   the day: done, blocked, queued, open, gap
+    internal/taskspec/taskspec.go 204   a proposal: strict parse, resolve, validate
+    internal/triage/triage.go   148   what the triage agent reads and writes back
     internal/store/migrations/   72   0001–0004
-    tests                     2,785   76 tests, `-race` clean
+    tests                     3,124   93 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -485,15 +487,45 @@ reconciliation decides what it may close. A task's live state is joined as:
   for "the day" needs a window, and the tab shows *now*. Test:
   `TestRunTimeIsMeasuredAtFinish`.
 
-## Phase 5 — triage
+## Phase 5 — triage (done)
 
-- [ ] **26. `taskflow import FILE`.** Read tasks from JSON, validate workspace,
-  scopes and dependencies, create nothing on any error. The boundary exists so
-  an agent can *propose* work without the ability to write the queue directly.
-- [ ] **27. Triage agent.** Read-only allowlist, runs before the workers, writes
-  a proposal file: reorder priorities, split oversized tasks, flag what needs a
-  human, never touch `body` of an existing task. Human approval stays manual
-  until the proposals have been boring for a week.
+- [x] **26. `taskflow import [FILE|-]`.** Read a proposal, validate it whole,
+  apply it in one transaction or not at all. The boundary exists so an agent can
+  *propose* work without the ability to write the queue directly. `internal/taskspec`
+  parses strictly (unknown fields are rejected, not ignored) and resolves `after`
+  references — a title in the same document — into positions, so a proposal can
+  say "this comes after that" before either task has an id. It also rejects
+  cycles: a task waiting on itself would sit in the queue forever and look like a
+  runner bug. `store.Apply` creates the batch and reprioritises existing tasks in
+  one transaction. `-dry-run` prints the validated document and creates nothing,
+  which is the human's review step. Test: `TestParseAcceptsAnObjectOrABareArray`,
+  `TestParseRejectsUnknownFieldsAndJunk`, `TestValidateResolvesAfterReferences`,
+  `TestValidateRejectsUnknownAfterAndDuplicateTitles`, `TestValidateRejectsCycles`,
+  `TestValidateRequiresWorkspaceAndSaneNumbers`,
+  `TestApplyCreatesTheBatchInOneTransaction`, `TestApplyRollsBackWhenAnyPartFails`,
+  plus CLI tests for apply, refusal and dry run.
+- [x] **27. Triage agent.** `taskflow triage` writes the queue — bodies, states,
+  dependencies — into a scratch directory, opens a workspace there, starts an
+  agent with `read,grep,find,ls,write` (no `bash`) and the instruction to write
+  `proposal.json`, then validates what came back and keeps it under
+  `$XDG_STATE_HOME/taskflow/proposals/`. It never applies anything: the queue is
+  only touched by `taskflow import`, and only when a person runs it. A blocked
+  agent is left open with its workspace named, as with a task.
+
+  Live check on a two-task queue it had never seen: it split a task whose title
+  and body disagreed, chained the parts with `after`, gave the first part the
+  higher priority because it blocks the others, and produced four notes including
+  the title/body mismatch and a bodiless task. `import` then created the three
+  tasks with their dependency chain, and the workspace closed itself.
+
+  Two honest limits: the "read-only" allowlist is a tool list, not a sandbox — an
+  agent with `write` can write anywhere under its scratch directory, which is
+  why the directory holds nothing else; and a triage run costs one model call,
+  which is the only place in this design where a model talks to a model's
+  output without a commit in between.
+
+  Notes are printed by `import` as well as by `triage`, because they are the part
+  a person has to act on.
 
 ## Not planned, on purpose
 
@@ -516,6 +548,8 @@ reconciliation decides what it may close. A task's live state is joined as:
 - **No LLM scheduler.** Priority, dependency and scope rules are SQL.
 - **No push, no merge, no branch deletion by an agent.** The runner keeps
   branches; a human merges them.
+- **No agent writes the queue.** Triage proposes, `import` applies, a person
+  runs it. That is the only boundary that makes an agent's opinion harmless.
 - **No retry storms.** `not_before` is a fixed delay, not exponential backoff —
   the simpler rule is the one that stays correct.
 

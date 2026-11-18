@@ -38,6 +38,8 @@ taskflow show ID                      # fields, and why it is not running
 taskflow ps [-json]                   # the queue joined with the live session
 taskflow dash                         # the tab: state, and the keys to act on it
 taskflow report [-since 24h|-json]    # what the day did, and how long it has been still
+taskflow triage                       # ask an agent to propose work; never applies it
+taskflow import FILE [-dry-run]       # apply a proposal: tasks, and priority changes
 taskflow lease -owner runner-1 -ttl 1h    # prints the task as JSON, or null
 taskflow done ID -branch b/thing -result "shipped"
 taskflow fail ID -result "test suite red"
@@ -139,6 +141,36 @@ TASKFLOW_DB="$XDG_STATE_HOME/taskflow/tasks.db" taskflow dash
 
 Task worktrees are separate linked workspaces under the repository's own
 workspace, so the tab is an index rather than a container.
+
+## Proposals
+
+An agent may propose work; only a person applies it. `taskflow triage` writes the
+queue into a scratch directory (bodies included, dependencies resolved), runs a
+`read,grep,find,ls,write` agent there with no `bash`, and keeps whatever
+`proposal.json` comes back under `$XDG_STATE_HOME/taskflow/proposals/`. It never
+touches the queue.
+
+```
+taskflow triage          # -> proposals/20261118T185722Z.json, plus its notes
+taskflow import -dry-run proposals/20261118T185722Z.json
+taskflow import proposals/20261118T185722Z.json
+```
+
+The document is the same shape in both directions:
+
+```json
+{"tasks": [{"title": "...", "body": "...", "workspace": "nixos", "priority": 4,
+            "after": ["another title in this file"]}],
+ "reprioritise": [{"id": 4, "priority": 9}],
+ "notes": ["#2 has no body, so it cannot be actioned"]}
+```
+
+`after` names a title in the same file, so a proposal can order tasks that do not
+have ids yet. Validation is whole-document: unknown fields are rejected rather
+than ignored, a title referenced but absent is an error, and a dependency cycle
+is refused because it would sit in the queue forever looking like a runner bug.
+`import` then applies tasks and priority changes in **one transaction**, so a
+document with one bad task creates nothing.
 
 ## The day
 
