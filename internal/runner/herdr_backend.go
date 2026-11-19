@@ -35,14 +35,23 @@ func (h *Herdr) Open(ctx context.Context, req OpenRequest) (Handle, error) {
 		return Handle{}, err
 	}
 
-	created, err := h.Client.CreateWorktree(ctx, herdr.WorktreeRequest{
-		WorkspaceID: workspaceID,
-		Branch:      req.Branch,
-		Base:        req.Base,
-		Label:       h.Label(req.TaskID),
-	})
+	created, err := h.createWorktree(ctx, workspaceID, req, req.Base)
+	usedBase := req.Base
+	// Herdr, not the runner, resolves the base ref, so a missing dependency
+	// branch only shows up as a failed create. Branching from the configured
+	// base instead is what keeps a merged-and-tidied dependency from costing
+	// the dependent task an attempt.
+	if err != nil && req.FallbackBase != "" && req.FallbackBase != req.Base {
+		var fallbackErr error
+		created, fallbackErr = h.createWorktree(ctx, workspaceID, req, req.FallbackBase)
+		if fallbackErr != nil {
+			return Handle{}, fmt.Errorf("%w (and from %s: %v)", err, req.FallbackBase, fallbackErr)
+		}
+		usedBase = req.FallbackBase
+		err = nil
+	}
 	if err != nil {
-		return Handle{}, fmt.Errorf("create worktree: %w", err)
+		return Handle{}, err
 	}
 
 	// The branch starts at the base commit, so HEAD is that commit right now.
@@ -61,6 +70,7 @@ func (h *Herdr) Open(ctx context.Context, req OpenRequest) (Handle, error) {
 		Worktree:    created.Path,
 		Repo:        created.Repo,
 		Base:        base,
+		BaseRef:     usedBase,
 		Branch:      req.Branch,
 	}
 
@@ -98,6 +108,20 @@ func (h *Herdr) startAgent(ctx context.Context, req herdr.StartAgentRequest) err
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// createWorktree asks Herdr for one worktree, naming the ref it branches from.
+func (h *Herdr) createWorktree(ctx context.Context, workspaceID string, req OpenRequest, base string) (herdr.Worktree, error) {
+	created, err := h.Client.CreateWorktree(ctx, herdr.WorktreeRequest{
+		WorkspaceID: workspaceID,
+		Branch:      req.Branch,
+		Base:        base,
+		Label:       h.Label(req.TaskID),
+	})
+	if err != nil {
+		return herdr.Worktree{}, fmt.Errorf("create worktree: %w", err)
+	}
+	return created, nil
 }
 
 // resolve turns a workspace label into an id. Exact match only: a task that

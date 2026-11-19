@@ -145,6 +145,16 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 	}
 
 	base, err := gitE(f.repo, "rev-parse", "--verify", req.Base+"^{commit}")
+	usedBase := req.Base
+	// The fake resolves refs the way Herdr does, so a dependency branch that
+	// was tidied away falls back to the configured base instead of failing.
+	if err != nil && req.FallbackBase != "" && req.FallbackBase != req.Base {
+		base, err = gitE(f.repo, "rev-parse", "--verify", req.FallbackBase+"^{commit}")
+		if err != nil {
+			return runner.Handle{}, err
+		}
+		usedBase = req.FallbackBase
+	}
 	if err != nil {
 		return runner.Handle{}, err
 	}
@@ -172,6 +182,7 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 		Worktree:    path,
 		Repo:        f.repo,
 		Base:        base,
+		BaseRef:     usedBase,
 		Branch:      req.Branch,
 	}, nil
 }
@@ -439,6 +450,66 @@ func TestDoneDependencyWithoutABranchLeavesTheBaseAlone(t *testing.T) {
 	}
 	if req.Base != "HEAD" {
 		t.Errorf("child base = %q, want the configured base HEAD", req.Base)
+	}
+}
+
+func TestTaskWhoseDependencyBranchIsGoneBranchesFromTheBase(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	b.agent = committer(t)
+
+	dep := addTask(t, s, store.NewTask{Title: "first"})
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	depTask, err := s.Get(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("get dependency: %v", err)
+	}
+	depCommit := gitRun(t, repo, "rev-parse", depTask.Branch+"^{commit}")
+
+	// The dependency was merged and its branch tidied away, but the store still
+	// records it. The child must fall back to the configured base rather than
+	// failing to create a worktree.
+	gitRun(t, repo, "branch", "--delete", "--force", depTask.Branch)
+
+	child := addTask(t, s, store.NewTask{Title: "second", Deps: []int64{dep.ID}})
+	var logs bytes.Buffer
+	if _, err := newRunner(t, s, b, func(c *runner.Config) {
+		c.Logger = log.New(&logs, "", 0)
+	}).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	req, ok := b.openRequest(child.ID)
+	if !ok {
+		t.Fatal("the child task was never dispatched")
+	}
+	if req.Base != depTask.Branch {
+		t.Errorf("child base = %q, want the recorded dependency branch %q", req.Base, depTask.Branch)
+	}
+	if req.FallbackBase != "HEAD" {
+		t.Errorf("child fallback = %q, want the configured base HEAD", req.FallbackBase)
+	}
+
+	childTask, err := s.Get(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if childTask.Status != store.Done {
+		t.Fatalf("child status = %q, want done", childTask.Status)
+	}
+	// Falling back means the child starts at the configured base, so the deleted
+	// dependency's commit is not part of its branch.
+	if _, err := gitE(repo, "merge-base", "--is-ancestor", depCommit, childTask.Branch); err == nil {
+		t.Errorf("the child branch %s still contains the deleted dependency commit", childTask.Branch)
+	}
+
+	want := fmt.Sprintf("task %d: cannot branch from dependency branch %s; branching from HEAD", child.ID, depTask.Branch)
+	if !strings.Contains(logs.String(), want) {
+		t.Errorf("log = %q, want %q", logs.String(), want)
 	}
 }
 
