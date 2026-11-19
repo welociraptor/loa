@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -280,8 +281,19 @@ func TestRunCompletesTaskThatCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if stats != (runner.Stats{Tasks: 1, Completed: 1}) {
+	if stats.Tasks != 1 || stats.Completed != 1 || stats.Failed != 0 {
 		t.Fatalf("stats = %+v", stats)
+	}
+	if stats.Run.ID == 0 || stats.Run.Active() || stats.Run.Done != 1 || stats.Run.Failed != 0 {
+		t.Errorf("run row = %+v, want a closed row with one done task", stats.Run)
+	}
+	if len(stats.Outcomes) != 1 {
+		t.Fatalf("outcomes = %+v", stats.Outcomes)
+	}
+	out := stats.Outcomes[0]
+	if out.ID != task.ID || !out.Done || out.Blocked || out.Branch != "loa/1.1" ||
+		out.WorkspaceID != "w1" || out.PaneID != "w1:p1" {
+		t.Errorf("outcome = %+v, want the branch and ids read back from the task row", out)
 	}
 
 	got, err := s.Get(ctx, task.ID)
@@ -314,6 +326,12 @@ func TestRunFailsWhenNothingIsCommitted(t *testing.T) {
 	}
 	if stats.Failed != 1 {
 		t.Errorf("stats = %+v", stats)
+	}
+	if stats.Run.Active() || stats.Run.Failed != 1 || stats.Run.Done != 0 {
+		t.Errorf("run row = %+v, want the failure counted and the row closed", stats.Run)
+	}
+	if len(stats.Outcomes) != 1 || stats.Outcomes[0].Done || stats.Outcomes[0].Blocked {
+		t.Errorf("outcomes = %+v, want one failed task", stats.Outcomes)
 	}
 
 	got, err := s.Get(ctx, task.ID)
@@ -546,6 +564,44 @@ func TestCancelledRunClosesTheWorkspaceAndLeavesTheLease(t *testing.T) {
 	}
 	if got.Status != store.Leased {
 		t.Errorf("status = %s, want leased", got.Status)
+	}
+	active, err := s.ActiveRun(context.Background())
+	if err != nil {
+		t.Fatalf("active run: %v", err)
+	}
+	if active != nil {
+		t.Errorf("run %d is still open after a cancelled run", active.ID)
+	}
+	closed, err := s.Runs(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(closed) != 1 || closed[0].EndedAt == "" {
+		t.Errorf("runs = %+v, want the cancelled run closed", closed)
+	}
+}
+
+func TestSecondRunIsRefusedWhileOneIsActive(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+
+	active, err := s.StartRun(ctx, "someone-else/1", 1, 1)
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+
+	_, err = newRunner(t, s, b, nil).Run(ctx)
+	if !errors.Is(err, store.ErrRunActive) {
+		t.Fatalf("run: %v, want ErrRunActive", err)
+	}
+	for _, want := range []string{strconv.FormatInt(active.ID, 10), "someone-else/1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	if len(b.opens) != 0 {
+		t.Errorf("a refused run leased work: %+v", b.opens)
 	}
 }
 

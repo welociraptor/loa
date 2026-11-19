@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"loa/internal/runner"
+	"loa/internal/store"
 )
 
 // The binary is built once, so these tests exercise argument parsing, exit
@@ -402,5 +406,179 @@ func TestImportDryRunCreatesNothing(t *testing.T) {
 	}
 	if list := c.mustRun("list"); strings.Contains(list, "later") {
 		t.Errorf("the dry run created a task:\n%s", list)
+	}
+}
+
+// seedRun writes one run row directly, so the read-only commands can be tested
+// without a Herdr session.
+func seedRun(t *testing.T, db, owner string, done, failed int, active bool) store.Run {
+	t.Helper()
+	ctx := context.Background()
+	s, err := store.Open(ctx, db)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	run, err := s.StartRun(ctx, owner, 2, 5)
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	if !active {
+		if err := s.FinishRun(ctx, run.ID, done, failed); err != nil {
+			t.Fatalf("finish run: %v", err)
+		}
+	}
+	return run
+}
+
+func TestRunsListsNewestFirstAndMarksTheActiveRow(t *testing.T) {
+	c := newCLI(t)
+	seedRun(t, c.db, "owner/a", 1, 0, false)
+	seedRun(t, c.db, "owner/b", 0, 0, true)
+
+	out := c.mustRun("runs")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("runs = %q", out)
+	}
+	for _, want := range []string{"ID", "OWNER", "STARTED", "ENDED", "DONE", "FAILED", "BUDGET"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("header %q is missing %q", lines[0], want)
+		}
+	}
+	if !strings.Contains(lines[1], "owner/b") || !strings.Contains(lines[1], "- [active]") {
+		t.Errorf("first row = %q, want the open run marked", lines[1])
+	}
+	if !strings.Contains(lines[2], "owner/a") || strings.Contains(lines[2], "[active]") {
+		t.Errorf("second row = %q, want the finished run", lines[2])
+	}
+	if !strings.Contains(lines[1], "2/5") || !strings.Contains(lines[2], "2/5") {
+		t.Errorf("rows = %q, want the workers/budget column", lines[1:])
+	}
+
+	limited := strings.Split(strings.TrimSpace(c.mustRun("runs", "-limit", "1")), "\n")
+	if len(limited) != 2 || !strings.Contains(limited[1], "owner/b") {
+		t.Errorf("runs -limit 1 = %q", limited)
+	}
+}
+
+func TestRunsJSONCarriesEveryRun(t *testing.T) {
+	c := newCLI(t)
+	first := seedRun(t, c.db, "owner/a", 1, 0, false)
+	second := seedRun(t, c.db, "owner/b", 0, 0, true)
+
+	var got struct {
+		Runs []struct {
+			ID        int64  `json:"id"`
+			Owner     string `json:"owner"`
+			StartedAt string `json:"started_at"`
+			EndedAt   string `json:"ended_at"`
+			Workers   int    `json:"workers"`
+			MaxTasks  int    `json:"max_tasks"`
+			Done      int    `json:"done"`
+			Failed    int    `json:"failed"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("runs", "-json")), &got); err != nil {
+		t.Fatalf("runs -json: %v", err)
+	}
+	if len(got.Runs) != 2 {
+		t.Fatalf("runs = %+v", got.Runs)
+	}
+	newest, older := got.Runs[0], got.Runs[1]
+	if newest.ID != second.ID || newest.Owner != "owner/b" || newest.EndedAt != "" {
+		t.Errorf("newest = %+v, want the active run", newest)
+	}
+	if older.ID != first.ID || older.Owner != "owner/a" || older.Done != 1 || older.EndedAt == "" {
+		t.Errorf("older = %+v, want the finished run", older)
+	}
+	if newest.Workers != 2 || newest.MaxTasks != 5 || older.Workers != 2 || older.MaxTasks != 5 {
+		t.Errorf("budget fields = %+v / %+v", newest, older)
+	}
+}
+
+func TestRunJSONShape(t *testing.T) {
+	stats := runner.Stats{
+		Run: store.Run{
+			ID: 12, Owner: "host/pid", StartedAt: "2026-11-19T10:00:00Z",
+			EndedAt: "2026-11-19T10:05:00Z", Workers: 4, MaxTasks: 4, Done: 1, Failed: 2,
+		},
+		Outcomes: []runner.TaskOutcome{
+			{ID: 1, Done: true, Branch: "loa/1.1", WorkspaceID: "w4", PaneID: "w4:p1"},
+			{ID: 2, Blocked: true, Branch: "loa/2.1", WorkspaceID: "w5", PaneID: "w5:p1"},
+			{ID: 3},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := printRunJSON(&buf, stats); err != nil {
+		t.Fatalf("print: %v", err)
+	}
+
+	var got struct {
+		Run struct {
+			ID        int64  `json:"id"`
+			Owner     string `json:"owner"`
+			StartedAt string `json:"started_at"`
+			EndedAt   string `json:"ended_at"`
+			Workers   int    `json:"workers"`
+			MaxTasks  int    `json:"max_tasks"`
+			Done      int    `json:"done"`
+			Failed    int    `json:"failed"`
+		} `json:"run"`
+		Tasks []struct {
+			ID          int64  `json:"id"`
+			Status      string `json:"status"`
+			Branch      string `json:"branch"`
+			WorkspaceID string `json:"workspace_id"`
+			PaneID      string `json:"pane_id"`
+			Blocked     bool   `json:"blocked"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("run json: %v: %s", err, buf.String())
+	}
+
+	if got.Run.ID != 12 || got.Run.Owner != "host/pid" || got.Run.Workers != 4 ||
+		got.Run.MaxTasks != 4 || got.Run.Done != 1 || got.Run.Failed != 2 ||
+		got.Run.StartedAt == "" || got.Run.EndedAt == "" {
+		t.Errorf("run = %+v", got.Run)
+	}
+	if len(got.Tasks) != 3 {
+		t.Fatalf("tasks = %+v", got.Tasks)
+	}
+	want := []struct {
+		id     int64
+		status string
+		branch string
+		ws     string
+		pane   string
+		block  bool
+	}{
+		{1, "done", "loa/1.1", "w4", "w4:p1", false},
+		{2, "blocked", "loa/2.1", "w5", "w5:p1", true},
+		{3, "failed", "", "", "", false},
+	}
+	for i, w := range want {
+		task := got.Tasks[i]
+		if task.ID != w.id || task.Status != w.status || task.Branch != w.branch ||
+			task.WorkspaceID != w.ws || task.PaneID != w.pane || task.Blocked != w.block {
+			t.Errorf("task %d = %+v, want %+v", i, task, w)
+		}
+	}
+}
+
+func TestRunJSONWithoutASessionExitsOneAndPrintsNothing(t *testing.T) {
+	c := newCLI(t)
+	stdout, stderr, code := c.run("run", "-json")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no document when the runner never started", stdout)
+	}
+	if !strings.Contains(stderr, "Herdr") {
+		t.Errorf("stderr = %q", stderr)
 	}
 }

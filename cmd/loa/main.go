@@ -44,7 +44,8 @@ usage:
   loa resolve ID [-fail] [-result TEXT]
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
-  loa run    [-workers N] [-max N] [-timeout 45m]
+  loa run    [-workers N] [-max N] [-timeout 45m] [-json]
+  loa runs   [-limit N] [-json]    # every run, newest first
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
 
 all commands accept -db PATH (default $LOA_DB, else loa.db)`
@@ -84,6 +85,8 @@ func main() {
 		err = cmdFinish(ctx, os.Args[2:], false)
 	case "run":
 		err = cmdRun(ctx, os.Args[2:])
+	case "runs":
+		err = cmdRuns(ctx, os.Args[2:])
 	case "dash":
 		err = cmdDash(ctx, os.Args[2:])
 	case "-h", "--help", "help":
@@ -776,7 +779,11 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer
 
 func cmdRun(ctx context.Context, args []string) error {
 	var flags runFlags
-	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
+	var asJSON bool
+	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) {
+		registerRunFlags(fs, &flags)
+		fs.BoolVar(&asJSON, "json", false, "emit the run outcome as JSON")
+	})
 	if err != nil {
 		return err
 	}
@@ -790,12 +797,133 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	stats, err := r.Run(ctx)
+	stats, runErr := r.Run(ctx)
+
+	// A run that never started has no row to report; the error says why.
+	if asJSON && stats.Run.ID != 0 {
+		if err := printRunJSON(os.Stdout, stats); err != nil {
+			return err
+		}
+	}
+	if runErr != nil {
+		return runErr
+	}
+
+	fmt.Fprintf(os.Stderr, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
+	return nil
+}
+
+type runJSON struct {
+	ID        int64  `json:"id"`
+	Owner     string `json:"owner"`
+	StartedAt string `json:"started_at"`
+	EndedAt   string `json:"ended_at"`
+	Workers   int    `json:"workers"`
+	MaxTasks  int    `json:"max_tasks"`
+	Done      int    `json:"done"`
+	Failed    int    `json:"failed"`
+}
+
+type runTaskJSON struct {
+	ID          int64  `json:"id"`
+	Status      string `json:"status"`
+	Branch      string `json:"branch"`
+	WorkspaceID string `json:"workspace_id"`
+	PaneID      string `json:"pane_id"`
+	Blocked     bool   `json:"blocked"`
+}
+
+type runReportJSON struct {
+	Run   runJSON       `json:"run"`
+	Tasks []runTaskJSON `json:"tasks"`
+}
+
+func newRunJSON(run store.Run) runJSON {
+	return runJSON{
+		ID: run.ID, Owner: run.Owner, StartedAt: run.StartedAt, EndedAt: run.EndedAt,
+		Workers: run.Workers, MaxTasks: run.MaxTasks, Done: run.Done, Failed: run.Failed,
+	}
+}
+
+// printRunJSON is the machine-readable half of `loa run`: one document, and
+// nothing else on stdout. The runner's log stays on stderr.
+func printRunJSON(w io.Writer, stats runner.Stats) error {
+	out := runReportJSON{
+		Run:   newRunJSON(stats.Run),
+		Tasks: make([]runTaskJSON, 0, len(stats.Outcomes)),
+	}
+	for _, task := range stats.Outcomes {
+		status := "failed"
+		switch {
+		case task.Done:
+			status = "done"
+		case task.Blocked:
+			status = "blocked"
+		}
+		out.Tasks = append(out.Tasks, runTaskJSON{
+			ID: task.ID, Status: status, Branch: task.Branch,
+			WorkspaceID: task.WorkspaceID, PaneID: task.PaneID, Blocked: task.Blocked,
+		})
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// cmdRuns lists every run, newest first. The open row is marked rather than
+// hidden: a run left active by a crash is exactly what a person needs to see.
+func cmdRuns(ctx context.Context, args []string) error {
+	var (
+		asJSON bool
+		limit  int
+	)
+	s, positional, err := open(ctx, "runs", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&asJSON, "json", false, "emit the runs as JSON")
+		fs.IntVar(&limit, "limit", 20, "how many runs to show")
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
-	return nil
+	defer s.Close()
+
+	if len(positional) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+
+	runs, err := s.Runs(ctx, limit)
+	if err != nil {
+		return err
+	}
+
+	if asJSON {
+		out := struct {
+			Runs []runJSON `json:"runs"`
+		}{Runs: make([]runJSON, 0, len(runs))}
+		for _, run := range runs {
+			out.Runs = append(out.Runs, newRunJSON(run))
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "ID\tOWNER\tSTARTED\tENDED\tDONE\tFAILED\tBUDGET"); err != nil {
+		return err
+	}
+	for _, run := range runs {
+		ended := run.EndedAt
+		if run.Active() {
+			ended = "- [active]"
+		}
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d\t%d/%d\n",
+			run.ID, run.Owner, run.StartedAt, ended, run.Done, run.Failed,
+			run.Workers, run.MaxTasks); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
 }
 
 // controls is what the dashboard tab may do. Each method is a call that exists
