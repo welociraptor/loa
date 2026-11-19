@@ -555,7 +555,7 @@ limit worth fixing rather than documenting.
   dependency's commit; a task whose dependency was re-queued still branches from
   the base.
 
-## Phase 7 — the factory (planned)
+## Phase 7 — the factory (done)
 
 A plan becomes a workflow: a planner turns a goal into phases of parallel
 tasks, each change is implemented and reviewed, and an approved change with a
@@ -645,7 +645,7 @@ policy in the workflow, and no model is trusted with either.
   person. Test: approve and green merges; a red check refuses; a conflict
   refuses; a wrong branch refuses.
 
-- [ ] **33. The plan, and `loa apply`.** `taskspec` learns `phases` and compiles
+- [x] **33. The plan, and `loa apply`.** `taskspec` learns `phases` and compiles
   them into dependencies; `0010_task_plan.sql` gives them a plan id so `report`
   names the plan. `loa plan -workflow FILE GOAL` runs the planner agent like
   `triage` (a scratch workspace, `plan.json`, never applied) and `loa import`
