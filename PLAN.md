@@ -5,8 +5,9 @@ handing one task at a time to an agent in its own worktree, and where the result
 of a day is legible afterwards without reading logs — including while it is
 running, from the terminal the human already has open.
 
-The store is the only shared state. Agents never write to it, so a confused
-worker can waste its own attempt and nothing else.
+The store is the only shared state. A worker does not write to it; the
+coordinator may (see "The coordinator" below). That boundary is policy, not a
+sandbox: a worker with `bash` can run `loa` too.
 
 Execution is Herdr: the runner itself lives in a pane, and each task becomes a
 worktree-backed workspace with one agent in it, so a stalled or blocked worker
@@ -30,7 +31,7 @@ is something to look at rather than a timeout to interpret.
     internal/report/report.go   187   the day: done, blocked, queued, open, gap
     internal/taskspec/taskspec.go 204   a proposal: strict parse, resolve, validate
     internal/triage/triage.go   148   what the triage agent reads and writes back
-    internal/store/migrations/   72   0001–0004
+    internal/store/migrations/   91   0001–0005, including runs and its active index
     tests                     3,124   93 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
@@ -116,8 +117,10 @@ What it costs, and why the trade still holds:
   uniseg, runewidth, …), measured with `go list -deps`. That is the price of not
   writing a terminal loop; the view is still a plain string built by a pure
   function, so it is testable without a terminal.
-- **One run at a time per dashboard.** The queue would survive two, but the
-  budget would be spent twice.
+- **One run at a time, enforced by SQL.** A partial unique index on `runs`
+  allows only one active run, so two dashboards, two panes or two processes
+  cannot both spend the budget. The run itself is a row; `loa runs` is the
+  record.
 - **The queue is the contract:** every rule above is enforced in SQL, not in Go
   call ordering, so a second process cannot bypass it.
 - **Herdr is the execution substrate.** The runner does not exec agents and
@@ -330,8 +333,9 @@ written and checked by hand against a live session.
 
 ### Starting a run
 
-Decision: no timer. A run starts when a human starts it — `s` in the dashboard,
-or `loa run` in any pane. Three reasons, in order of weight:
+Decision: no timer. A run starts when a person or a coordinator starts it —
+`s` in the dashboard, `loa run`, or `loa run -json`. Three reasons, in order of
+weight:
 
 1. The failure mode that matters is a blocked agent, and that needs a person.
    A scheduler delivers work to nobody.
@@ -490,8 +494,10 @@ reconciliation decides what it may close. A task's live state is joined as:
 ## Phase 5 — triage (done)
 
 - [x] **26. `loa import [FILE|-]`.** Read a proposal, validate it whole,
-  apply it in one transaction or not at all. The boundary exists so an agent can
-  *propose* work without the ability to write the queue directly. `internal/taskspec`
+  apply it in one transaction or not at all. The proposal boundary exists so an
+  agent can propose work without the ability to write the queue directly; a
+  trusted coordinator may apply it, but the proposing agent cannot apply its own
+  document. `internal/taskspec`
   parses strictly (unknown fields are rejected, not ignored) and resolves `after`
   references — a title in the same document — into positions, so a proposal can
   say "this comes after that" before either task has an id. It also rejects
@@ -509,8 +515,8 @@ reconciliation decides what it may close. A task's live state is joined as:
   agent with `read,grep,find,ls,write` (no `bash`) and the instruction to write
   `proposal.json`, then validates what came back and keeps it under
   `$XDG_STATE_HOME/loa/proposals/`. It never applies anything: the queue is
-  only touched by `loa import`, and only when a person runs it. A blocked
-  agent is left open with its workspace named, as with a task.
+  only touched by `loa import`, run by a person or a trusted coordinator. A
+  blocked agent is left open with its workspace named, as with a task.
 
   Live check on a two-task queue it had never seen: it split a task whose title
   and body disagreed, chained the parts with `after`, gave the first part the
@@ -546,10 +552,34 @@ limit worth fixing rather than documenting.
   dependency's commit; a task whose dependency was re-queued still branches from
   the base.
 
+## The coordinator (decided)
+
+`loa` may be driven by a coordinator agent, not only by a person. Three
+decisions define that mode; each widens the old design deliberately.
+
+- **A coordinator may write the queue.** Triage used to propose and a person
+  apply, so an agent's opinion could not become work by itself. A coordinator
+  exists to turn the day's state into the next queue, so it may run `loa add`
+  and `loa import` itself. The boundary is now policy: a worker with `bash` can
+  run `loa` too, and nothing sandboxes either. What still holds is that the
+  queue is the only coordination channel, and every change is a recorded
+  transition rather than a conversation.
+- **The run record is a table, and one active run is SQL.** A run is not a log
+  line or a flag in the dashboard: `runs` stores who started it, its budget,
+  when it ended and what it settled. `loa runs` reads it, and `loa run -json`
+  emits machine-readable results for a coordinator. The single-active-run
+  invariant is the partial unique index `runs_one_active`, so a second process
+  racing to start a run loses in SQLite, not in Go or in the tab.
+- **There is no check command.** Done still means a commit on the task's
+  branch, and `loa run` judges that itself. A coordinator may read the result
+  and decide what to queue next, but it cannot mark work done without a commit.
+  A separate check command would be a second definition of done, free to
+  disagree with the first.
+
 ## Not planned, on purpose
 
-- **No timer, no daemon, no scheduler.** A run is something a person starts,
-  and the dashboard is where they start it.
+- **No timer, no daemon, no scheduler.** A run is something a person or a
+  coordinator starts, and the dashboard is where a person starts it.
 - **No second execution backend.** Herdr is the only way a task runs. A headless
   path would double every failure mode to save one attach.
 - **No web UI.** The dashboard is a pane because the workers are panes; a
@@ -567,15 +597,17 @@ limit worth fixing rather than documenting.
 - **No LLM scheduler.** Priority, dependency and scope rules are SQL.
 - **No push, no merge, no branch deletion by an agent.** The runner keeps
   branches; a human merges them.
-- **No agent writes the queue.** Triage proposes, `import` applies, a person
-  runs it. That is the only boundary that makes an agent's opinion harmless.
+- **No sandbox around the queue.** A coordinator may write it, and a worker
+  with `bash` can too. The rules that matter are SQL transitions, not the
+  absence of a command.
 - **No retry storms.** `not_before` is a fixed delay, not exponential backoff —
   the simpler rule is the one that stays correct.
 
 ## Known limitations
 
-- **Nothing runs unless someone starts it.** A missed day is a real gap; step
-  24 reports it, but nothing reminds you beforehand.
+- **Nothing runs unless someone starts it.** A person or a coordinator must
+  start a run; a missed day is a real gap. Step 24 reports it, but nothing
+  reminds you beforehand.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
@@ -597,10 +629,10 @@ limit worth fixing rather than documenting.
 - **Cost is visible only as wall time**, to the second, and not as tokens. It is
   also the attempt's duration, not the model's thinking time — a worker that
   spent three minutes running tests reports three minutes.
-- **One Herdr session.** Two runners in two sessions pointed at one database
-  would each lease distinct tasks and create their own worktrees, so they no
-  longer collide by path — but nothing stops that configuration from being a
-  surprise.
+- **One active run, across sessions and dashboards.** The `runs` index refuses
+  a second run sharing the database, so two sessions cannot split the queue.
+  Two separate databases can still be driven independently; nothing joins
+  them.
 - **Dependencies order execution, not content** (step 28): two tasks in a chain
   do not share a base, so the later one cannot build on the earlier one's commit.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It

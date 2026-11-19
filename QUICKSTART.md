@@ -14,8 +14,9 @@ until you start a run.
   instructions are called the body.
 - **Workspace**: a Herdr workspace that points at a git repository. A task names
   the workspace *label*, never a filesystem path.
-- **Run**: a person starts it inside a Herdr pane. loa leases runnable tasks,
-  starts agents in worktree workspaces, and cleans the worktrees up afterwards.
+- **Run**: a person or a trusted coordinator starts it inside a Herdr pane. loa
+  leases runnable tasks, starts agents in worktree workspaces, and cleans the
+  worktrees up afterwards.
 - **Branch**: each attempt works on `loa/<task-id>.<attempt>`. That branch is
   the deliverable. Uncommitted work is discarded.
 
@@ -340,6 +341,10 @@ in the same proposal by title, so work can be ordered before ids exist:
 Notes are printed by both `triage` and `import`; they are for the human and are
 never applied.
 
+A trusted coordinator can apply and run by itself: `loa import FILE`, then
+`loa run -json`, and read the record with `loa runs`. A blocked task still goes
+to a person. That boundary is policy, not a sandbox.
+
 ## Command reference
 
 | Command | Purpose |
@@ -349,7 +354,8 @@ never applied.
 | `loa show ID` | Show one task and why it is or is not runnable. |
 | `loa ps [-json]` | Show the queue joined with live session state. |
 | `loa report [-since 24h\|YYYY-MM-DD] [-json]` | Show what happened in a window. |
-| `loa run [flags]` | Work the queue inside Herdr. |
+| `loa run [flags] [-json]` | Work the queue inside Herdr; `-json` emits machine-readable results. |
+| `loa runs` | List the run record, newest first. |
 | `loa dash [flags]` | Open the dashboard inside Herdr. |
 | `loa unblock ID` | Return a blocked task to the queue. |
 | `loa resolve ID [-fail] [-result TEXT]` | Settle a non-leased task done, or blocked with `-fail`. |
