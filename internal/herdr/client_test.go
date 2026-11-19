@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -101,13 +100,16 @@ func newHarness(t *testing.T, extraEnv ...string) *harness {
 	return &harness{client: &herdr.Client{Bin: bin}, argsDir: argsDir}
 }
 
+// testdataDir is where the fixtures live. The test binary runs in the package
+// directory; runtime.Caller would name a path the sandboxed gate rewrites with
+// -trimpath and therefore cannot read.
 func testdataDir(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate the test source")
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("working directory: %v", err)
 	}
-	return filepath.Join(filepath.Dir(file), "testdata")
+	return filepath.Join(wd, "testdata")
 }
 
 // calls returns every invocation the client made, each as its argument list.
