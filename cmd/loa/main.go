@@ -251,6 +251,20 @@ func cmdList(ctx context.Context, args []string) error {
 	return w.Flush()
 }
 
+// edgeList is the whole dependency graph in one field, including edges whose
+// task is done. Blockers is the separate explanation of what actually holds a
+// task.
+func edgeList(deps []store.Dep) string {
+	if len(deps) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(deps))
+	for i, d := range deps {
+		parts[i] = fmt.Sprintf("#%d (%s) %q", d.ID, d.Status, d.Title)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func cmdShow(ctx context.Context, args []string) error {
 	s, positional, err := open(ctx, "show", args, func(*flag.FlagSet) {})
 	if err != nil {
@@ -267,6 +281,10 @@ func cmdShow(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	dependents, err := s.Dependents(ctx, id)
+	if err != nil {
+		return err
+	}
 	blockers, err := s.Blockers(ctx, id, time.Now())
 	if err != nil {
 		return err
@@ -279,6 +297,8 @@ func cmdShow(ctx context.Context, args []string) error {
 		fmt.Sprintf("role:\t%s", task.Role),
 		fmt.Sprintf("priority:\t%d", task.Priority),
 		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
+		fmt.Sprintf("depends on:\t%s", edgeList(task.Deps)),
+		fmt.Sprintf("needed by:\t%s", edgeList(dependents)),
 	}
 	if task.PlanID != "" {
 		lines = append(lines, fmt.Sprintf("plan:\t%s", task.PlanID))

@@ -1152,17 +1152,18 @@ func TestClosedStoreRefusesWork(t *testing.T) {
 			_, err := s.Apply(ctx, []store.BatchItem{{NewTask: store.NewTask{Title: "later", Workspace: "loa"}}}, nil)
 			return err
 		},
-		"get":      func() error { _, err := s.Get(ctx, id); return err },
-		"list":     func() error { _, err := s.List(ctx); return err },
-		"lease":    func() error { _, err := s.Lease(ctx, "test", time.Hour, time.Now()); return err },
-		"complete": func() error { return s.Complete(ctx, id, "b/x", "ok") },
-		"fail":     func() error { return s.Fail(ctx, id, "nope") },
-		"attach":   func() error { return s.Attach(ctx, id, "w1", "w1:p1") },
-		"unblock":  func() error { return s.Unblock(ctx, id) },
-		"resolve":  func() error { return s.Resolve(ctx, id, true, "late") },
-		"claims":   func() error { _, err := s.Claims(ctx); return err },
-		"deps":     func() error { _, err := s.Deps(ctx, id); return err },
-		"blockers": func() error { _, err := s.Blockers(ctx, id, time.Now()); return err },
+		"get":        func() error { _, err := s.Get(ctx, id); return err },
+		"list":       func() error { _, err := s.List(ctx); return err },
+		"lease":      func() error { _, err := s.Lease(ctx, "test", time.Hour, time.Now()); return err },
+		"complete":   func() error { return s.Complete(ctx, id, "b/x", "ok") },
+		"fail":       func() error { return s.Fail(ctx, id, "nope") },
+		"attach":     func() error { return s.Attach(ctx, id, "w1", "w1:p1") },
+		"unblock":    func() error { return s.Unblock(ctx, id) },
+		"resolve":    func() error { return s.Resolve(ctx, id, true, "late") },
+		"claims":     func() error { _, err := s.Claims(ctx); return err },
+		"deps":       func() error { _, err := s.Deps(ctx, id); return err },
+		"dependents": func() error { _, err := s.Dependents(ctx, id); return err },
+		"blockers":   func() error { _, err := s.Blockers(ctx, id, time.Now()); return err },
 	}
 
 	for name, op := range ops {
@@ -1533,6 +1534,83 @@ func TestDepsOrderAndMissingTask(t *testing.T) {
 	}
 	if len(missing) != 0 {
 		t.Errorf("missing task has deps %+v", missing)
+	}
+}
+
+func TestTaskCarriesDependenciesInGetAndList(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	first := add(t, s, store.NewTask{Title: "first", Workspace: "loa"})
+	second := add(t, s, store.NewTask{Title: "second", Workspace: "loa"})
+	child := add(t, s, store.NewTask{Title: "child", Workspace: "loa", Deps: []int64{second, first}})
+
+	// A done edge still belongs to the task; it is not removed from the graph.
+	if got := lease(t, s, time.Now()); got == nil || got.ID != first {
+		t.Fatalf("lease = %v, want first dependency %d", got, first)
+	}
+	if err := s.Complete(ctx, first, "b/first", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	want := []store.Dep{
+		{ID: first, Title: "first", Status: store.Done},
+		{ID: second, Title: "second", Status: store.New},
+	}
+	task, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !slices.Equal(task.Deps, want) {
+		t.Errorf("get deps = %+v, want %+v", task.Deps, want)
+	}
+
+	tasks, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, listed := range tasks {
+		if listed.ID == child {
+			if !slices.Equal(listed.Deps, want) {
+				t.Errorf("list deps = %+v, want %+v", listed.Deps, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("child %d missing from list %+v", child, tasks)
+}
+
+func TestDependentsListsTasksInIDOrder(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	dep := add(t, s, store.NewTask{Title: "dep", Workspace: "loa"})
+	writer := add(t, s, store.NewTask{Title: "writer", Workspace: "loa", Deps: []int64{dep}})
+	reader := add(t, s, store.NewTask{Title: "reader", Workspace: "loa", Deps: []int64{dep}})
+	unrelated := add(t, s, store.NewTask{Title: "unrelated", Workspace: "loa"})
+
+	got, err := s.Dependents(ctx, dep)
+	if err != nil {
+		t.Fatalf("dependents: %v", err)
+	}
+	want := []store.Dep{
+		{ID: writer, Title: "writer", Status: store.New},
+		{ID: reader, Title: "reader", Status: store.New},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("dependents = %+v, want %+v", got, want)
+	}
+
+	if none, err := s.Dependents(ctx, unrelated); err != nil {
+		t.Errorf("dependents of a task nothing waits on: %v", err)
+	} else if len(none) != 0 {
+		t.Errorf("dependents of %d = %+v, want none", unrelated, none)
+	}
+
+	if none, err := s.Dependents(ctx, 999); err != nil {
+		t.Errorf("dependents of a missing task: %v", err)
+	} else if len(none) != 0 {
+		t.Errorf("missing task has dependents %+v", none)
 	}
 }
 

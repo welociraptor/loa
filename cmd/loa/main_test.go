@@ -87,6 +87,18 @@ func (c *cli) mustRun(args ...string) string {
 	return out
 }
 
+// showField is the value after a label in `loa show`'s aligned output.
+func showField(t *testing.T, show, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(show, "\n") {
+		if strings.HasPrefix(line, label) {
+			return strings.TrimSpace(strings.TrimPrefix(line, label))
+		}
+	}
+	t.Fatalf("show has no %q line:\n%s", label, show)
+	return ""
+}
+
 func TestAddListLeaseDone(t *testing.T) {
 	c := newCLI(t)
 
@@ -147,6 +159,48 @@ func TestShowExplainsWhyATaskIsNotRunning(t *testing.T) {
 	}
 	if strings.Contains(show, "runnable:\tyes") {
 		t.Errorf("show claims a blocked task is runnable: %q", show)
+	}
+}
+
+func TestShowNamesADoneDependency(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "child", "-dep", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "1", "-result", "finished")
+
+	show := c.mustRun("show", "2")
+	if got, want := showField(t, show, "depends on:"), `#1 (done) "root"`; got != want {
+		t.Errorf("depends on = %q, want %q", got, want)
+	}
+	// The edge list is not the blocker explanation: a done dependency holds nothing.
+	if strings.Contains(show, "waiting on #1") {
+		t.Errorf("show names a done dependency as a blocker: %q", show)
+	}
+}
+
+func TestShowPrintsAnEmptyDependentList(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "lonely")
+
+	show := c.mustRun("show", "1")
+	if got, want := showField(t, show, "needed by:"), "-"; got != want {
+		t.Errorf("needed by = %q, want %q", got, want)
+	}
+}
+
+func TestShowNamesBothDirections(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle", "-dep", "1")
+	c.mustRun("add", "-workspace", "loa", "-title", "leaf", "-dep", "2")
+
+	show := c.mustRun("show", "2")
+	if got, want := showField(t, show, "depends on:"), `#1 (new) "root"`; got != want {
+		t.Errorf("depends on = %q, want %q", got, want)
+	}
+	if got, want := showField(t, show, "needed by:"), `#3 (new) "leaf"`; got != want {
+		t.Errorf("needed by = %q, want %q", got, want)
 	}
 }
 

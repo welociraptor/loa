@@ -43,7 +43,7 @@ var (
 )
 
 // Task is one row of the queue. Scopes are coarse mutual-exclusion domains:
-// two leased tasks never share one.
+// two leased tasks never share one. Deps are the tasks this one waits on.
 type Task struct {
 	ID          int64
 	Title       string
@@ -63,6 +63,7 @@ type Task struct {
 	LeaseExpiry time.Time
 	NotBefore   time.Time // claimable again after a failure; zero means now
 	Scopes      []string
+	Deps        []Dep
 
 	// What the current attempt produced. Empty before the first dispatch.
 	WorkspaceID string
@@ -416,6 +417,48 @@ func loadScopes(ctx context.Context, q querier, t *Task) error {
 	return nil
 }
 
+// loadDeps fills each task's Deps in one query, however many tasks are given.
+func loadDeps(ctx context.Context, q querier, tasks []*Task) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(tasks))
+	args := make([]any, len(tasks))
+	byID := make(map[int64]*Task, len(tasks))
+	for i, t := range tasks {
+		placeholders[i] = "?"
+		args[i] = t.ID
+		byID[t.ID] = t
+	}
+
+	rows, err := q.QueryContext(ctx,
+		`SELECT d.task_id, t.id, t.title, t.status
+		 FROM task_deps d
+		 JOIN tasks t ON t.id = d.depends_on
+		 WHERE d.task_id IN (`+strings.Join(placeholders, ", ")+`)
+		 ORDER BY d.task_id, t.id`, args...)
+	if err != nil {
+		return fmt.Errorf("store: deps: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var taskID int64
+		var d Dep
+		var status string
+		if err := rows.Scan(&taskID, &d.ID, &d.Title, &status); err != nil {
+			return fmt.Errorf("store: deps: %w", err)
+		}
+		d.Status = Status(status)
+		byID[taskID].Deps = append(byID[taskID].Deps, d)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: deps: %w", err)
+	}
+	return nil
+}
+
 // Get returns a single task.
 func (s *Store) Get(ctx context.Context, id int64) (*Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id))
@@ -423,6 +466,9 @@ func (s *Store) Get(ctx context.Context, id int64) (*Task, error) {
 		return nil, err
 	}
 	if err := loadScopes(ctx, s.db, t); err != nil {
+		return nil, err
+	}
+	if err := loadDeps(ctx, s.db, []*Task{t}); err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -462,10 +508,15 @@ func (s *Store) List(ctx context.Context, statuses ...Status) ([]Task, error) {
 		return nil, fmt.Errorf("store: list: %w", err)
 	}
 
+	ptrs := make([]*Task, len(tasks))
 	for i := range tasks {
 		if err := loadScopes(ctx, s.db, &tasks[i]); err != nil {
 			return nil, err
 		}
+		ptrs[i] = &tasks[i]
+	}
+	if err := loadDeps(ctx, s.db, ptrs); err != nil {
+		return nil, err
 	}
 	return tasks, nil
 }
@@ -542,6 +593,9 @@ func (s *Store) Lease(ctx context.Context, owner string, ttl time.Duration, now 
 		return nil, fmt.Errorf("store: lease: %w", err)
 	}
 	if err := loadScopes(ctx, tx, task); err != nil {
+		return nil, err
+	}
+	if err := loadDeps(ctx, tx, []*Task{task}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -44,6 +44,35 @@ func (s *Store) Deps(ctx context.Context, id int64) ([]Dep, error) {
 	return deps, nil
 }
 
+// Dependents returns the tasks that wait on id, in id order.
+func (s *Store) Dependents(ctx context.Context, id int64) ([]Dep, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT t.id, t.title, t.status
+		 FROM task_deps d
+		 JOIN tasks t ON t.id = d.task_id
+		 WHERE d.depends_on = ?
+		 ORDER BY t.id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("store: dependents of %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	var dependents []Dep
+	for rows.Next() {
+		var d Dep
+		var status string
+		if err := rows.Scan(&d.ID, &d.Title, &status); err != nil {
+			return nil, fmt.Errorf("store: dependents of %d: %w", id, err)
+		}
+		d.Status = Status(status)
+		dependents = append(dependents, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: dependents of %d: %w", id, err)
+	}
+	return dependents, nil
+}
+
 // DependencyBase returns the branch of the dependency that finished last among
 // those that are done and recorded one. It returns "" when no dependency
 // qualifies, which is what makes the configured base the fallback. A re-queued
@@ -87,6 +116,9 @@ func (s *Store) ReviewFor(ctx context.Context, id int64) (*Task, error) {
 		return nil, err
 	}
 	if err := loadScopes(ctx, s.db, t); err != nil {
+		return nil, err
+	}
+	if err := loadDeps(ctx, s.db, []*Task{t}); err != nil {
 		return nil, err
 	}
 	return t, nil
