@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -101,6 +102,43 @@ func showField(t *testing.T, show, label string) string {
 	}
 	t.Fatalf("show has no %q line:\n%s", label, show)
 	return ""
+}
+
+// psRows keys the task rows of `loa ps` by id. An orphan has no task id, so it
+// has no row here.
+func psRows(t *testing.T, ps string) map[int64]string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(ps), "\n")
+	rows := make(map[int64]string, len(lines))
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		id, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		rows[id] = line
+	}
+	return rows
+}
+
+// psIDs is the task ids `loa ps` printed, in order. Orphan rows have no id.
+func psIDs(t *testing.T, ps string) []int64 {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(ps), "\n")
+	ids := make([]int64, 0, len(lines)-1)
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if id, err := strconv.ParseInt(fields[0], 10, 64); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // listColumn is a `loa list` row's value keyed by the header, so a test names a
@@ -393,8 +431,42 @@ func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 	if !strings.Contains(lines[0], "SESSION") || !strings.Contains(lines[0], "WORKSPACE") {
 		t.Errorf("header = %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "leased") || !strings.Contains(lines[2], "new") {
+	// Rows are located by id, not by position: ps is a separate order from the tab.
+	rows := psRows(t, out)
+	if !strings.Contains(rows[1], "leased") || !strings.Contains(rows[2], "new") {
 		t.Errorf("rows = %q", lines[1:])
+	}
+}
+
+func TestPsListsTasksNewestFirst(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "oldest")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle")
+	c.mustRun("add", "-workspace", "loa", "-title", "newest")
+	// Status must not decide the order: the oldest is leased, the middle is done.
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "2", "-branch", "loa/2.1", "-result", "shipped")
+
+	ids := psIDs(t, c.mustRun("ps"))
+	if want := []int64{3, 2, 1}; !slices.Equal(ids, want) {
+		t.Fatalf("ps ids = %v, want %v", ids, want)
+	}
+
+	var snap struct {
+		Rows []struct {
+			ID int64 `json:"id"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
+		t.Fatalf("ps -json: %v", err)
+	}
+	jsonIDs := make([]int64, 0, len(snap.Rows))
+	for _, row := range snap.Rows {
+		jsonIDs = append(jsonIDs, row.ID)
+	}
+	if !slices.Equal(jsonIDs, ids) {
+		t.Errorf("ps -json ids = %v, table ids = %v", jsonIDs, ids)
 	}
 }
 

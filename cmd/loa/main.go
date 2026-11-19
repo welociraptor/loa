@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -429,6 +430,12 @@ func cmdPs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// ps is a view of the queue, not the tab: newest first, whatever each task
+	// is doing. The tab keeps live work at the top.
+	sort.SliceStable(snap.Rows, func(i, j int) bool {
+		return snap.Rows[i].Task.ID > snap.Rows[j].Task.ID
+	})
 
 	if asJSON {
 		out := psJSON{SessionUnavailable: snap.Unavailable}
