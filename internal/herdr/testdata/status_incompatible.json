@@ -1,0 +1,1 @@
+{"id":"cli:status","client":{"version":"0.9.5","channel":"stable","protocol":22},"server":{"status":"running","running":true,"version":"0.8.0","protocol":21,"compatible":false,"endpoint_compatible":false},"update":{"restart_needed":false,"server_binary_stale":false}}
