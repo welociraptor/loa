@@ -521,6 +521,69 @@ func (s *Store) List(ctx context.Context, statuses ...Status) ([]Task, error) {
 	return tasks, nil
 }
 
+// Cancel removes a queued task and returns the row it deleted. It refuses a
+// leased task, a done task, and a task another task still depends on: each row
+// belongs to someone else, and deleting it would silently break them. The
+// guards and the delete share one transaction, so a task leased meanwhile
+// cannot be deleted underneath its runner.
+func (s *Store) Cancel(ctx context.Context, id int64) (Task, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("store: cancel %d: %w", id, err)
+	}
+	defer tx.Rollback()
+
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id))
+	if err != nil {
+		return Task{}, err
+	}
+
+	switch task.Status {
+	case Leased:
+		return Task{}, fmt.Errorf("store: cancel %d: leased by %s until %s; interrupt the agent or let the attempt end, then cancel",
+			task.ID, task.LeaseOwner, task.LeaseExpiry.Format(time.RFC3339))
+	case Done:
+		if task.Branch != "" {
+			return Task{}, fmt.Errorf("store: cancel %d: task is done; its branch %q is the deliverable", task.ID, task.Branch)
+		}
+		return Task{}, fmt.Errorf("store: cancel %d: task is done; finished work is not cancelled", task.ID)
+	}
+
+	var dependentID int64
+	var dependentTitle string
+	err = tx.QueryRowContext(ctx,
+		`SELECT t.id, t.title
+		 FROM task_deps d
+		 JOIN tasks t ON t.id = d.task_id
+		 WHERE d.depends_on = ?
+		 ORDER BY t.id
+		 LIMIT 1`, id).Scan(&dependentID, &dependentTitle)
+	if err == nil {
+		return Task{}, fmt.Errorf("store: cancel %d: #%d %q depends on it; cancel the dependent first, or re-chain it",
+			id, dependentID, dependentTitle)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Task{}, fmt.Errorf("store: cancel %d: dependents: %w", id, err)
+	}
+
+	// The row is about to go, so its scopes and outgoing edges are read now:
+	// they are part of what the caller removed, and gone afterwards.
+	if err := loadScopes(ctx, tx, task); err != nil {
+		return Task{}, err
+	}
+	if err := loadDeps(ctx, tx, []*Task{task}); err != nil {
+		return Task{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id); err != nil {
+		return Task{}, fmt.Errorf("store: cancel %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("store: cancel %d: %w", id, err)
+	}
+	return *task, nil
+}
+
 // Lease claims the highest-priority task that is runnable and not contending
 // for a scope with another leased task. It returns nil when nothing is
 // runnable. A caller that dies leaves a lease that expires; the next Lease

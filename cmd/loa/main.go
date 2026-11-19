@@ -37,6 +37,7 @@ usage:
   loa add    -title TEXT -workspace LABEL [-role ROLE] [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
   loa list   [-status STATUS]...
   loa show   ID
+  loa cancel ID                    # delete a queued task; refuses leased, done, or depended-on work
   loa ps     [-json]               # the queue joined with the live session
   loa report [-since 24h|-since 2026-11-18] [-json]   # what the day did
   loa import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
@@ -70,6 +71,8 @@ func main() {
 		err = cmdList(ctx, os.Args[2:])
 	case "show":
 		err = cmdShow(ctx, os.Args[2:])
+	case "cancel":
+		err = cmdCancel(ctx, os.Args[2:])
 	case "ps":
 		err = cmdPs(ctx, os.Args[2:])
 	case "report":
@@ -1274,6 +1277,42 @@ func cmdFinish(ctx context.Context, args []string, done bool) error {
 		return s.Complete(ctx, id, branch, result)
 	}
 	return s.Fail(ctx, id, result)
+}
+
+// cmdCancel deletes a queued task and prints the row it removed. The guards
+// live in the store; the shell only records what happened.
+func cmdCancel(ctx context.Context, args []string) error {
+	s, positional, err := open(ctx, "cancel", args, func(*flag.FlagSet) {})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	id, err := taskID("cancel", positional)
+	if err != nil {
+		return err
+	}
+
+	task, err := s.Cancel(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	lines := []string{
+		fmt.Sprintf("id:\t%d", task.ID),
+		fmt.Sprintf("title:\t%s", task.Title),
+		fmt.Sprintf("status:\t%s", task.Status),
+		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
+	}
+	if task.Branch != "" {
+		lines = append(lines, fmt.Sprintf("branch:\t%s", task.Branch))
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if _, err := io.WriteString(w, strings.Join(lines, "\n")+"\n"); err != nil {
+		return err
+	}
+	return w.Flush()
 }
 
 // cmdUnblock returns a blocked task to the queue without waiting for a run.

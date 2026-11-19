@@ -57,6 +57,22 @@ func add(t *testing.T, s *store.Store, task store.NewTask) int64 {
 	return id
 }
 
+// countRows reads the database directly, which is how the tests prove a row
+// and its cascaded children are really gone rather than merely hidden.
+func countRows(t *testing.T, path, query string, args ...any) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count %q: %v", query, err)
+	}
+	return n
+}
+
 func leaseFor(t *testing.T, s *store.Store, owner string, ttl time.Duration, now time.Time) *store.Task {
 	t.Helper()
 	task, err := s.Lease(context.Background(), owner, ttl, now)
@@ -987,6 +1003,165 @@ func TestListMultipleStatuses(t *testing.T) {
 	}
 	if len(unknown) != 0 {
 		t.Errorf("unknown status returned %+v", unknown)
+	}
+}
+
+func TestCancelDeletesANewTaskAndItsChildren(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	s := openAt(t, path)
+
+	dep := add(t, s, store.NewTask{Title: "base", Workspace: "loa"})
+	id := add(t, s, store.NewTask{
+		Title: "queued", Workspace: "loa",
+		Scopes: []string{"repo:loa", "file:README"},
+		Deps:   []int64{dep},
+	})
+
+	removed, err := s.Cancel(ctx, id)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if removed.ID != id || removed.Title != "queued" || removed.Status != store.New || removed.Attempts != 0 {
+		t.Errorf("removed = %+v, want the queued row", removed)
+	}
+	if !slices.Equal(removed.Scopes, []string{"file:README", "repo:loa"}) {
+		t.Errorf("removed scopes = %v, want the rows that went with it", removed.Scopes)
+	}
+	if len(removed.Deps) != 1 || removed.Deps[0].ID != dep {
+		t.Errorf("removed deps = %+v, want the edge to %d", removed.Deps, dep)
+	}
+
+	if _, err := s.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("get cancelled task: %v, want ErrNotFound", err)
+	}
+	for _, query := range []string{
+		`SELECT count(*) FROM task_scopes WHERE task_id = ?`,
+		`SELECT count(*) FROM task_deps WHERE task_id = ?`,
+		`SELECT count(*) FROM task_deps WHERE depends_on = ?`,
+	} {
+		if n := countRows(t, path, query, id); n != 0 {
+			t.Errorf("cancelled task left %d row(s) for %q", n, query)
+		}
+	}
+	if _, err := s.Get(ctx, dep); err != nil {
+		t.Errorf("the dependency was removed too: %v", err)
+	}
+}
+
+func TestCancelRefusesALeasedTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "running", Workspace: "loa"})
+	lease(t, s, time.Now())
+
+	_, err := s.Cancel(ctx, id)
+	if err == nil || !strings.Contains(err.Error(), "leased by test until") {
+		t.Fatalf("cancel leased: %v, want the owner and expiry named", err)
+	}
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != store.Leased || task.LeaseOwner != "test" {
+		t.Errorf("refused cancel changed the lease: %+v", task)
+	}
+	// The lease is intact, so its runner can still finish the task.
+	if err := s.Complete(ctx, id, "loa/1.1", "done"); err != nil {
+		t.Fatalf("complete after refused cancel: %v", err)
+	}
+}
+
+func TestCancelRefusesADoneTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "shipped", Workspace: "loa"})
+	lease(t, s, time.Now())
+	if err := s.Complete(ctx, id, "loa/1.1", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	_, err := s.Cancel(ctx, id)
+	if err == nil || !strings.Contains(err.Error(), "task is done") || !strings.Contains(err.Error(), "loa/1.1") {
+		t.Fatalf("cancel done: %v, want a refusal naming the deliverable branch", err)
+	}
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != store.Done || task.Branch != "loa/1.1" {
+		t.Errorf("refused cancel changed the done row: %+v", task)
+	}
+}
+
+func TestCancelRefusesATaskWithADependent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	s := openAt(t, path)
+
+	dep := add(t, s, store.NewTask{Title: "base", Workspace: "loa"})
+	child := add(t, s, store.NewTask{Title: "dependent", Workspace: "loa", Deps: []int64{dep}})
+	beforeDep, err := s.Get(ctx, dep)
+	if err != nil {
+		t.Fatalf("get dependency: %v", err)
+	}
+	beforeChild, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get dependent: %v", err)
+	}
+
+	_, err = s.Cancel(ctx, dep)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("#%d", child)) || !strings.Contains(err.Error(), "dependent") {
+		t.Fatalf("cancel depended-on task: %v, want the dependent named", err)
+	}
+
+	afterDep, err := s.Get(ctx, dep)
+	if err != nil {
+		t.Fatalf("get dependency after refusal: %v", err)
+	}
+	afterChild, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get dependent after refusal: %v", err)
+	}
+	if afterDep.Status != beforeDep.Status || !afterDep.UpdatedAt.Equal(beforeDep.UpdatedAt) {
+		t.Errorf("refused cancel changed the dependency: %+v -> %+v", beforeDep, afterDep)
+	}
+	if afterChild.Status != beforeChild.Status || !afterChild.UpdatedAt.Equal(beforeChild.UpdatedAt) {
+		t.Errorf("refused cancel changed the dependent: %+v -> %+v", beforeChild, afterChild)
+	}
+	deps, err := s.Deps(ctx, child)
+	if err != nil {
+		t.Fatalf("deps: %v", err)
+	}
+	if len(deps) != 1 || deps[0].ID != dep {
+		t.Errorf("dependent lost its edge: %+v", deps)
+	}
+	if n := countRows(t, path, `SELECT count(*) FROM task_deps WHERE depends_on = ?`, dep); n != 1 {
+		t.Errorf("dependent edge count = %d, want 1", n)
+	}
+}
+
+func TestCancelDeletesABlockedTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "needs a human", Workspace: "loa", MaxTries: 1})
+	lease(t, s, time.Now())
+	if err := s.Fail(ctx, id, "out of attempts"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	removed, err := s.Cancel(ctx, id)
+	if err != nil {
+		t.Fatalf("cancel blocked: %v", err)
+	}
+	if removed.Status != store.Blocked {
+		t.Errorf("removed status = %s, want blocked", removed.Status)
+	}
+	if _, err := s.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("get cancelled task: %v, want ErrNotFound", err)
 	}
 }
 

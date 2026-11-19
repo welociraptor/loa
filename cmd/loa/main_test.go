@@ -316,6 +316,86 @@ func TestShowRejectsUnknownTask(t *testing.T) {
 	}
 }
 
+func TestCancelDeletesANewTaskAndPrintsIt(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "queued")
+
+	out := c.mustRun("cancel", "1")
+	for label, want := range map[string]string{
+		"id:": "1", "title:": "queued", "status:": "new", "attempts:": "0/2",
+	} {
+		if got := showField(t, out, label); got != want {
+			t.Errorf("cancel %s = %q, want %q", label, got, want)
+		}
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "queued") {
+		t.Errorf("cancelled task is still listed: %q", list)
+	}
+}
+
+func TestCancelRefusesALeasedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "running")
+	c.mustRun("lease", "-owner", "cli-test")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "leased by cli-test until") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list", "-status", "leased"); !strings.Contains(list, "running") {
+		t.Errorf("refused cancel removed the leased task: %q", list)
+	}
+}
+
+func TestCancelRefusesADoneTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "shipped")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "1", "-branch", "loa/1.1")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "task is done") || !strings.Contains(errOut, "loa/1.1") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestCancelRefusesATaskWithADependent(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "base")
+	c.mustRun("add", "-workspace", "loa", "-title", "dependent", "-dep", "1")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "#2") || !strings.Contains(errOut, "dependent") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list"); !strings.Contains(list, "base") || !strings.Contains(list, "dependent") {
+		t.Errorf("refused cancel changed the queue: %q", list)
+	}
+}
+
+func TestCancelDeletesABlockedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "needs a human", "-max", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("fail", "1", "-result", "out of attempts")
+
+	out := c.mustRun("cancel", "1")
+	if got := showField(t, out, "status:"); got != "blocked" {
+		t.Errorf("cancel status = %q, want blocked", got)
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "needs a human") {
+		t.Errorf("cancelled task is still listed: %q", list)
+	}
+}
+
+func TestCancelRejectsUnknownTask(t *testing.T) {
+	c := newCLI(t)
+	_, errOut, code := c.run("cancel", "42")
+	if code != 1 || !strings.Contains(errOut, "not found") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
 func TestDoneRequiresALease(t *testing.T) {
 	c := newCLI(t)
 	c.mustRun("add", "-workspace", "loa", "-title", "unclaimed")
