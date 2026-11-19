@@ -92,3 +92,22 @@ func TestRunRestoresTheTerminalOnSIGTERM(t *testing.T) {
 	}
 	assertRestored(t, f)
 }
+
+func TestRawModeStartsEveryLineAtColumnOne(t *testing.T) {
+	f := &fakeTerminal{width: 80, height: 24, keysCh: quitKey()}
+	if err := run(context.Background(), New(nil, nil, nil), f, nil, nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	_, drawn, ok := strings.Cut(f.out.String(), clearScreen)
+	if !ok {
+		t.Fatal("the screen was never cleared")
+	}
+	for i := range len(drawn) {
+		if drawn[i] != '\n' {
+			continue
+		}
+		if i == 0 || drawn[i-1] != '\r' {
+			t.Fatalf("line feed at offset %d is not preceded by a carriage return", i)
+		}
+	}
+}

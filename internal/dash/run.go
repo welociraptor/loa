@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +21,14 @@ const (
 	showCursor     = "\x1b[?25h"
 	clearScreen    = "\x1b[H\x1b[2J"
 )
+
+// forScreen makes a view writable in raw mode. Raw mode clears the output
+// post-processing that turns \n into a carriage return plus a line feed, so a
+// newline alone would leave the cursor in the previous line's column and each
+// row would start where the last one ended.
+func forScreen(view string) string {
+	return strings.ReplaceAll(view, "\n", "\r\n")
+}
 
 // terminal is what the loop needs. The real one is a tty; tests record what
 // was written so the restore path can be checked without one.
@@ -77,7 +86,7 @@ func run(ctx context.Context, m Model, t terminal, signals <-chan os.Signal, pri
 	m, _ = m.Update(WindowSizeMsg{Width: width, Height: height})
 
 	draw := func() error {
-		return t.write(clearScreen + m.View())
+		return t.write(clearScreen + forScreen(m.View()))
 	}
 	if err := draw(); err != nil {
 		return err
