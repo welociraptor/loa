@@ -19,7 +19,7 @@
             pname = "loa";
             version = "0.0.0";
             src = self;
-            vendorHash = "sha256-EwpoH+Thk8bplM8mjWEbMO1dAwvcA/gn+dZVJjtunbU=";
+            vendorHash = "sha256-lm3SAmSuo9aLEVG451A6XhzwbZ3YyDBRzsXcq0F9ldk=";
 
             nativeCheckInputs = [ pkgs.git pkgs.golangci-lint ];
             checkPhase = ''

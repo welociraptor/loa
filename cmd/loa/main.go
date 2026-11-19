@@ -17,7 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 
 	"loa/internal/dash"
 	"loa/internal/herdr"
@@ -984,6 +984,10 @@ func (c controls) Resolve(ctx context.Context, taskID int64, done bool, result s
 func (c controls) Run(ctx context.Context) error { return c.runFn(ctx) }
 
 func cmdDash(ctx context.Context, args []string) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return errors.New("dash needs a terminal")
+	}
+
 	var flags runFlags
 	s, positional, err := open(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
 	if err != nil {
@@ -1027,9 +1031,7 @@ func cmdDash(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	program := tea.NewProgram(dash.New(s, client, c), tea.WithAltScreen(), tea.WithContext(ctx))
-	_, err = program.Run()
-	return err
+	return dash.Run(ctx, dash.New(s, client, c), os.Stdin, os.Stdout)
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {

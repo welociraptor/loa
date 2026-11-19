@@ -27,7 +27,8 @@ is something to look at rather than a timeout to interpret.
     internal/runner/git.go       80   commit count, screen-to-summary
     internal/runner/prompt.go    34
     internal/live/live.go       187   queue joined with the session (`ps`)
-    internal/dash/dash.go       364   the tab: model, keys, view (bubbletea)
+    internal/dash/dash.go       437   the tab: model, keys, view (plain strings)
+    internal/dash/run.go        250   raw mode, key decoding, one select loop
     internal/report/report.go   187   the day: done, blocked, queued, open, gap
     internal/taskspec/taskspec.go 204   a proposal: strict parse, resolve, validate
     internal/triage/triage.go   148   what the triage agent reads and writes back
@@ -420,10 +421,13 @@ reconciliation decides what it may close. A task's live state is joined as:
   `internal/dash`: an 80-line-wide view with the header counts, a windowed row
   list, an orphan section, a message line and a key footer — plain text, no
   styling beyond what the column padding does. `Update` handles keys, ticks and
-  results; every store or session call is a `tea.Cmd`, so the view never
-  blocks. Refresh is a one-second tick, and `SnapshotMsg` is exported so a
-  caller can prime the view with a read it already has (which is how the tests
-  work without a terminal).
+  results; every store or session call is a `Cmd` that the loop runs in a
+  goroutine, so the view never blocks. Refresh is a one-second tick, and
+  `SnapshotMsg` is exported so a caller can prime the view with a read it
+  already has (which is how the tests work without a terminal). `run.go` owns
+  the terminal: raw mode and the size from `golang.org/x/term`, plain escapes
+  for the alt screen and the cursor, and one select over keys, the tick, action
+  results and SIGWINCH. Restore runs from a defer and on SIGTERM.
 
 - [x] **21. Actions.** `enter` focuses the task's agent or workspace (`agent
   focus`, `workspace focus`); `x` interrupts a working agent (`send-keys
@@ -434,7 +438,7 @@ reconciliation decides what it may close. A task's live state is joined as:
   label), so it works for a blocked task whose agent has already exited. The
   keys are `enter` focus, `x` interrupt, `u` unblock, `c` remove the workspace,
   `d`/`f` resolve with a one-line result prompt, `s`/`S` start and stop a run,
-  `q` quit.
+  `q` quit and restore the terminal.
 
   Two store methods were missing, and both are the *human's* override rather
   than the runner's: `Unblock` (blocked → new, `not_before` cleared, attempts
@@ -671,7 +675,7 @@ Two gaps, neither of them in the rules. The tab carries a framework it no longer
 needs, and the graph the claim predicate enforces — the thing that decides what
 runs next — is invisible outside `sqlite3`.
 
-- [ ] **34. The tab loses its framework.** `bubbletea` bought async commands,
+- [x] **34. The tab loses its framework.** `bubbletea` bought async commands,
   resize handling and an alt screen, and cost twenty-odd modules on a binary
   whose other dependency is a SQLite driver, plus a `tea.Cmd` indirection in
   front of every call the tab makes. `internal/dash` keeps the state machine and

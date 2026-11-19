@@ -9,12 +9,63 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"loa/internal/herdr"
 	"loa/internal/live"
 	"loa/internal/store"
 )
+
+// Msg is one event the model can handle. It is a plain value; the loop in run.go
+// is what turns input and results into one.
+type Msg any
+
+// Cmd is work the loop runs off the render path. Its result comes back as a Msg.
+type Cmd func() Msg
+
+// KeyType is the kind of a decoded key press.
+type KeyType int
+
+// The key types the model understands.
+const (
+	KeyRunes KeyType = iota
+	KeyEnter
+	KeyEsc
+	KeyBackspace
+	KeyCtrlC
+	KeyUp
+	KeyDown
+	KeyLeft
+	KeyRight
+)
+
+// Key is one key press, decoded from the terminal's bytes.
+type Key struct {
+	Type  KeyType
+	Runes []rune
+}
+
+// String names the key the way the model's switch reads it.
+func (k Key) String() string {
+	switch k.Type {
+	case KeyEnter:
+		return "enter"
+	case KeyEsc:
+		return "esc"
+	case KeyBackspace:
+		return "backspace"
+	case KeyCtrlC:
+		return "ctrl+c"
+	case KeyUp:
+		return "up"
+	case KeyDown:
+		return "down"
+	case KeyLeft:
+		return "left"
+	case KeyRight:
+		return "right"
+	default:
+		return string(k.Runes)
+	}
+}
 
 // Controls is everything the tab can do. The composition root supplies it, so
 // the dashboard has no opinion about sessions or runners beyond these calls.
@@ -33,6 +84,13 @@ type Session = live.Session
 // refreshEvery is how often the queue is re-read while the tab is open.
 const refreshEvery = time.Second
 
+// WindowSizeMsg is the terminal's current size. The loop reads it once when it
+// starts and again on every SIGWINCH.
+type WindowSizeMsg struct {
+	Width  int
+	Height int
+}
+
 // SnapshotMsg is a completed read of the queue and the active run. The refresh
 // command produces it; a caller may also send one directly, which is how the
 // view is tested without a terminal.
@@ -49,6 +107,7 @@ type (
 		err  error
 	}
 	runDoneMsg struct{ err error }
+	quitMsg    struct{}
 )
 
 // prompt is the one-line input used by done/fail.
@@ -87,20 +146,11 @@ func New(s *store.Store, session Session, controls Controls) Model {
 	return Model{store: s, session: session, controls: controls, width: 80, height: 24}
 }
 
-// Init starts the refresh loop.
-func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick())
-}
-
-func tick() tea.Cmd {
-	return tea.Tick(refreshEvery, func(t time.Time) tea.Msg { return tickMsg(t) })
-}
-
 // refresh re-reads the queue, the session and the active run. It runs as a
 // command, never in Update, so the view never blocks on a store query.
-func (m Model) refresh() tea.Cmd {
+func (m Model) refresh() Cmd {
 	s, session := m.store, m.session
-	return func() tea.Msg {
+	return func() Msg {
 		ctx := context.Background()
 		snap, err := live.Read(ctx, s, session)
 		if err != nil {
@@ -115,8 +165,8 @@ func (m Model) refresh() tea.Cmd {
 }
 
 // act runs one control call as a command.
-func (m Model) act(text string, fn func(ctx context.Context) error) tea.Cmd {
-	return func() tea.Msg {
+func (m Model) act(text string, fn func(ctx context.Context) error) Cmd {
+	return func() Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		return actionMsg{text: text, err: fn(ctx)}
@@ -125,12 +175,12 @@ func (m Model) act(text string, fn func(ctx context.Context) error) tea.Cmd {
 
 // Update handles input, ticks and results. Everything that touches the store or
 // the session is returned as a command.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(msg Msg) (Model, Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
-		return m, tea.Batch(m.refresh(), tick())
+		return m, m.refresh()
 
-	case tea.WindowSizeMsg:
+	case WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
@@ -163,7 +213,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.refresh()
 
-	case tea.KeyMsg:
+	case Key:
 		if m.prompt.active {
 			return m.updatePrompt(msg)
 		}
@@ -172,13 +222,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updatePrompt(msg Key) (Model, Cmd) {
 	switch msg.Type {
-	case tea.KeyEsc:
+	case KeyEsc:
 		m.prompt = prompt{}
 		m.message = "cancelled"
 		return m, nil
-	case tea.KeyEnter:
+	case KeyEnter:
 		p := m.prompt
 		m.prompt = prompt{}
 		row, ok := m.selected()
@@ -192,20 +242,20 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.act(kind+" #"+fmt.Sprint(id), func(ctx context.Context) error {
 			return m.controls.Resolve(ctx, id, p.done, result)
 		})
-	case tea.KeyBackspace:
+	case KeyBackspace:
 		if n := len(m.prompt.buffer); n > 0 {
 			m.prompt.buffer = m.prompt.buffer[:n-1]
 		}
 		return m, nil
 	default:
-		if msg.Type == tea.KeyRunes {
+		if msg.Type == KeyRunes {
 			m.prompt.buffer += string(msg.Runes)
 		}
 		return m, nil
 	}
 }
 
-func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) updateKeys(msg Key) (Model, Cmd) {
 	row, hasRow := m.selected()
 
 	switch msg.String() {
@@ -213,7 +263,7 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cancel != nil {
 			m.cancel()
 		}
-		return m, tea.Quit
+		return m, func() Msg { return quitMsg{} }
 	case "j", "down":
 		if m.cursor < len(m.rows)-1 {
 			m.cursor++
@@ -272,7 +322,7 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.cancel = cancel
 		m.message = "run started"
-		return m, func() tea.Msg {
+		return m, func() Msg {
 			err := m.controls.Run(ctx)
 			cancel()
 			return runDoneMsg{err: err}

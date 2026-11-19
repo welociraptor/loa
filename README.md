@@ -55,9 +55,9 @@ loa run    -workers 2 -max 5 [-json] # works the queue, inside Herdr
 also takes `-db`.
 
 Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
-`github.com/charmbracelet/bubbletea` for the tab. The second brings a renderer
-stack with it — that is the price of a real terminal loop instead of hand-rolled
-raw mode.
+`golang.org/x/term` for raw mode and the tab's window size. Everything else the
+tab draws is plain strings and escapes, so the loop stays testable and the
+dependency list stays at two.
 
 ## The runner
 

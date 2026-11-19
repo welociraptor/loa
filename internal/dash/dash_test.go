@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"loa/internal/dash"
 	"loa/internal/herdr"
 	"loa/internal/live"
@@ -144,21 +142,21 @@ func readMsg(t *testing.T, s *store.Store, session fakeSession) dash.SnapshotMsg
 func loaded(t *testing.T, s *store.Store, session fakeSession, c dash.Controls) dash.Model {
 	t.Helper()
 	m := dash.New(s, session, c)
-	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
 	m = asModel(t, next)
 
 	next, _ = m.Update(readMsg(t, s, session))
 	return asModel(t, next)
 }
 
-func key(s string) tea.KeyMsg {
-	if t, ok := map[string]tea.KeyType{"enter": tea.KeyEnter, "esc": tea.KeyEsc, "backspace": tea.KeyBackspace}[s]; ok {
-		return tea.KeyMsg{Type: t}
+func key(s string) dash.Key {
+	if t, ok := map[string]dash.KeyType{"enter": dash.KeyEnter, "esc": dash.KeyEsc, "backspace": dash.KeyBackspace}[s]; ok {
+		return dash.Key{Type: t}
 	}
-	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	return dash.Key{Type: dash.KeyRunes, Runes: []rune(s)}
 }
 
-func run(t *testing.T, cmd tea.Cmd) tea.Msg {
+func run(t *testing.T, cmd dash.Cmd) dash.Msg {
 	t.Helper()
 	if cmd == nil {
 		t.Fatal("no command to run")
@@ -273,7 +271,7 @@ func TestResolvePromptTakesAResult(t *testing.T) {
 		t.Fatalf("prompt did not open:\n%s", m.View())
 	}
 	for _, r := range "approved by hand" {
-		m = step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = step(t, m, dash.Key{Type: dash.KeyRunes, Runes: []rune{r}})
 	}
 	next, cmd := m.Update(key("enter"))
 	run(t, cmd)
@@ -408,13 +406,13 @@ func TestControlsErrorsLandInTheMessageLine(t *testing.T) {
 	}
 }
 
-func step(t *testing.T, m dash.Model, msg tea.Msg) dash.Model {
+func step(t *testing.T, m dash.Model, msg dash.Msg) dash.Model {
 	t.Helper()
 	next, _ := m.Update(msg)
 	return asModel(t, next)
 }
 
-func mustCmd(t *testing.T, m dash.Model, msg tea.Msg) tea.Cmd {
+func mustCmd(t *testing.T, m dash.Model, msg dash.Msg) dash.Cmd {
 	t.Helper()
 	_, cmd := m.Update(msg)
 	if cmd == nil {
@@ -423,15 +421,10 @@ func mustCmd(t *testing.T, m dash.Model, msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
-// asModel asserts the model type once, so tests read as flow rather than type
-// switches.
-func asModel(t *testing.T, m tea.Model) dash.Model {
+// asModel keeps the flow readable now that Update returns the model directly.
+func asModel(t *testing.T, m dash.Model) dash.Model {
 	t.Helper()
-	model, ok := m.(dash.Model)
-	if !ok {
-		t.Fatalf("update returned %T, want dash.Model", m)
-	}
-	return model
+	return m
 }
 
 // cursor is the index of the row the marker is on.
