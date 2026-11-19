@@ -57,6 +57,22 @@ func add(t *testing.T, s *store.Store, task store.NewTask) int64 {
 	return id
 }
 
+// countRows reads the database directly, which is how the tests prove a row
+// and its cascaded children are really gone rather than merely hidden.
+func countRows(t *testing.T, path, query string, args ...any) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count %q: %v", query, err)
+	}
+	return n
+}
+
 func leaseFor(t *testing.T, s *store.Store, owner string, ttl time.Duration, now time.Time) *store.Task {
 	t.Helper()
 	task, err := s.Lease(context.Background(), owner, ttl, now)
@@ -990,6 +1006,165 @@ func TestListMultipleStatuses(t *testing.T) {
 	}
 }
 
+func TestCancelDeletesANewTaskAndItsChildren(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	s := openAt(t, path)
+
+	dep := add(t, s, store.NewTask{Title: "base", Workspace: "loa"})
+	id := add(t, s, store.NewTask{
+		Title: "queued", Workspace: "loa",
+		Scopes: []string{"repo:loa", "file:README"},
+		Deps:   []int64{dep},
+	})
+
+	removed, err := s.Cancel(ctx, id)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if removed.ID != id || removed.Title != "queued" || removed.Status != store.New || removed.Attempts != 0 {
+		t.Errorf("removed = %+v, want the queued row", removed)
+	}
+	if !slices.Equal(removed.Scopes, []string{"file:README", "repo:loa"}) {
+		t.Errorf("removed scopes = %v, want the rows that went with it", removed.Scopes)
+	}
+	if len(removed.Deps) != 1 || removed.Deps[0].ID != dep {
+		t.Errorf("removed deps = %+v, want the edge to %d", removed.Deps, dep)
+	}
+
+	if _, err := s.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("get cancelled task: %v, want ErrNotFound", err)
+	}
+	for _, query := range []string{
+		`SELECT count(*) FROM task_scopes WHERE task_id = ?`,
+		`SELECT count(*) FROM task_deps WHERE task_id = ?`,
+		`SELECT count(*) FROM task_deps WHERE depends_on = ?`,
+	} {
+		if n := countRows(t, path, query, id); n != 0 {
+			t.Errorf("cancelled task left %d row(s) for %q", n, query)
+		}
+	}
+	if _, err := s.Get(ctx, dep); err != nil {
+		t.Errorf("the dependency was removed too: %v", err)
+	}
+}
+
+func TestCancelRefusesALeasedTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "running", Workspace: "loa"})
+	lease(t, s, time.Now())
+
+	_, err := s.Cancel(ctx, id)
+	if err == nil || !strings.Contains(err.Error(), "leased by test until") {
+		t.Fatalf("cancel leased: %v, want the owner and expiry named", err)
+	}
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != store.Leased || task.LeaseOwner != "test" {
+		t.Errorf("refused cancel changed the lease: %+v", task)
+	}
+	// The lease is intact, so its runner can still finish the task.
+	if err := s.Complete(ctx, id, "loa/1.1", "done"); err != nil {
+		t.Fatalf("complete after refused cancel: %v", err)
+	}
+}
+
+func TestCancelRefusesADoneTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "shipped", Workspace: "loa"})
+	lease(t, s, time.Now())
+	if err := s.Complete(ctx, id, "loa/1.1", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	_, err := s.Cancel(ctx, id)
+	if err == nil || !strings.Contains(err.Error(), "task is done") || !strings.Contains(err.Error(), "loa/1.1") {
+		t.Fatalf("cancel done: %v, want a refusal naming the deliverable branch", err)
+	}
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != store.Done || task.Branch != "loa/1.1" {
+		t.Errorf("refused cancel changed the done row: %+v", task)
+	}
+}
+
+func TestCancelRefusesATaskWithADependent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	s := openAt(t, path)
+
+	dep := add(t, s, store.NewTask{Title: "base", Workspace: "loa"})
+	child := add(t, s, store.NewTask{Title: "dependent", Workspace: "loa", Deps: []int64{dep}})
+	beforeDep, err := s.Get(ctx, dep)
+	if err != nil {
+		t.Fatalf("get dependency: %v", err)
+	}
+	beforeChild, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get dependent: %v", err)
+	}
+
+	_, err = s.Cancel(ctx, dep)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("#%d", child)) || !strings.Contains(err.Error(), "dependent") {
+		t.Fatalf("cancel depended-on task: %v, want the dependent named", err)
+	}
+
+	afterDep, err := s.Get(ctx, dep)
+	if err != nil {
+		t.Fatalf("get dependency after refusal: %v", err)
+	}
+	afterChild, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get dependent after refusal: %v", err)
+	}
+	if afterDep.Status != beforeDep.Status || !afterDep.UpdatedAt.Equal(beforeDep.UpdatedAt) {
+		t.Errorf("refused cancel changed the dependency: %+v -> %+v", beforeDep, afterDep)
+	}
+	if afterChild.Status != beforeChild.Status || !afterChild.UpdatedAt.Equal(beforeChild.UpdatedAt) {
+		t.Errorf("refused cancel changed the dependent: %+v -> %+v", beforeChild, afterChild)
+	}
+	deps, err := s.Deps(ctx, child)
+	if err != nil {
+		t.Fatalf("deps: %v", err)
+	}
+	if len(deps) != 1 || deps[0].ID != dep {
+		t.Errorf("dependent lost its edge: %+v", deps)
+	}
+	if n := countRows(t, path, `SELECT count(*) FROM task_deps WHERE depends_on = ?`, dep); n != 1 {
+		t.Errorf("dependent edge count = %d, want 1", n)
+	}
+}
+
+func TestCancelDeletesABlockedTask(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	id := add(t, s, store.NewTask{Title: "needs a human", Workspace: "loa", MaxTries: 1})
+	lease(t, s, time.Now())
+	if err := s.Fail(ctx, id, "out of attempts"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	removed, err := s.Cancel(ctx, id)
+	if err != nil {
+		t.Fatalf("cancel blocked: %v", err)
+	}
+	if removed.Status != store.Blocked {
+		t.Errorf("removed status = %s, want blocked", removed.Status)
+	}
+	if _, err := s.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("get cancelled task: %v, want ErrNotFound", err)
+	}
+}
+
 func TestDatabaseIsCreatedOwnerOnly(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tasks.db")
@@ -1152,17 +1327,18 @@ func TestClosedStoreRefusesWork(t *testing.T) {
 			_, err := s.Apply(ctx, []store.BatchItem{{NewTask: store.NewTask{Title: "later", Workspace: "loa"}}}, nil)
 			return err
 		},
-		"get":      func() error { _, err := s.Get(ctx, id); return err },
-		"list":     func() error { _, err := s.List(ctx); return err },
-		"lease":    func() error { _, err := s.Lease(ctx, "test", time.Hour, time.Now()); return err },
-		"complete": func() error { return s.Complete(ctx, id, "b/x", "ok") },
-		"fail":     func() error { return s.Fail(ctx, id, "nope") },
-		"attach":   func() error { return s.Attach(ctx, id, "w1", "w1:p1") },
-		"unblock":  func() error { return s.Unblock(ctx, id) },
-		"resolve":  func() error { return s.Resolve(ctx, id, true, "late") },
-		"claims":   func() error { _, err := s.Claims(ctx); return err },
-		"deps":     func() error { _, err := s.Deps(ctx, id); return err },
-		"blockers": func() error { _, err := s.Blockers(ctx, id, time.Now()); return err },
+		"get":        func() error { _, err := s.Get(ctx, id); return err },
+		"list":       func() error { _, err := s.List(ctx); return err },
+		"lease":      func() error { _, err := s.Lease(ctx, "test", time.Hour, time.Now()); return err },
+		"complete":   func() error { return s.Complete(ctx, id, "b/x", "ok") },
+		"fail":       func() error { return s.Fail(ctx, id, "nope") },
+		"attach":     func() error { return s.Attach(ctx, id, "w1", "w1:p1") },
+		"unblock":    func() error { return s.Unblock(ctx, id) },
+		"resolve":    func() error { return s.Resolve(ctx, id, true, "late") },
+		"claims":     func() error { _, err := s.Claims(ctx); return err },
+		"deps":       func() error { _, err := s.Deps(ctx, id); return err },
+		"dependents": func() error { _, err := s.Dependents(ctx, id); return err },
+		"blockers":   func() error { _, err := s.Blockers(ctx, id, time.Now()); return err },
 	}
 
 	for name, op := range ops {
@@ -1533,6 +1709,83 @@ func TestDepsOrderAndMissingTask(t *testing.T) {
 	}
 	if len(missing) != 0 {
 		t.Errorf("missing task has deps %+v", missing)
+	}
+}
+
+func TestTaskCarriesDependenciesInGetAndList(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	first := add(t, s, store.NewTask{Title: "first", Workspace: "loa"})
+	second := add(t, s, store.NewTask{Title: "second", Workspace: "loa"})
+	child := add(t, s, store.NewTask{Title: "child", Workspace: "loa", Deps: []int64{second, first}})
+
+	// A done edge still belongs to the task; it is not removed from the graph.
+	if got := lease(t, s, time.Now()); got == nil || got.ID != first {
+		t.Fatalf("lease = %v, want first dependency %d", got, first)
+	}
+	if err := s.Complete(ctx, first, "b/first", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	want := []store.Dep{
+		{ID: first, Title: "first", Status: store.Done},
+		{ID: second, Title: "second", Status: store.New},
+	}
+	task, err := s.Get(ctx, child)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !slices.Equal(task.Deps, want) {
+		t.Errorf("get deps = %+v, want %+v", task.Deps, want)
+	}
+
+	tasks, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, listed := range tasks {
+		if listed.ID == child {
+			if !slices.Equal(listed.Deps, want) {
+				t.Errorf("list deps = %+v, want %+v", listed.Deps, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("child %d missing from list %+v", child, tasks)
+}
+
+func TestDependentsListsTasksInIDOrder(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	dep := add(t, s, store.NewTask{Title: "dep", Workspace: "loa"})
+	writer := add(t, s, store.NewTask{Title: "writer", Workspace: "loa", Deps: []int64{dep}})
+	reader := add(t, s, store.NewTask{Title: "reader", Workspace: "loa", Deps: []int64{dep}})
+	unrelated := add(t, s, store.NewTask{Title: "unrelated", Workspace: "loa"})
+
+	got, err := s.Dependents(ctx, dep)
+	if err != nil {
+		t.Fatalf("dependents: %v", err)
+	}
+	want := []store.Dep{
+		{ID: writer, Title: "writer", Status: store.New},
+		{ID: reader, Title: "reader", Status: store.New},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("dependents = %+v, want %+v", got, want)
+	}
+
+	if none, err := s.Dependents(ctx, unrelated); err != nil {
+		t.Errorf("dependents of a task nothing waits on: %v", err)
+	} else if len(none) != 0 {
+		t.Errorf("dependents of %d = %+v, want none", unrelated, none)
+	}
+
+	if none, err := s.Dependents(ctx, 999); err != nil {
+		t.Errorf("dependents of a missing task: %v", err)
+	} else if len(none) != 0 {
+		t.Errorf("missing task has dependents %+v", none)
 	}
 }
 

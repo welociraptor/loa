@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -36,6 +37,7 @@ usage:
   loa add    -title TEXT -workspace LABEL [-role ROLE] [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
   loa list   [-status STATUS]...
   loa show   ID
+  loa cancel ID                    # delete a queued task; refuses leased, done, or depended-on work
   loa ps     [-json]               # the queue joined with the live session
   loa report [-since 24h|-since 2026-11-18] [-json]   # what the day did
   loa import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
@@ -50,8 +52,9 @@ usage:
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
+  loa version                      # the release and commit this binary was built from
 
-all commands accept -db PATH (default $LOA_DB, else loa.db)`
+all commands except version accept -db PATH (default $LOA_DB, else loa.db)`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -68,6 +71,8 @@ func main() {
 		err = cmdList(ctx, os.Args[2:])
 	case "show":
 		err = cmdShow(ctx, os.Args[2:])
+	case "cancel":
+		err = cmdCancel(ctx, os.Args[2:])
 	case "ps":
 		err = cmdPs(ctx, os.Args[2:])
 	case "report":
@@ -96,6 +101,8 @@ func main() {
 		err = cmdMerge(ctx, os.Args[2:])
 	case "dash":
 		err = cmdDash(ctx, os.Args[2:])
+	case "version":
+		fmt.Println(versionLine())
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 		return
@@ -234,7 +241,7 @@ func cmdList(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tPRI\tTRIES\tSCOPES\tDEPS\tTITLE"); err != nil {
 		return err
 	}
 	for _, t := range tasks {
@@ -242,13 +249,33 @@ func cmdList(ctx context.Context, args []string) error {
 		if len(t.Scopes) > 0 {
 			scopes = strings.Join(t.Scopes, ",")
 		}
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\n",
-			t.ID, t.Status, t.Role, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
+		deps := edgeList(t.Deps, ",", func(d store.Dep) string { return strconv.FormatInt(d.ID, 10) })
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\t%s\n",
+			t.ID, t.Status, t.Role, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, deps, t.Title); err != nil {
 			return err
 		}
 	}
 	// A tabwriter buffers, so a write failure can surface only here or above.
 	return w.Flush()
+}
+
+// edgeList is the whole dependency graph in one field, including edges whose
+// task is done. Blockers is the separate explanation of what actually holds a
+// task. Each edge's shape is the caller's: show names it, list shows its id.
+func edgeList(deps []store.Dep, sep string, edge func(store.Dep) string) string {
+	if len(deps) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(deps))
+	for i, d := range deps {
+		parts[i] = edge(d)
+	}
+	return strings.Join(parts, sep)
+}
+
+// namedEdge is how show renders one dependency: the id, its status and its title.
+func namedEdge(d store.Dep) string {
+	return fmt.Sprintf("#%d (%s) %q", d.ID, d.Status, d.Title)
 }
 
 func cmdShow(ctx context.Context, args []string) error {
@@ -267,6 +294,10 @@ func cmdShow(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	dependents, err := s.Dependents(ctx, id)
+	if err != nil {
+		return err
+	}
 	blockers, err := s.Blockers(ctx, id, time.Now())
 	if err != nil {
 		return err
@@ -279,6 +310,8 @@ func cmdShow(ctx context.Context, args []string) error {
 		fmt.Sprintf("role:\t%s", task.Role),
 		fmt.Sprintf("priority:\t%d", task.Priority),
 		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
+		fmt.Sprintf("depends on:\t%s", edgeList(task.Deps, ", ", namedEdge)),
+		fmt.Sprintf("needed by:\t%s", edgeList(dependents, ", ", namedEdge)),
 	}
 	if task.PlanID != "" {
 		lines = append(lines, fmt.Sprintf("plan:\t%s", task.PlanID))
@@ -400,6 +433,12 @@ func cmdPs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// ps is a view of the queue, not the tab: newest first, whatever each task
+	// is doing. The tab keeps live work at the top.
+	sort.SliceStable(snap.Rows, func(i, j int) bool {
+		return snap.Rows[i].Task.ID > snap.Rows[j].Task.ID
+	})
 
 	if asJSON {
 		out := psJSON{SessionUnavailable: snap.Unavailable}
@@ -1238,6 +1277,42 @@ func cmdFinish(ctx context.Context, args []string, done bool) error {
 		return s.Complete(ctx, id, branch, result)
 	}
 	return s.Fail(ctx, id, result)
+}
+
+// cmdCancel deletes a queued task and prints the row it removed. The guards
+// live in the store; the shell only records what happened.
+func cmdCancel(ctx context.Context, args []string) error {
+	s, positional, err := open(ctx, "cancel", args, func(*flag.FlagSet) {})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	id, err := taskID("cancel", positional)
+	if err != nil {
+		return err
+	}
+
+	task, err := s.Cancel(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	lines := []string{
+		fmt.Sprintf("id:\t%d", task.ID),
+		fmt.Sprintf("title:\t%s", task.Title),
+		fmt.Sprintf("status:\t%s", task.Status),
+		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
+	}
+	if task.Branch != "" {
+		lines = append(lines, fmt.Sprintf("branch:\t%s", task.Branch))
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	if _, err := io.WriteString(w, strings.Join(lines, "\n")+"\n"); err != nil {
+		return err
+	}
+	return w.Flush()
 }
 
 // cmdUnblock returns a blocked task to the queue without waiting for a run.

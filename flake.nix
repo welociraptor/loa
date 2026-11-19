@@ -20,6 +20,10 @@
             version = "0.0.0";
             src = self;
             vendorHash = "sha256-lm3SAmSuo9aLEVG451A6XhzwbZ3YyDBRzsXcq0F9ldk=";
+            ldflags = [
+              "-X main.version=0.0.0"
+              "-X main.commit=${self.shortRev or self.dirtyShortRev or ""}"
+            ];
 
             nativeCheckInputs = [ pkgs.git pkgs.golangci-lint ];
             checkPhase = ''

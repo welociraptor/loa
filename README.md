@@ -39,6 +39,7 @@ go build ./cmd/loa
 loa add    -workspace nixos -title "..." -body "..." [-role implement|plan|review] [-priority 5] [-scope repo:loa]... [-dep ID]...
 loa list   [-status new]...
 loa show   ID                      # fields, and why it is not running
+loa cancel ID                      # delete a queued task; refuses leased, done, or depended-on work
 loa ps     [-json]                 # the queue joined with the live session
 loa dash                           # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
@@ -51,10 +52,15 @@ loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
 loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
+loa version                         # the release and commit this binary was built from
 ```
 
+Every other transition leaves a row behind; `cancel` deletes one, which is why
+it refuses a leased, done, or still-depended-on task rather than cascading a
+hole into the queue.
+
 `LOA_DB` selects the database (default `./loa.db`); every command
-also takes `-db`.
+except `version` also takes `-db`.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses

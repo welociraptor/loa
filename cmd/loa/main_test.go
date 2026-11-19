@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,8 +42,9 @@ func TestMain(m *testing.M) {
 }
 
 type cli struct {
-	t  *testing.T
-	db string
+	t   *testing.T
+	db  string
+	dir string
 }
 
 func newCLI(t *testing.T) *cli {
@@ -64,6 +66,9 @@ func (c *cli) run(args ...string) (stdout, stderr string, code int) {
 		env = append(env, kv)
 	}
 	cmd.Env = env
+	if c.dir != "" {
+		cmd.Dir = c.dir
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -85,6 +90,93 @@ func (c *cli) mustRun(args ...string) string {
 		c.t.Fatalf("%v exited %d: %s", args, code, errOut)
 	}
 	return out
+}
+
+// showField is the value after a label in `loa show`'s aligned output.
+func showField(t *testing.T, show, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(show, "\n") {
+		if strings.HasPrefix(line, label) {
+			return strings.TrimSpace(strings.TrimPrefix(line, label))
+		}
+	}
+	t.Fatalf("show has no %q line:\n%s", label, show)
+	return ""
+}
+
+// psRows keys the task rows of `loa ps` by id. An orphan has no task id, so it
+// has no row here.
+func psRows(t *testing.T, ps string) map[int64]string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(ps), "\n")
+	rows := make(map[int64]string, len(lines))
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		id, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		rows[id] = line
+	}
+	return rows
+}
+
+// psIDs is the task ids `loa ps` printed, in order. Orphan rows have no id.
+func psIDs(t *testing.T, ps string) []int64 {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(ps), "\n")
+	ids := make([]int64, 0, len(lines)-1)
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if id, err := strconv.ParseInt(fields[0], 10, 64); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// listColumn is a `loa list` row's value keyed by the header, so a test names a
+// column instead of counting tabs.
+func listColumn(t *testing.T, list, id, column string) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(list, "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("list has no rows:\n%s", list)
+	}
+	header := lines[0]
+	start, end, offset := -1, -1, 0
+	for _, name := range strings.Fields(header) {
+		at := strings.Index(header[offset:], name) + offset
+		if start >= 0 {
+			end = at
+			break
+		}
+		if name == column {
+			start = at
+		}
+		offset = at + len(name)
+	}
+	if start < 0 {
+		t.Fatalf("list has no %s column:\n%s", column, list)
+	}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != id {
+			continue
+		}
+		if end < 0 || end > len(line) {
+			end = len(line)
+		}
+		return strings.TrimSpace(line[start:end])
+	}
+	t.Fatalf("list has no row for id %s:\n%s", id, list)
+	return ""
 }
 
 func TestAddListLeaseDone(t *testing.T) {
@@ -132,6 +224,30 @@ func TestAddListLeaseDone(t *testing.T) {
 	}
 }
 
+func TestListShowsNoDependencies(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "lonely")
+
+	if got := listColumn(t, c.mustRun("list"), "1", "DEPS"); got != "-" {
+		t.Errorf("DEPS = %q, want -", got)
+	}
+}
+
+func TestListShowsDependenciesInIDOrder(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle", "-dep", "1")
+	c.mustRun("add", "-workspace", "loa", "-title", "leaf", "-dep", "2")
+	c.mustRun("add", "-workspace", "loa", "-title", "both", "-dep", "1", "-dep", "3")
+
+	list := c.mustRun("list")
+	for id, want := range map[string]string{"1": "-", "2": "1", "3": "2", "4": "1,3"} {
+		if got := listColumn(t, list, id, "DEPS"); got != want {
+			t.Errorf("task %s DEPS = %q, want %q", id, got, want)
+		}
+	}
+}
+
 func TestShowExplainsWhyATaskIsNotRunning(t *testing.T) {
 	c := newCLI(t)
 	c.mustRun("add", "-workspace", "loa", "-title", "schema", "-scope", "repo:demo")
@@ -150,9 +266,131 @@ func TestShowExplainsWhyATaskIsNotRunning(t *testing.T) {
 	}
 }
 
+func TestShowNamesADoneDependency(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "child", "-dep", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "1", "-result", "finished")
+
+	show := c.mustRun("show", "2")
+	if got, want := showField(t, show, "depends on:"), `#1 (done) "root"`; got != want {
+		t.Errorf("depends on = %q, want %q", got, want)
+	}
+	// The edge list is not the blocker explanation: a done dependency holds nothing.
+	if strings.Contains(show, "waiting on #1") {
+		t.Errorf("show names a done dependency as a blocker: %q", show)
+	}
+}
+
+func TestShowPrintsAnEmptyDependentList(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "lonely")
+
+	show := c.mustRun("show", "1")
+	if got, want := showField(t, show, "needed by:"), "-"; got != want {
+		t.Errorf("needed by = %q, want %q", got, want)
+	}
+}
+
+func TestShowNamesBothDirections(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle", "-dep", "1")
+	c.mustRun("add", "-workspace", "loa", "-title", "leaf", "-dep", "2")
+
+	show := c.mustRun("show", "2")
+	if got, want := showField(t, show, "depends on:"), `#1 (new) "root"`; got != want {
+		t.Errorf("depends on = %q, want %q", got, want)
+	}
+	if got, want := showField(t, show, "needed by:"), `#3 (new) "leaf"`; got != want {
+		t.Errorf("needed by = %q, want %q", got, want)
+	}
+}
+
 func TestShowRejectsUnknownTask(t *testing.T) {
 	c := newCLI(t)
 	_, errOut, code := c.run("show", "42")
+	if code != 1 || !strings.Contains(errOut, "not found") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestCancelDeletesANewTaskAndPrintsIt(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "queued")
+
+	out := c.mustRun("cancel", "1")
+	for label, want := range map[string]string{
+		"id:": "1", "title:": "queued", "status:": "new", "attempts:": "0/2",
+	} {
+		if got := showField(t, out, label); got != want {
+			t.Errorf("cancel %s = %q, want %q", label, got, want)
+		}
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "queued") {
+		t.Errorf("cancelled task is still listed: %q", list)
+	}
+}
+
+func TestCancelRefusesALeasedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "running")
+	c.mustRun("lease", "-owner", "cli-test")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "leased by cli-test until") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list", "-status", "leased"); !strings.Contains(list, "running") {
+		t.Errorf("refused cancel removed the leased task: %q", list)
+	}
+}
+
+func TestCancelRefusesADoneTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "shipped")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "1", "-branch", "loa/1.1")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "task is done") || !strings.Contains(errOut, "loa/1.1") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestCancelRefusesATaskWithADependent(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "base")
+	c.mustRun("add", "-workspace", "loa", "-title", "dependent", "-dep", "1")
+
+	_, errOut, code := c.run("cancel", "1")
+	if code != 1 || !strings.Contains(errOut, "#2") || !strings.Contains(errOut, "dependent") {
+		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list"); !strings.Contains(list, "base") || !strings.Contains(list, "dependent") {
+		t.Errorf("refused cancel changed the queue: %q", list)
+	}
+}
+
+func TestCancelDeletesABlockedTask(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "needs a human", "-max", "1")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("fail", "1", "-result", "out of attempts")
+
+	out := c.mustRun("cancel", "1")
+	if got := showField(t, out, "status:"); got != "blocked" {
+		t.Errorf("cancel status = %q, want blocked", got)
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "needs a human") {
+		t.Errorf("cancelled task is still listed: %q", list)
+	}
+}
+
+func TestCancelRejectsUnknownTask(t *testing.T) {
+	c := newCLI(t)
+	_, errOut, code := c.run("cancel", "42")
 	if code != 1 || !strings.Contains(errOut, "not found") {
 		t.Errorf("exit %d, stderr %q", code, errOut)
 	}
@@ -273,8 +511,42 @@ func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 	if !strings.Contains(lines[0], "SESSION") || !strings.Contains(lines[0], "WORKSPACE") {
 		t.Errorf("header = %q", lines[0])
 	}
-	if !strings.Contains(lines[1], "leased") || !strings.Contains(lines[2], "new") {
+	// Rows are located by id, not by position: ps is a separate order from the tab.
+	rows := psRows(t, out)
+	if !strings.Contains(rows[1], "leased") || !strings.Contains(rows[2], "new") {
 		t.Errorf("rows = %q", lines[1:])
+	}
+}
+
+func TestPsListsTasksNewestFirst(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "oldest")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle")
+	c.mustRun("add", "-workspace", "loa", "-title", "newest")
+	// Status must not decide the order: the oldest is leased, the middle is done.
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("lease", "-owner", "cli-test")
+	c.mustRun("done", "2", "-branch", "loa/2.1", "-result", "shipped")
+
+	ids := psIDs(t, c.mustRun("ps"))
+	if want := []int64{3, 2, 1}; !slices.Equal(ids, want) {
+		t.Fatalf("ps ids = %v, want %v", ids, want)
+	}
+
+	var snap struct {
+		Rows []struct {
+			ID int64 `json:"id"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
+		t.Fatalf("ps -json: %v", err)
+	}
+	jsonIDs := make([]int64, 0, len(snap.Rows))
+	for _, row := range snap.Rows {
+		jsonIDs = append(jsonIDs, row.ID)
+	}
+	if !slices.Equal(jsonIDs, ids) {
+		t.Errorf("ps -json ids = %v, table ids = %v", jsonIDs, ids)
 	}
 }
 
