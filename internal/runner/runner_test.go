@@ -3,6 +3,8 @@ package runner_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -109,6 +111,7 @@ type fakeBackend struct {
 	interrupted []string
 	opens       []runner.OpenRequest
 	output      map[string]string
+	prompts     map[string]string
 }
 
 func newFakeBackend(t *testing.T, repo string) *fakeBackend {
@@ -119,9 +122,10 @@ func newFakeBackend(t *testing.T, repo string) *fakeBackend {
 		agent: func(context.Context, string) (string, error) {
 			return "", nil
 		},
-		opened: map[string]string{},
-		closed: map[string]bool{},
-		output: map[string]string{},
+		opened:  map[string]string{},
+		closed:  map[string]bool{},
+		output:  map[string]string{},
+		prompts: map[string]string{},
 	}
 }
 
@@ -172,9 +176,10 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 	}, nil
 }
 
-func (f *fakeBackend) Prompt(ctx context.Context, h runner.Handle, _ string, _ time.Duration) error {
+func (f *fakeBackend) Prompt(ctx context.Context, h runner.Handle, text string, _ time.Duration) error {
 	f.mu.Lock()
 	agent := f.agent
+	f.prompts[h.WorkspaceID] = text
 	f.mu.Unlock()
 
 	out, err := agent(ctx, h.Worktree)
@@ -188,6 +193,12 @@ func (f *fakeBackend) Read(_ context.Context, h runner.Handle, _ int) (string, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.output[h.WorkspaceID], nil
+}
+
+func (f *fakeBackend) promptText(workspace string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prompts[workspace]
 }
 
 func (f *fakeBackend) Interrupt(_ context.Context, h runner.Handle) error {
@@ -250,6 +261,7 @@ func newRunner(t *testing.T, s *store.Store, b runner.Backend, mutate func(*runn
 	cfg := runner.Config{
 		Store:       s,
 		Backend:     b,
+		PromptsDir:  filepath.Join("..", "..", "prompts"),
 		Workers:     2,
 		MaxTasks:    10,
 		LeaseTTL:    time.Hour,
@@ -904,5 +916,107 @@ func TestReconcileClosesOnlyWhatItOwns(t *testing.T) {
 				t.Errorf("closed = %v, want %v", closed, tc.closed)
 			}
 		})
+	}
+}
+
+func TestDispatchRecordsThePromptAndItsHash(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	b.agent = committer(t)
+	task := addTask(t, s, store.NewTask{Title: "add a file"})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	source, err := os.ReadFile(filepath.Join("..", "..", "prompts", "implementer.md"))
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	sum := sha256.Sum256(source)
+	if got.Role != "implement" || got.Prompt != "implementer.md" || got.PromptHash != hex.EncodeToString(sum[:]) {
+		t.Errorf("prompt record = (%q, %q, %q), want the implementer file and its hash",
+			got.Role, got.Prompt, got.PromptHash)
+	}
+}
+
+func TestMissingPromptFileFailsTheTaskBeforeOpening(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	task := addTask(t, s, store.NewTask{Title: "plan it", Role: "planner"})
+
+	r := newRunner(t, s, b, func(c *runner.Config) { c.PromptsDir = t.TempDir() })
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(got.Result, "planner.md") || !strings.Contains(got.Result, "planner") {
+		t.Errorf("result = %q, want the missing prompt named with its role", got.Result)
+	}
+	if len(b.opens) != 0 {
+		t.Errorf("a missing prompt still opened a workspace: %+v", b.opens)
+	}
+}
+
+func TestUnknownRoleFailsTheTask(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	task := addTask(t, s, store.NewTask{Title: "who am i", Role: "wizard"})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got, err := s.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(got.Result, "unknown role") || !strings.Contains(got.Result, "wizard") {
+		t.Errorf("result = %q, want the unknown role named", got.Result)
+	}
+	if len(b.opens) != 0 {
+		t.Errorf("an unknown role still opened a workspace: %+v", b.opens)
+	}
+}
+
+func TestRoleSelectsTheToolSet(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "planner.md"), []byte("Task #{{.ID}}: {{.Title}}\n"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	task := addTask(t, s, store.NewTask{Title: "plan it", Role: "planner"})
+
+	r := newRunner(t, s, b, func(c *runner.Config) { c.PromptsDir = dir })
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	req, ok := b.openRequest(task.ID)
+	if !ok {
+		t.Fatal("the planner task was never dispatched")
+	}
+	want := []string{"read", "write", "grep", "find", "ls"}
+	if len(req.Tools) != len(want) {
+		t.Fatalf("tools = %v, want %v", req.Tools, want)
+	}
+	for i := range want {
+		if req.Tools[i] != want[i] {
+			t.Fatalf("tools = %v, want %v", req.Tools, want)
+		}
 	}
 }

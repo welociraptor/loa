@@ -692,3 +692,23 @@ func TestAgentKindAndReadyTimeoutDefaults(t *testing.T) {
 		t.Errorf("ready timeout = %s, want 2s", got)
 	}
 }
+
+func TestAgentArgsAppliesTheRoleTools(t *testing.T) {
+	h := &Herdr{AgentArgs: []string{"--no-session", "--model", "test"}}
+	got := h.agentArgs([]string{"read", "write"})
+	want := []string{"--no-session", "--model", "test", "--tools", "read,write"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+
+	h.AgentArgs = []string{"--no-session", "--tools", "bash"}
+	got = h.agentArgs([]string{"read"})
+	want = []string{"--no-session", "--tools", "read"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("args = %q, want the configured tools replaced", got)
+	}
+
+	if got := h.agentArgs(nil); !reflect.DeepEqual(got, h.AgentArgs) {
+		t.Errorf("nil tools changed the configured args: %q", got)
+	}
+}

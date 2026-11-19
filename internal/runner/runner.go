@@ -26,6 +26,9 @@ type Config struct {
 	Backend      Backend
 	Base         string // ref each worktree branches from
 	BranchPrefix string
+	PromptsDir   string // where role prompt files live; default found from the cwd
+	ProposalsDir string // where a changes verdict writes its proposal
+	Check        string // command run in a review worktree; exit status decides pass
 	Workers      int
 	MaxTasks     int           // tasks per run, i.e. the budget for one run
 	LeaseTTL     time.Duration // must exceed TaskTimeout
@@ -44,6 +47,8 @@ type TaskOutcome struct {
 	Branch      string
 	WorkspaceID string
 	PaneID      string
+	Verdict     string // a review's answer, empty for other roles
+	CheckPassed bool   // whether the review's check passed
 }
 
 // Stats is what one run did. Run is the run row this run closed.
@@ -77,6 +82,12 @@ func New(cfg Config) (*Runner, error) {
 	}
 	if cfg.BranchPrefix == "" {
 		cfg.BranchPrefix = "loa/"
+	}
+	if cfg.PromptsDir == "" {
+		cfg.PromptsDir = defaultPromptsDir()
+	}
+	if cfg.ProposalsDir == "" {
+		cfg.ProposalsDir = defaultProposalsDir()
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 1
@@ -236,6 +247,8 @@ func (r *Runner) taskOutcomes(tasks []*store.Task) []TaskOutcome {
 			Branch:      got.Branch,
 			WorkspaceID: got.WorkspaceID,
 			PaneID:      got.PaneID,
+			Verdict:     got.Verdict,
+			CheckPassed: got.CheckPassed,
 		})
 	}
 	return out
@@ -255,6 +268,28 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 
 	if strings.TrimSpace(task.Workspace) == "" {
 		return r.fail(ctx, task, "no workspace: a task needs -workspace LABEL to be dispatched")
+	}
+
+	// The role decides the prompt and the tools before anything is opened: an
+	// unknown role or a missing file must fail without leaving a workspace.
+	spec, err := specForRole(task.Role)
+	if err != nil {
+		return r.fail(ctx, task, err.Error())
+	}
+	source, err := readPrompt(r.cfg.PromptsDir, spec)
+	if err != nil {
+		return r.fail(ctx, task, err.Error())
+	}
+
+	review := spec.deliverable == deliverableVerdict
+	if review {
+		deps, err := r.cfg.Store.Deps(ctx, task.ID)
+		if err != nil {
+			return r.record(task, err)
+		}
+		if len(deps) == 0 {
+			return r.fail(ctx, task, "review has nothing to review: it depends on no task")
+		}
 	}
 
 	// A done dependency's branch already carries what that task committed, so a
@@ -278,6 +313,7 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
 		Base:           base,
 		AgentName:      fmt.Sprintf("loa-%d-%d", task.ID, task.Attempts),
+		Tools:          spec.tools,
 	})
 	if err != nil {
 		return r.fail(ctx, task, err.Error())
@@ -294,10 +330,40 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		return r.record(task, err)
 	}
 
+	// The prompt file is rendered with the attempt's real worktree, then the
+	// contract is appended. The name and hash go on the row before the prompt is
+	// sent, so everything this attempt produces is attributable to those bytes.
+	fields := fieldsFor(task, handle.Worktree, handle.Repo, handle.Branch)
+	if review {
+		diffs, err := r.reviewDiffs(ctx, task, handle)
+		if err != nil {
+			r.stopAndClose(handle, logf)
+			if commits, _ := commitsAhead(ctx, handle.Worktree, handle.Base); commits == 0 {
+				_ = deleteBranch(ctx, handle.Repo, handle.Branch)
+			}
+			return r.fail(ctx, task, err.Error())
+		}
+		if len(diffs) == 0 {
+			r.stopAndClose(handle, logf)
+			_ = deleteBranch(ctx, handle.Repo, handle.Branch)
+			return r.fail(ctx, task, "review has nothing to review: no dependency has a committed change")
+		}
+		fields.Diffs = diffs
+	}
+
+	text, err := taskPromptFor(task, spec, spec.prompt, source, fields)
+	if err != nil {
+		r.stopAndClose(handle, logf)
+		return r.fail(ctx, task, err.Error())
+	}
+	if err := r.cfg.Store.RecordPrompt(ctx, task.ID, spec.prompt, promptHash(source)); err != nil {
+		return r.record(task, err)
+	}
+
 	// The prompt is bounded twice: the backend's own wait, and this context, so a
 	// backend that ignores its timeout still cannot hold the run.
 	taskCtx, cancel := context.WithTimeout(ctx, r.cfg.TaskTimeout)
-	promptErr := r.cfg.Backend.Prompt(taskCtx, handle, prompt(task, handle.Worktree, handle.Repo, handle.Branch), r.cfg.TaskTimeout)
+	promptErr := r.cfg.Backend.Prompt(taskCtx, handle, text, r.cfg.TaskTimeout)
 	cancel()
 
 	// A blocked agent is waiting for a person. Leave the pane alone; closing it
@@ -322,6 +388,9 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	if gitErr != nil {
 		r.stopAndClose(handle, logf)
 		return r.fail(ctx, task, "cannot inspect the worktree: "+gitErr.Error())
+	}
+	if review {
+		return r.finishReview(ctx, task, handle, commits, summary, logf)
 	}
 
 	// Clean up before judging: the checkout is scratch space, the branch is the

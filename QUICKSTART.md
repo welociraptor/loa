@@ -179,8 +179,8 @@ git -C "$HOME/code/my-project" log --oneline HEAD..loa/1.1
 git -C "$HOME/code/my-project" diff HEAD...loa/1.1
 ```
 
-Review that branch like any other contribution, then merge it when you are
-satisfied. loa never pushes or merges.
+Review that branch like any other contribution, then merge it yourself, or let
+an approved review with a green check merge with `loa merge`. loa never pushes.
 
 ## Day-to-day use
 
@@ -356,6 +356,7 @@ to a person. That boundary is policy, not a sandbox.
 | `loa report [-since 24h\|YYYY-MM-DD] [-json]` | Show what happened in a window. |
 | `loa run [flags] [-json]` | Work the queue inside Herdr; `-json` emits machine-readable results. |
 | `loa runs` | List the run record, newest first. |
+| `loa merge ID [-into BRANCH]` | Merge an approved, green review; refuses a dirty checkout, a wrong branch or a conflict. |
 | `loa dash [flags]` | Open the dashboard inside Herdr. |
 | `loa unblock ID` | Return a blocked task to the queue. |
 | `loa resolve ID [-fail] [-result TEXT]` | Settle a non-leased task done, or blocked with `-fail`. |
@@ -365,9 +366,9 @@ to a person. That boundary is policy, not a sandbox.
 | `loa done ID [-branch B] [-result TEXT]` | Mark a held lease done. |
 | `loa fail ID [-result TEXT]` | Fail a held lease. |
 
-`loa run` and `loa dash` accept `-workers`, `-max`, `-base`, `-timeout`, `-ttl`,
-`-owner`, `-model` and `-kind`. All commands accept `-db PATH`. `loa help` prints
-the short reference.
+`loa run` and `loa dash` accept `-workers`, `-max`, `-base`, `-check`, `-timeout`,
+`-ttl`, `-owner`, `-model` and `-kind`. All commands accept `-db PATH`. `loa help`
+prints the short reference.
 
 ## Limits and safety
 

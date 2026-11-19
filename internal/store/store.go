@@ -37,6 +37,9 @@ const (
 var (
 	ErrNotFound  = errors.New("store: task not found")
 	ErrNotLeased = errors.New("store: task is not leased")
+
+	// ErrAlreadyMerged refuses a second merge of the same implementation task.
+	ErrAlreadyMerged = errors.New("store: task is already merged")
 )
 
 // Task is one row of the queue. Scopes are coarse mutual-exclusion domains:
@@ -46,6 +49,7 @@ type Task struct {
 	Title       string
 	Body        string
 	Workspace   string // Herdr workspace label; resolved to an id at dispatch
+	Role        string // which prompt file and tool set the worker gets
 	Status      Status
 	Priority    int
 	Attempts    int
@@ -65,6 +69,27 @@ type Task struct {
 
 	// RunMS is how long the last attempt held the task, in milliseconds.
 	RunMS int64
+
+	// What the last dispatch asked the worker with. Empty before the first
+	// dispatch; kept afterwards so a result is attributable to its prompt.
+	Prompt     string
+	PromptHash string
+
+	// A review's deliverable. Verdict is empty for tasks that are not reviews;
+	// VerdictNotes is the JSON array the parser accepted.
+	Verdict      string
+	VerdictNotes string
+
+	// What the review's deterministic check did. CheckCommand is empty when no
+	// check ran, which is a refusal to merge rather than a pass.
+	CheckCommand string
+	CheckPassed  bool
+	CheckOutput  string
+
+	// When the implementation branch merged, and the commit it produced. Both
+	// are empty until `loa merge` succeeds.
+	MergedAt    time.Time
+	MergeCommit string
 }
 
 // NewTask is the caller-supplied part of a task.
@@ -72,6 +97,7 @@ type NewTask struct {
 	Title     string
 	Body      string
 	Workspace string
+	Role      string
 	Priority  int
 	MaxTries  int
 	Scopes    []string
@@ -199,9 +225,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 
 func insertTask(ctx context.Context, tx *sql.Tx, t NewTask, now string) (int64, error) {
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (title, body, workspace, priority, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.Title, t.Body, t.Workspace, t.Priority, maxTries(t.MaxTries), now, now)
+		`INSERT INTO tasks (title, body, workspace, role, priority, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Title, t.Body, t.Workspace, roleOf(t.Role), t.Priority, maxTries(t.MaxTries), now, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert task: %w", err)
 	}
@@ -308,11 +334,22 @@ func maxTries(n int) int {
 	return n
 }
 
-const taskColumns = `id, title, body, workspace, status, priority, attempts, max_attempts,
+// roleOf is the column's default, applied on the way in so a caller that does
+// not know about roles, or an old binary, lands on the implementer path.
+func roleOf(role string) string {
+	if strings.TrimSpace(role) == "" {
+		return "implement"
+	}
+	return role
+}
+
+const taskColumns = `id, title, body, workspace, role, status, priority, attempts, max_attempts,
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
-	coalesce(not_before, ''), workspace_id, pane_id, run_ms`
+	coalesce(not_before, ''), workspace_id, pane_id, run_ms,
+	prompt, prompt_hash, verdict, verdict_notes,
+	check_command, check_passed, check_output, coalesce(merged_at, ''), merge_commit`
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -325,10 +362,13 @@ type scanner interface {
 
 func scanTask(sc scanner) (*Task, error) {
 	t := Task{}
-	var status, created, updated, expiry, notBefore string
-	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
+	var status, created, updated, expiry, notBefore, mergedAt string
+	var checkPassed int
+	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &t.Role, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
-		&t.WorkspaceID, &t.PaneID, &t.RunMS)
+		&t.WorkspaceID, &t.PaneID, &t.RunMS, &t.Prompt, &t.PromptHash,
+		&t.Verdict, &t.VerdictNotes, &t.CheckCommand, &checkPassed, &t.CheckOutput,
+		&mergedAt, &t.MergeCommit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -336,6 +376,7 @@ func scanTask(sc scanner) (*Task, error) {
 		return nil, fmt.Errorf("store: scan task: %w", err)
 	}
 	t.Status = Status(status)
+	t.CheckPassed = checkPassed != 0
 	if t.CreatedAt, err = parseTime(created); err != nil {
 		return nil, fmt.Errorf("store: created_at: %w", err)
 	}
@@ -347,6 +388,9 @@ func scanTask(sc scanner) (*Task, error) {
 	}
 	if t.NotBefore, err = parseTime(notBefore); err != nil {
 		return nil, fmt.Errorf("store: not_before: %w", err)
+	}
+	if t.MergedAt, err = parseTime(mergedAt); err != nil {
+		return nil, fmt.Errorf("store: merged_at: %w", err)
 	}
 	return &t, nil
 }
@@ -539,6 +583,87 @@ func (s *Store) Attach(ctx context.Context, id int64, workspaceID, paneID string
 		 WHERE id = ? AND status = 'leased'`,
 		workspaceID, paneID, formatTime(time.Now()), id)
 	return finished(res, err, id)
+}
+
+// RecordPrompt records the prompt file and content hash the attempt used. Like
+// Attach it is refused once the task is no longer leased: the record belongs to
+// whoever holds the task now.
+func (s *Store) RecordPrompt(ctx context.Context, id int64, name, hash string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET prompt = ?, prompt_hash = ?, updated_at = ?
+		 WHERE id = ? AND status = 'leased'`,
+		name, hash, formatTime(time.Now()), id)
+	return finished(res, err, id)
+}
+
+// RecordVerdict stores a review's answer without finishing the task. It is how
+// a blocked verdict is kept: the pane is left open for a human, but the reason
+// is on the row. Like RecordPrompt it is refused once the lease is gone.
+func (s *Store) RecordVerdict(ctx context.Context, id int64, verdict, notes string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET verdict = ?, verdict_notes = ?
+		 WHERE id = ? AND status = 'leased'`,
+		verdict, notes, id)
+	return finished(res, err, id)
+}
+
+// CompleteReview marks a leased review done with its verdict. A review has no
+// branch deliverable, so the recorded branch is left where it was.
+func (s *Store) CompleteReview(ctx context.Context, id int64, verdict, notes, result string) error {
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks
+		 SET status = 'done', verdict = ?, verdict_notes = ?, result = ?,
+		     lease_owner = NULL, lease_expires_at = NULL,
+		     run_ms = `+runTime+`, updated_at = ?
+		 WHERE id = ? AND status = 'leased'`,
+		verdict, notes, result, formatTime(now), formatTime(now), id)
+	return finished(res, err, id)
+}
+
+// RecordCheck stores what the review's deterministic check did. It is refused
+// once the lease is gone, like the other attempt records, and deliberately
+// leaves updated_at alone so the run's duration stays the attempt's.
+func (s *Store) RecordCheck(ctx context.Context, id int64, command string, passed bool, output string) error {
+	passedInt := 0
+	if passed {
+		passedInt = 1
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET check_command = ?, check_passed = ?, check_output = ?
+		 WHERE id = ? AND status = 'leased'`,
+		command, passedInt, output, id)
+	return finished(res, err, id)
+}
+
+// MarkMerged records the merge commit on the implementation task. The
+// transition is guarded in SQL, so a second caller sees ErrAlreadyMerged rather
+// than writing a second record over the first.
+func (s *Store) MarkMerged(ctx context.Context, id int64, at time.Time, commit string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET merged_at = ?, merge_commit = ?, updated_at = ?
+		 WHERE id = ? AND merged_at = ''`,
+		formatTime(at), commit, formatTime(at), id)
+	if err != nil {
+		return fmt.Errorf("store: merge %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: merge %d: %w", id, err)
+	}
+	if n > 0 {
+		return nil
+	}
+
+	var found int
+	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id = ?`, id).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: merge %d: %w", id, err)
+	}
+	return ErrAlreadyMerged
 }
 
 // runTime measures how long the attempt held the task. SQLite evaluates the

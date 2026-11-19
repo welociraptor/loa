@@ -41,6 +41,7 @@ type OpenRequest struct {
 	Branch         string
 	Base           string // ref to branch from
 	AgentName      string
+	Tools          []string // the role's tool set; nil leaves the backend default
 }
 
 // Handle is what exists once a task's work has been opened.

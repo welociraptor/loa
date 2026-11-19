@@ -33,6 +33,13 @@ func commitsAhead(ctx context.Context, worktree, base string) (int, error) {
 	return strconv.Atoi(out)
 }
 
+// diffBetween is the change a branch carries against its base. The three-dot
+// form uses the branches' merge base, so a configured base that moved since the
+// task branched does not put unrelated reverse commits into the review.
+func diffBetween(ctx context.Context, repoPath, base, branch string) (string, error) {
+	return gitOutput(ctx, repoPath, "diff", "--no-color", base+"..."+branch)
+}
+
 // deleteBranch removes a branch nobody has checked out. The runner asked Herdr
 // for this branch name, so it also owns cleaning it up when an attempt produced
 // nothing; otherwise every failed attempt litters the repository.

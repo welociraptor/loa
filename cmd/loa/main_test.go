@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"loa/internal/runner"
 	"loa/internal/store"
@@ -546,7 +547,7 @@ func TestRunJSONShape(t *testing.T) {
 			EndedAt: "2026-11-19T10:05:00Z", Workers: 4, MaxTasks: 4, Done: 1, Failed: 2,
 		},
 		Outcomes: []runner.TaskOutcome{
-			{ID: 1, Done: true, Branch: "loa/1.1", WorkspaceID: "w4", PaneID: "w4:p1"},
+			{ID: 1, Done: true, Branch: "loa/1.1", WorkspaceID: "w4", PaneID: "w4:p1", Verdict: "approve", CheckPassed: true},
 			{ID: 2, Blocked: true, Branch: "loa/2.1", WorkspaceID: "w5", PaneID: "w5:p1"},
 			{ID: 3},
 		},
@@ -575,6 +576,8 @@ func TestRunJSONShape(t *testing.T) {
 			WorkspaceID string `json:"workspace_id"`
 			PaneID      string `json:"pane_id"`
 			Blocked     bool   `json:"blocked"`
+			Verdict     string `json:"verdict"`
+			CheckPassed bool   `json:"check_passed"`
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
@@ -590,21 +593,24 @@ func TestRunJSONShape(t *testing.T) {
 		t.Fatalf("tasks = %+v", got.Tasks)
 	}
 	want := []struct {
-		id     int64
-		status string
-		branch string
-		ws     string
-		pane   string
-		block  bool
+		id      int64
+		status  string
+		branch  string
+		ws      string
+		pane    string
+		block   bool
+		verdict string
+		check   bool
 	}{
-		{1, "done", "loa/1.1", "w4", "w4:p1", false},
-		{2, "blocked", "loa/2.1", "w5", "w5:p1", true},
-		{3, "failed", "", "", "", false},
+		{1, "done", "loa/1.1", "w4", "w4:p1", false, "approve", true},
+		{2, "blocked", "loa/2.1", "w5", "w5:p1", true, "", false},
+		{3, "failed", "", "", "", false, "", false},
 	}
 	for i, w := range want {
 		task := got.Tasks[i]
 		if task.ID != w.id || task.Status != w.status || task.Branch != w.branch ||
-			task.WorkspaceID != w.ws || task.PaneID != w.pane || task.Blocked != w.block {
+			task.WorkspaceID != w.ws || task.PaneID != w.pane || task.Blocked != w.block ||
+			task.Verdict != w.verdict || task.CheckPassed != w.check {
 			t.Errorf("task %d = %+v, want %+v", i, task, w)
 		}
 	}
@@ -621,5 +627,71 @@ func TestRunJSONWithoutASessionExitsOneAndPrintsNothing(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "Herdr") {
 		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+func TestRoleIsAddedAndShown(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "plan the phase", "-role", "planner")
+
+	list := c.mustRun("list")
+	if !strings.Contains(list, "ROLE") || !strings.Contains(list, "planner") {
+		t.Errorf("list = %q, want the role", list)
+	}
+
+	show := c.mustRun("show", "1")
+	if !strings.Contains(show, "role:") || !strings.Contains(show, "planner") {
+		t.Errorf("show = %q, want the role", show)
+	}
+
+	ps := c.mustRun("ps")
+	if !strings.Contains(ps, "ROLE") || !strings.Contains(ps, "planner") {
+		t.Errorf("ps = %q, want the role", ps)
+	}
+
+	var snap struct {
+		Rows []struct {
+			Role string `json:"role"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
+		t.Fatalf("ps -json: %v", err)
+	}
+	if len(snap.Rows) != 1 || snap.Rows[0].Role != "planner" {
+		t.Errorf("rows = %+v, want the role", snap.Rows)
+	}
+}
+
+func TestDefaultRoleIsImplement(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "old style")
+	if show := c.mustRun("show", "1"); !strings.Contains(show, "role:") || !strings.Contains(show, "implement") {
+		t.Errorf("show = %q, want the default role", show)
+	}
+}
+
+func TestShowRendersTheVerdictAndItsNotes(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "review it", "-role", "review")
+
+	s, err := store.Open(context.Background(), c.db)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.Lease(context.Background(), "test", time.Hour, time.Now()); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := s.CompleteReview(context.Background(), 1, "changes",
+		`[{"file":"main.go","issue":"leaks a handle","suggestion":"close it"}]`,
+		"verdict: changes"); err != nil {
+		t.Fatalf("complete review: %v", err)
+	}
+
+	show := c.mustRun("show", "1")
+	for _, want := range []string{"verdict:", "changes", "note:", "main.go: leaks a handle", "suggested:", "close it"} {
+		if !strings.Contains(show, want) {
+			t.Errorf("show = %q, missing %q", show, want)
+		}
 	}
 }

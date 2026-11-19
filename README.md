@@ -36,7 +36,7 @@ order, and a database newer than the binary is refused rather than opened.
 nix develop
 go build ./cmd/loa
 
-loa add    -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:loa]... [-dep ID]...
+loa add    -workspace nixos -title "..." -body "..." [-role implement|plan|review] [-priority 5] [-scope repo:loa]... [-dep ID]...
 loa list   [-status new]...
 loa show   ID                      # fields, and why it is not running
 loa ps     [-json]                 # the queue joined with the live session
@@ -45,14 +45,26 @@ loa report [-since 24h|-json]      # what the day did, and how long it has been 
 loa runs                           # the run record, newest first
 loa triage                         # ask an agent to propose work; never applies it
 loa import FILE [-dry-run]         # apply a proposal: tasks, and priority changes
+loa merge ID [-into BRANCH]        # merge an approved, green review; never pushes
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5 [-json] # works the queue, inside Herdr
+loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
 ```
 
 `LOA_DB` selects the database (default `./loa.db`); every command
 also takes `-db`.
+
+A task's `-role` selects its prompt and tool set. The default, `implement`,
+uses `prompts/implementer.md` and the full tool set; `plan` uses
+`prompts/planner.md`, and `review` uses `prompts/reviewer.md`, both read-only
+plus `write`. The prompt is Markdown rendered with the task fields and then the
+runner appends its contract, which a prompt file cannot weaken. The dispatch
+records the prompt file and its content hash on the task, so a result is
+attributable to the instructions that produced it. `loa list`, `show` and `ps`
+show the role, and `show` shows the recorded prompt once a task has run.
+`loa run -prompts DIR` overrides the directory; otherwise it is found by
+walking up from the working directory to the repository root.
 
 Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
 `github.com/charmbracelet/bubbletea` for the tab. The second brings a renderer
@@ -67,10 +79,10 @@ that workspace's pane, prompts it and reads its terminal. Nothing is exec'd
 except the `herdr` client and `git`, and no worktree is created by this code.
 It has to be safe to interrupt and safe to run twice:
 
-- **Success is read from the repository, not from the agent.** A task is done
-  only if its branch gained a commit. An agent that reports success and
-  commits nothing fails, and its review text is recorded as the failure
-  reason.
+- **Success is read from the repository, not from the agent.** An implementation
+  task is done only if its branch gained a commit; an agent that reports success
+  and commits nothing fails, and its terminal text is recorded as the failure
+  reason. A review task is judged by its verdict instead (see [Reviews](#reviews)).
 - **The workspace is where the work happens.** A task names a Herdr workspace
   *label*, resolved to an id at dispatch: exact match, or the task fails. No
   filesystem path comes from task text at all — Herdr owns the repository.
@@ -185,13 +197,67 @@ is refused because it would sit in the queue forever looking like a runner bug.
 `import` then applies tasks and priority changes in **one transaction**, so a
 document with one bad task creates nothing.
 
+## Reviews
+
+A task whose role is `review` has a verdict as its deliverable, not a commit.
+The runner hands it the diffs of the tasks it depends on — that dependency set
+is the review subject — and reads `.loa/verdict.json` from its worktree:
+
+```json
+{"verdict": "approve|changes|blocked",
+ "notes": [{"file": "...", "issue": "...", "suggestion": "..."}],
+ "tasks": [{"title": "...", "workspace": "...", "body": "..."}]}
+```
+
+Parsing is strict: unknown fields, a missing verdict, or a verdict outside the
+three accepted answers fails the task with the parser's reason. `tasks` is the
+same plan format as a proposal and is optional.
+
+- `approve` finishes the review with the verdict recorded; no commit is needed.
+  If a check is configured, it is run in the review worktree first: only its
+  exit status decides, and an `approve` with a red check is recorded as
+  `changes`. A verdict is not a build.
+- `changes` also finishes it, records the verdict, and writes its `tasks` under
+  `$XDG_STATE_HOME/loa/proposals/`. Nothing applies that file — a person reads
+  it and imports it, so an agent cannot turn its own objection into work.
+- `blocked` is the existing human path: the task fails with its pane left open,
+  and a person answers the reviewer there.
+
+A commit alone cannot finish a review, and a review with no dependency diff
+fails rather than approving nothing. `show` renders the verdict, the check and
+its output; `report` includes the verdict with the day's work.
+
+## Merge
+
+`loa merge` is the only command that writes into a workspace checkout, and it
+performs one deterministic transition rather than a review of its own. It
+merges only when the review's verdict is `approve`, its check is recorded and
+passed, and the current checkout is clean and on the branch named by `-into`
+(default `main`). It runs one `git merge --no-ff`, records `merged_at` and
+`merge_commit` on the implementation task, and never pushes or deletes a
+branch. `ID` may be the review task or its implementation task.
+
+Everything else is a refusal that names the reason: a dirty checkout, a wrong
+branch, a conflict, a red or missing check, a verdict other than `approve`, an
+unfinished task, or a task already merged. A conflict is aborted and the
+branch is left for a person; no agent resolves it. A second merge for the same
+task is refused, not a second merge commit. A workflow's `merge: auto` is the
+coordinator calling `loa merge` per approved review; the guard stays in loa.
+
+The runner runs `-check CMD` in the review worktree after an `approve`, bounded
+by the same timeout as the task. Only the exit status is read as a pass; the
+output is kept on the row for the person reading a refusal. Without `-check`,
+an `approve` is still a verdict, but nothing merges: a review with no check
+recorded is refused by `loa merge`.
+
 ## Coordinator
 
 A run may be driven by a coordinator agent instead of a person. The coordinator
 writes the queue with `loa add` and `loa import`, starts work with `loa run
 -json`, reads the run record with `loa runs`, and escalates a blocked task to a
-person rather than answering its pane. A worker still sees one task body, and
-done still means a commit on its branch.
+person rather than answering its pane. A worker still sees one task body; an
+implementation is done when its branch gains a commit, and a review is done when
+it writes a verdict.
 
 A run that died without closing does not block the next one: `loa runs -close
 ID` settles it without inventing what it settled.
@@ -234,10 +300,13 @@ What is bounded:
 
 - one worktree per attempt, deleted afterwards; uncommitted work is discarded
   and only the branch survives
-- a named tool allowlist (`read`, `edit`, `write`, `bash`, `grep`, `find`, `ls`)
-  rather than whatever the human's settings happen to be
+- a named tool allowlist rather than whatever the human's settings happen to be:
+  implementers get `read`, `edit`, `write`, `bash`, `grep`, `find`, `ls`;
+  planners and reviewers get `read`, `write`, `grep`, `find`, `ls`, with no
+  `bash` and no `edit`
 - no push, no merge, no branch switching: a worker cannot publish or reach
-  another checkout through the tools it is told to use
+  another checkout through the tools it is told to use. `loa merge` is a
+  separate command with its own guard, not a worker tool
 - the task cannot name a filesystem path: it names a workspace label, and Herdr
   resolves it
 - `-timeout` and `-max` bound how long and how often a worker runs

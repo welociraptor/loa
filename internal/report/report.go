@@ -10,18 +10,21 @@ import (
 
 	"loa/internal/live"
 	"loa/internal/store"
+	"loa/internal/taskspec"
 )
 
 // Item is one task in a section.
 type Item struct {
-	ID        int64     `json:"id"`
-	Title     string    `json:"title"`
-	Workspace string    `json:"workspace"`
-	Branch    string    `json:"branch,omitempty"`
-	Session   string    `json:"session,omitempty"`
-	Result    string    `json:"result,omitempty"`
-	RunMS     int64     `json:"run_ms,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64           `json:"id"`
+	Title     string          `json:"title"`
+	Workspace string          `json:"workspace"`
+	Branch    string          `json:"branch,omitempty"`
+	Session   string          `json:"session,omitempty"`
+	Result    string          `json:"result,omitempty"`
+	Verdict   string          `json:"verdict,omitempty"`
+	Notes     []taskspec.Note `json:"notes,omitempty"`
+	RunMS     int64           `json:"run_ms,omitempty"`
+	UpdatedAt time.Time       `json:"updated_at"`
 }
 
 // Report is what happened in a window, and what is still lying around.
@@ -65,8 +68,14 @@ func Build(snap live.Snapshot, since, now time.Time) Report {
 			Branch:    task.Branch,
 			Session:   row.Session(),
 			Result:    task.Result,
+			Verdict:   task.Verdict,
 			RunMS:     task.RunMS,
 			UpdatedAt: task.UpdatedAt,
+		}
+		// Stored notes were accepted by the parser; a corrupted column must not
+		// take the whole report down, so only the valid ones are shown.
+		if notes, err := taskspec.ParseNotes(task.VerdictNotes); err == nil {
+			item.Notes = notes
 		}
 
 		inWindow := !task.UpdatedAt.Before(since)
@@ -100,11 +109,11 @@ func (r Report) Text() string {
 		r.Since.UTC().Format(time.RFC3339), r.Until.Sub(r.Since).Round(time.Minute))
 
 	section(&b, "done", r.Done, func(i Item) string {
-		return fmt.Sprintf("#%d  %s   %s   %s   %s",
-			i.ID, i.Title, branch(i.Branch), ran(i.RunMS), oneLine(i.Result))
+		return fmt.Sprintf("#%d  %s   %s   %s   %s%s",
+			i.ID, i.Title, branch(i.Branch), ran(i.RunMS), oneLine(i.Result), verdict(i.Verdict))
 	})
 	section(&b, "needs a human", r.Blocked, func(i Item) string {
-		return fmt.Sprintf("#%d  %s   %s", i.ID, i.Title, oneLine(i.Result))
+		return fmt.Sprintf("#%d  %s   %s%s", i.ID, i.Title, oneLine(i.Result), verdict(i.Verdict))
 	})
 	section(&b, "queued", r.Queued, func(i Item) string {
 		return fmt.Sprintf("#%d  %s", i.ID, i.Title)
@@ -133,6 +142,13 @@ func section(b *strings.Builder, name string, items []Item, line func(Item) stri
 	fmt.Fprintf(b, "%s: %d\n", name, len(items))
 	for _, item := range items {
 		fmt.Fprintf(b, "  %s\n", line(item))
+		for _, note := range item.Notes {
+			fmt.Fprintf(b, "    note %s: %s", note.File, oneLine(note.Issue))
+			if strings.TrimSpace(note.Suggestion) != "" {
+				fmt.Fprintf(b, " (suggested: %s)", oneLine(note.Suggestion))
+			}
+			b.WriteString("\n")
+		}
 	}
 	b.WriteString("\n")
 }
@@ -166,6 +182,13 @@ func branch(b string) string {
 		return "(no branch)"
 	}
 	return b
+}
+
+func verdict(v string) string {
+	if v == "" {
+		return ""
+	}
+	return "   verdict: " + v
 }
 
 // ran reports the attempt's wall time. Zero means it was never measured, which
