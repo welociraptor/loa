@@ -1,0 +1,53 @@
+-- index sqlite_autoindex_task_deps_1
+
+
+-- index sqlite_autoindex_task_scopes_1
+
+
+-- index task_scopes_scope
+CREATE INDEX task_scopes_scope ON task_scopes (scope)
+
+-- index tasks_claimable
+CREATE INDEX tasks_claimable ON tasks (status, priority DESC, id)
+
+-- table task_deps
+CREATE TABLE task_deps (
+    task_id    INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    depends_on INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on),
+    CHECK (task_id <> depends_on)
+)
+
+-- table task_scopes
+CREATE TABLE task_scopes (
+    task_id INTEGER NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    scope   TEXT    NOT NULL CHECK (scope <> ''),
+    PRIMARY KEY (task_id, scope)
+)
+
+-- table tasks
+CREATE TABLE tasks (
+    id               INTEGER PRIMARY KEY,
+    title            TEXT    NOT NULL,
+    body             TEXT    NOT NULL DEFAULT '',
+    status           TEXT    NOT NULL DEFAULT 'new'
+                     CHECK (status IN ('new', 'leased', 'done', 'blocked')),
+    priority         INTEGER NOT NULL DEFAULT 0,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    max_attempts     INTEGER NOT NULL DEFAULT 2,
+    branch           TEXT,
+    result           TEXT,
+    created_at       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL,
+    -- When a failed or abandoned task becomes claimable again. Retries are
+    -- deliberately delayed: an immediate retry would spend every attempt on the
+    -- same transient condition and starve the rest of the queue.
+    not_before       TEXT,
+    lease_owner      TEXT,
+    lease_expires_at TEXT, workspace TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '', run_ms INTEGER NOT NULL DEFAULT 0,
+    -- A lease is all-or-nothing: it is either held by someone with an expiry,
+    -- or not held at all. Anything else means a writer bypassed the store.
+    CHECK (status <> 'leased' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
+    CHECK (status = 'leased' OR (lease_owner IS NULL AND lease_expires_at IS NULL))
+)
+
