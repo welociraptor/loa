@@ -40,8 +40,13 @@ type OpenRequest struct {
 	WorkspaceLabel string // the Herdr workspace the task belongs to
 	Branch         string
 	Base           string // ref to branch from
-	AgentName      string
-	Tools          []string // the role's tool set; nil leaves the backend default
+	// FallbackBase is the ref to branch from when Base does not resolve. Only a
+	// dependency's branch can go missing: it is deleted once the merge is in,
+	// so a dependent task falls back to the configured base instead of failing.
+	// Empty means Base is the only choice.
+	FallbackBase string
+	AgentName    string
+	Tools        []string // the role's tool set; nil leaves the backend default
 }
 
 // Handle is what exists once a task's work has been opened.
@@ -53,6 +58,7 @@ type Handle struct {
 	Worktree    string
 	Repo        string
 	Base        string // commit the branch started from
+	BaseRef     string // ref that resolved to that commit, after any fallback
 	Branch      string
 }
 

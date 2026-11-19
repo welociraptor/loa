@@ -295,28 +295,36 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	// A done dependency's branch already carries what that task committed, so a
 	// dependent task starts there instead of at the configured base. The store
 	// picks the dependency that finished last; an empty answer means none
-	// qualifies and the base stands.
-	base := r.cfg.Base
+	// qualifies and the base stands. A branch that no longer resolves — it was
+	// deleted after its merge — is the backend's cue to use the configured base.
+	request := OpenRequest{
+		TaskID:         task.ID,
+		Attempt:        task.Attempts,
+		WorkspaceLabel: task.Workspace,
+		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
+		Base:           r.cfg.Base,
+		AgentName:      fmt.Sprintf("loa-%d-%d", task.ID, task.Attempts),
+		Tools:          spec.tools,
+	}
 	depBase, err := r.cfg.Store.DependencyBase(ctx, task.ID)
 	if err != nil {
 		return r.record(task, err)
 	}
 	if depBase != "" {
-		base = depBase
-		logf("branching from done dependency %s", depBase)
+		request.Base = depBase
+		request.FallbackBase = r.cfg.Base
 	}
 
-	handle, err := r.cfg.Backend.Open(ctx, OpenRequest{
-		TaskID:         task.ID,
-		Attempt:        task.Attempts,
-		WorkspaceLabel: task.Workspace,
-		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
-		Base:           base,
-		AgentName:      fmt.Sprintf("loa-%d-%d", task.ID, task.Attempts),
-		Tools:          spec.tools,
-	})
+	handle, err := r.cfg.Backend.Open(ctx, request)
 	if err != nil {
 		return r.fail(ctx, task, err.Error())
+	}
+	if depBase != "" {
+		if handle.BaseRef == depBase {
+			logf("branching from done dependency %s", depBase)
+		} else {
+			logf("cannot branch from dependency branch %s; branching from %s", depBase, r.cfg.Base)
+		}
 	}
 	logf("working in %s on %s (workspace %s, agent %s)",
 		handle.Worktree, handle.Branch, handle.WorkspaceID, handle.AgentName)

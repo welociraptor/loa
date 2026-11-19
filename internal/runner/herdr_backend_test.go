@@ -386,6 +386,7 @@ func TestOpenCreatesWorktreeAndStartsAgent(t *testing.T) {
 		Worktree:    wantPath,
 		Repo:        f.repo,
 		Base:        base,
+		BaseRef:     "HEAD",
 		Branch:      "loa/7.1",
 	}
 	if !reflect.DeepEqual(handle, want) {
@@ -415,6 +416,82 @@ func TestOpenCreatesWorktreeAndStartsAgent(t *testing.T) {
 		"--timeout", "60000",
 		"--", "--no-session", "--tools", "read,edit",
 	)
+}
+
+func TestOpenFallsBackWhenTheBaseRefIsGone(t *testing.T) {
+	ctx := context.Background()
+	f := newBackendFixture(t)
+	f.setWorkspaces(t, workspaceSpec{id: "w1", label: "loa"})
+
+	handle, err := f.backend().Open(ctx, OpenRequest{
+		TaskID:         7,
+		Attempt:        1,
+		WorkspaceLabel: "loa",
+		Branch:         "loa/7.1",
+		Base:           "loa/6.1",
+		FallbackBase:   "HEAD",
+		AgentName:      "loa-7-1",
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	base, err := gitOutput(ctx, f.repo, "rev-parse", "HEAD^{commit}")
+	if err != nil {
+		t.Fatalf("read base: %v", err)
+	}
+	if handle.Base != base || handle.BaseRef != "HEAD" {
+		t.Errorf("handle base = %q/%q, want the configured HEAD commit", handle.BaseRef, handle.Base)
+	}
+	if _, err := os.Stat(filepath.Join(f.worktrees, "w1", "README.md")); err != nil {
+		t.Errorf("the fallback worktree was not created: %v", err)
+	}
+
+	calls := f.calls(t)
+	if len(calls) != 4 {
+		t.Fatalf("calls = %q, want list, a failed create, the fallback create and start", calls)
+	}
+	assertArgv(t, calls[1],
+		"worktree", "create",
+		"--workspace", "w1",
+		"--branch", "loa/7.1",
+		"--base", "loa/6.1",
+		"--label", "loa #7",
+		"--no-focus",
+	)
+	assertArgv(t, calls[2],
+		"worktree", "create",
+		"--workspace", "w1",
+		"--branch", "loa/7.1",
+		"--base", "HEAD",
+		"--label", "loa #7",
+		"--no-focus",
+	)
+}
+
+func TestOpenReportsBothBasesWhenTheFallbackAlsoFails(t *testing.T) {
+	f := newBackendFixture(t)
+	f.setWorkspaces(t, workspaceSpec{id: "w1", label: "loa"})
+	t.Setenv("FAIL_WORKTREE_CREATE", "worktree_exists")
+
+	_, err := f.backend().Open(context.Background(), OpenRequest{
+		TaskID:         7,
+		Attempt:        1,
+		WorkspaceLabel: "loa",
+		Branch:         "loa/7.1",
+		Base:           "loa/6.1",
+		FallbackBase:   "HEAD",
+		AgentName:      "loa-7-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "create worktree") ||
+		!strings.Contains(err.Error(), "from HEAD") {
+		t.Fatalf("err = %v, want both base failures named", err)
+	}
+
+	calls := f.calls(t)
+	if len(calls) != 3 {
+		t.Fatalf("calls = %q, want list and both create attempts", calls)
+	}
 }
 
 func TestOpenRemovesWorktreeWhenBaseIsUnreadable(t *testing.T) {
