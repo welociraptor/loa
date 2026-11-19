@@ -232,6 +232,19 @@ func (f *fakeBackend) wasInterrupted(workspace string) bool {
 	return false
 }
 
+// openRequest returns the request that dispatched a task, which is how a test
+// sees the base a worktree was asked to branch from.
+func (f *fakeBackend) openRequest(taskID int64) (runner.OpenRequest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, req := range f.opens {
+		if req.TaskID == taskID {
+			return req, true
+		}
+	}
+	return runner.OpenRequest{}, false
+}
+
 func newRunner(t *testing.T, s *store.Store, b runner.Backend, mutate func(*runner.Config)) *runner.Runner {
 	t.Helper()
 	cfg := runner.Config{
@@ -254,10 +267,12 @@ func newRunner(t *testing.T, s *store.Store, b runner.Backend, mutate func(*runn
 }
 
 // committer writes a file and commits it, which is what a successful worker
-// leaves behind.
+// leaves behind. The name is derived from the worktree so a task running on top
+// of a dependency still adds a change instead of rewriting the same file.
 func committer(_ *testing.T) func(context.Context, string) (string, error) {
 	return func(_ context.Context, dir string) (string, error) {
-		if err := os.WriteFile(filepath.Join(dir, "work.txt"), []byte("x\n"), 0o600); err != nil {
+		name := "work-" + filepath.Base(dir) + ".txt"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x\n"), 0o600); err != nil {
 			return "", err
 		}
 		if _, err := gitE(dir, "add", "-A"); err != nil {
@@ -311,6 +326,108 @@ func TestRunCompletesTaskThatCommits(t *testing.T) {
 	}
 	// The branch outlives the workspace; that is the deliverable.
 	gitRun(t, b.repo, "rev-parse", "--verify", "loa/1.1")
+}
+
+func TestTaskBranchesFromItsDoneDependency(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	b.agent = committer(t)
+
+	dep := addTask(t, s, store.NewTask{Title: "first"})
+	child := addTask(t, s, store.NewTask{Title: "second", Deps: []int64{dep.ID}})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	depTask, err := s.Get(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("get dependency: %v", err)
+	}
+	if depTask.Branch != "loa/1.1" {
+		t.Fatalf("dependency branch = %q", depTask.Branch)
+	}
+
+	req, ok := b.openRequest(child.ID)
+	if !ok {
+		t.Fatal("the child task was never dispatched")
+	}
+	if req.Base != depTask.Branch {
+		t.Errorf("child base = %q, want the dependency branch %q", req.Base, depTask.Branch)
+	}
+
+	// The child's branch therefore carries the dependency's commit, not just the
+	// repository's starting point.
+	depCommit := gitRun(t, repo, "rev-parse", depTask.Branch+"^{commit}")
+	if _, err := gitE(repo, "merge-base", "--is-ancestor", depCommit, "loa/2.1"); err != nil {
+		t.Errorf("the child branch does not contain the dependency commit: %v", err)
+	}
+}
+
+func TestAChainOfTasksStacksCommits(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	b.agent = committer(t)
+
+	first := addTask(t, s, store.NewTask{Title: "first"})
+	second := addTask(t, s, store.NewTask{Title: "second", Deps: []int64{first.ID}})
+	third := addTask(t, s, store.NewTask{Title: "third", Deps: []int64{second.ID}})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	secondTask, err := s.Get(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("get second: %v", err)
+	}
+	req, ok := b.openRequest(third.ID)
+	if !ok {
+		t.Fatal("the third task was never dispatched")
+	}
+	if req.Base != secondTask.Branch {
+		t.Errorf("third base = %q, want %q", req.Base, secondTask.Branch)
+	}
+
+	// The chain is linear: the last branch has both earlier commits.
+	for _, branch := range []string{"loa/1.1", "loa/2.1"} {
+		commit := gitRun(t, repo, "rev-parse", branch+"^{commit}")
+		if _, err := gitE(repo, "merge-base", "--is-ancestor", commit, "loa/3.1"); err != nil {
+			t.Errorf("loa/3.1 does not contain %s: %v", branch, err)
+		}
+	}
+}
+
+func TestDoneDependencyWithoutABranchLeavesTheBaseAlone(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	b.agent = committer(t)
+
+	// A dependency can be done without a branch, e.g. settled by hand after a
+	// failure. There is nothing to branch from, so the configured base stands.
+	dep := addTask(t, s, store.NewTask{Title: "settled by hand"})
+	if err := s.Resolve(ctx, dep.ID, true, "approved by hand"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	child := addTask(t, s, store.NewTask{Title: "second", Deps: []int64{dep.ID}})
+
+	if _, err := newRunner(t, s, b, nil).Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	req, ok := b.openRequest(child.ID)
+	if !ok {
+		t.Fatal("the child task was never dispatched")
+	}
+	if req.Base != "HEAD" {
+		t.Errorf("child base = %q, want the configured base HEAD", req.Base)
+	}
 }
 
 func TestRunFailsWhenNothingIsCommitted(t *testing.T) {

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -40,6 +42,30 @@ func (s *Store) Deps(ctx context.Context, id int64) ([]Dep, error) {
 		return nil, fmt.Errorf("store: deps of %d: %w", id, err)
 	}
 	return deps, nil
+}
+
+// DependencyBase returns the branch of the dependency that finished last among
+// those that are done and recorded one. It returns "" when no dependency
+// qualifies, which is what makes the configured base the fallback. A re-queued
+// dependency is not done, so it never contributes.
+func (s *Store) DependencyBase(ctx context.Context, id int64) (string, error) {
+	var branch string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT coalesce(dep.branch, '')
+		 FROM task_deps d
+		 JOIN tasks dep ON dep.id = d.depends_on
+		 WHERE d.task_id = ?
+		   AND dep.status = 'done'
+		   AND dep.branch IS NOT NULL AND dep.branch <> ''
+		 ORDER BY dep.updated_at DESC, dep.id DESC
+		 LIMIT 1`, id).Scan(&branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: dependency base of %d: %w", id, err)
+	}
+	return branch, nil
 }
 
 // Blockers explains why a task cannot be claimed at now. An empty result means
