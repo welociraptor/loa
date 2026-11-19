@@ -173,7 +173,7 @@ func TestRealMigrationsFromEveryVersion(t *testing.T) {
 	ctx := context.Background()
 	const created = "2024-01-02T03:04:05Z"
 
-	for n := 1; n <= 4; n++ {
+	for n := 1; n <= 5; n++ {
 		t.Run(fmt.Sprintf("from_v%d", n), func(t *testing.T) {
 			db := rawDB(t)
 			applyMigrationsUpTo(t, db, n)
@@ -218,8 +218,11 @@ func TestRealMigrationsFromEveryVersion(t *testing.T) {
 			if err := migrate(ctx, db, migrationsFS); err != nil {
 				t.Fatalf("migrate to the newest version: %v", err)
 			}
-			if got := version(t, db); got != 4 {
-				t.Errorf("user_version = %d, want 4", got)
+			if got := version(t, db); got != 5 {
+				t.Errorf("user_version = %d, want 5", got)
+			}
+			if !hasTable(t, db, "runs") {
+				t.Error("runs table missing after the chain")
 			}
 
 			var title, workspace, workspaceID, paneID string
@@ -396,8 +399,8 @@ func TestConcurrentOpenMigratesOnce(t *testing.T) {
 	}
 
 	db := rawDBAt(t, path)
-	if got := version(t, db); got != 4 {
-		t.Errorf("user_version = %d, want 4", got)
+	if got := version(t, db); got != 5 {
+		t.Errorf("user_version = %d, want 5", got)
 	}
 	if !hasTable(t, db, "tasks") {
 		t.Error("migrations did not produce the schema")
