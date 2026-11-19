@@ -45,7 +45,7 @@ func (h *Herdr) Open(ctx context.Context, req OpenRequest) (Handle, error) {
 		var fallbackErr error
 		created, fallbackErr = h.createWorktree(ctx, workspaceID, req, req.FallbackBase)
 		if fallbackErr != nil {
-			return Handle{}, fmt.Errorf("%w (and from %s: %v)", err, req.FallbackBase, fallbackErr)
+			return Handle{}, fmt.Errorf("%w (and from %s: %w)", err, req.FallbackBase, fallbackErr)
 		}
 		usedBase = req.FallbackBase
 		err = nil
