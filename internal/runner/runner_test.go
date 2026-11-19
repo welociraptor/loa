@@ -595,7 +595,10 @@ func TestSecondRunIsRefusedWhileOneIsActive(t *testing.T) {
 	if !errors.Is(err, store.ErrRunActive) {
 		t.Fatalf("run: %v, want ErrRunActive", err)
 	}
-	for _, want := range []string{strconv.FormatInt(active.ID, 10), "someone-else/1"} {
+	for _, want := range []string{
+		strconv.FormatInt(active.ID, 10), "someone-else/1",
+		fmt.Sprintf("loa runs -close %d", active.ID),
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not name %q", err, want)
 		}

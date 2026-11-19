@@ -163,6 +163,65 @@ func TestFinishRunTwiceErrors(t *testing.T) {
 	}
 }
 
+func TestSettleRunFreesTheSlotAndKeepsTheCounts(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	first := openAt(t, path)
+	second := openAt(t, path)
+
+	run := startRun(t, first, "owner-a")
+	// Counts can only be written on the way out of active, so set them behind
+	// the API to show that settling carries them rather than zeroing them.
+	if _, err := first.db.ExecContext(ctx,
+		`UPDATE runs SET done = 5, failed = 2 WHERE id = ?`, run.ID); err != nil {
+		t.Fatalf("seed counts: %v", err)
+	}
+
+	if err := second.SettleRun(ctx, run.ID); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+
+	active, err := first.ActiveRun(ctx)
+	if err != nil {
+		t.Fatalf("active run: %v", err)
+	}
+	if active != nil {
+		t.Errorf("active run = %+v, want none", active)
+	}
+
+	settled, err := first.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if settled.Active() || settled.EndedAt == "" {
+		t.Errorf("run = %+v, want it closed", settled)
+	}
+	if settled.Done != 5 || settled.Failed != 2 {
+		t.Errorf("counts = (%d, %d), want the recorded (5, 2)", settled.Done, settled.Failed)
+	}
+
+	next := startRun(t, second, "owner-b")
+	if next.ID == run.ID {
+		t.Errorf("new run reuses id %d", run.ID)
+	}
+}
+
+func TestSettleRunRefusesAFinishedRun(t *testing.T) {
+	ctx := context.Background()
+	s := openAt(t, filepath.Join(t.TempDir(), "tasks.db"))
+	run := startRun(t, s, "owner")
+	if err := s.FinishRun(ctx, run.ID, 1, 0); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	if err := s.SettleRun(ctx, run.ID); !errors.Is(err, ErrRunFinished) {
+		t.Fatalf("settle: %v, want ErrRunFinished", err)
+	}
+	if err := s.SettleRun(ctx, run.ID+999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("settle unknown run: %v, want ErrNotFound", err)
+	}
+}
+
 func TestRunTimestampsAreRFC3339UTC(t *testing.T) {
 	ctx := context.Background()
 	s := openAt(t, filepath.Join(t.TempDir(), "tasks.db"))

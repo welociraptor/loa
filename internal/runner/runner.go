@@ -203,10 +203,10 @@ func (r *Runner) startRun(ctx context.Context) (store.Run, error) {
 	if errors.Is(err, store.ErrRunActive) {
 		active, lookupErr := r.cfg.Store.ActiveRun(ctx)
 		if lookupErr == nil && active != nil {
-			return store.Run{}, fmt.Errorf("runner: run %d is already active (owner %s): %w",
-				active.ID, active.Owner, err)
+			return store.Run{}, fmt.Errorf("runner: run %d is active (owner %s); if it is dead, close it with `loa runs -close %d`: %w",
+				active.ID, active.Owner, active.ID, err)
 		}
-		return store.Run{}, fmt.Errorf("runner: another run is already active (owner %s unknown): %w", r.owner, err)
+		return store.Run{}, fmt.Errorf("runner: a run is active (owner unknown); if it is dead, find it with `loa runs` and close it with `loa runs -close ID`: %w", err)
 	}
 	if err != nil {
 		return store.Run{}, fmt.Errorf("runner: start run: %w", err)

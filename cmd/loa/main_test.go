@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -495,6 +496,46 @@ func TestRunsJSONCarriesEveryRun(t *testing.T) {
 	}
 	if newest.Workers != 2 || newest.MaxTasks != 5 || older.Workers != 2 || older.MaxTasks != 5 {
 		t.Errorf("budget fields = %+v / %+v", newest, older)
+	}
+}
+
+func TestRunsCloseSettlesADeadRun(t *testing.T) {
+	c := newCLI(t)
+	dead := seedRun(t, c.db, "owner/a", 0, 0, true)
+
+	out := c.mustRun("runs", "-close", strconv.FormatInt(dead.ID, 10))
+	if !strings.Contains(out, "owner/a") || strings.Contains(out, "[active]") {
+		t.Errorf("runs -close printed %q, want the settled run", out)
+	}
+
+	var got struct {
+		Runs []struct {
+			ID      int64  `json:"id"`
+			EndedAt string `json:"ended_at"`
+			Done    int    `json:"done"`
+			Failed  int    `json:"failed"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("runs", "-json")), &got); err != nil {
+		t.Fatalf("runs -json: %v", err)
+	}
+	if len(got.Runs) != 1 || got.Runs[0].ID != dead.ID || got.Runs[0].EndedAt == "" {
+		t.Fatalf("runs = %+v, want the run closed", got.Runs)
+	}
+	if got.Runs[0].Done != 0 || got.Runs[0].Failed != 0 {
+		t.Errorf("counts = (%d, %d), want the recorded (0, 0)", got.Runs[0].Done, got.Runs[0].Failed)
+	}
+
+	// The slot is free: the next run starts instead of being refused.
+	next := seedRun(t, c.db, "owner/b", 0, 0, true)
+	if next.ID == dead.ID {
+		t.Errorf("new run reuses id %d", dead.ID)
+	}
+
+	// A finished run is not settled twice, and the refusal names the state.
+	_, errOut, code := c.run("runs", "-close", strconv.FormatInt(dead.ID, 10))
+	if code != 1 || !strings.Contains(errOut, "finished") {
+		t.Errorf("exit %d, stderr %q, want a finished-run refusal", code, errOut)
 	}
 }
 
