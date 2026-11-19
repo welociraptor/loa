@@ -111,6 +111,7 @@ type fakeBackend struct {
 	interrupted []string
 	opens       []runner.OpenRequest
 	output      map[string]string
+	prompts     map[string]string
 }
 
 func newFakeBackend(t *testing.T, repo string) *fakeBackend {
@@ -121,9 +122,10 @@ func newFakeBackend(t *testing.T, repo string) *fakeBackend {
 		agent: func(context.Context, string) (string, error) {
 			return "", nil
 		},
-		opened: map[string]string{},
-		closed: map[string]bool{},
-		output: map[string]string{},
+		opened:  map[string]string{},
+		closed:  map[string]bool{},
+		output:  map[string]string{},
+		prompts: map[string]string{},
 	}
 }
 
@@ -174,9 +176,10 @@ func (f *fakeBackend) Open(_ context.Context, req runner.OpenRequest) (runner.Ha
 	}, nil
 }
 
-func (f *fakeBackend) Prompt(ctx context.Context, h runner.Handle, _ string, _ time.Duration) error {
+func (f *fakeBackend) Prompt(ctx context.Context, h runner.Handle, text string, _ time.Duration) error {
 	f.mu.Lock()
 	agent := f.agent
+	f.prompts[h.WorkspaceID] = text
 	f.mu.Unlock()
 
 	out, err := agent(ctx, h.Worktree)
@@ -190,6 +193,12 @@ func (f *fakeBackend) Read(_ context.Context, h runner.Handle, _ int) (string, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.output[h.WorkspaceID], nil
+}
+
+func (f *fakeBackend) promptText(workspace string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prompts[workspace]
 }
 
 func (f *fakeBackend) Interrupt(_ context.Context, h runner.Handle) error {

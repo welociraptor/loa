@@ -71,6 +71,11 @@ type Task struct {
 	// dispatch; kept afterwards so a result is attributable to its prompt.
 	Prompt     string
 	PromptHash string
+
+	// A review's deliverable. Verdict is empty for tasks that are not reviews;
+	// VerdictNotes is the JSON array the parser accepted.
+	Verdict      string
+	VerdictNotes string
 }
 
 // NewTask is the caller-supplied part of a task.
@@ -329,7 +334,7 @@ const taskColumns = `id, title, body, workspace, role, status, priority, attempt
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
 	coalesce(not_before, ''), workspace_id, pane_id, run_ms,
-	prompt, prompt_hash`
+	prompt, prompt_hash, verdict, verdict_notes`
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -345,7 +350,8 @@ func scanTask(sc scanner) (*Task, error) {
 	var status, created, updated, expiry, notBefore string
 	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &t.Role, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
-		&t.WorkspaceID, &t.PaneID, &t.RunMS, &t.Prompt, &t.PromptHash)
+		&t.WorkspaceID, &t.PaneID, &t.RunMS, &t.Prompt, &t.PromptHash,
+		&t.Verdict, &t.VerdictNotes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -566,6 +572,31 @@ func (s *Store) RecordPrompt(ctx context.Context, id int64, name, hash string) e
 		`UPDATE tasks SET prompt = ?, prompt_hash = ?, updated_at = ?
 		 WHERE id = ? AND status = 'leased'`,
 		name, hash, formatTime(time.Now()), id)
+	return finished(res, err, id)
+}
+
+// RecordVerdict stores a review's answer without finishing the task. It is how
+// a blocked verdict is kept: the pane is left open for a human, but the reason
+// is on the row. Like RecordPrompt it is refused once the lease is gone.
+func (s *Store) RecordVerdict(ctx context.Context, id int64, verdict, notes string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET verdict = ?, verdict_notes = ?
+		 WHERE id = ? AND status = 'leased'`,
+		verdict, notes, id)
+	return finished(res, err, id)
+}
+
+// CompleteReview marks a leased review done with its verdict. A review has no
+// branch deliverable, so the recorded branch is left where it was.
+func (s *Store) CompleteReview(ctx context.Context, id int64, verdict, notes, result string) error {
+	now := time.Now()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks
+		 SET status = 'done', verdict = ?, verdict_notes = ?, result = ?,
+		     lease_owner = NULL, lease_expires_at = NULL,
+		     run_ms = `+runTime+`, updated_at = ?
+		 WHERE id = ? AND status = 'leased'`,
+		verdict, notes, result, formatTime(now), formatTime(now), id)
 	return finished(res, err, id)
 }
 

@@ -27,6 +27,7 @@ type Config struct {
 	Base         string // ref each worktree branches from
 	BranchPrefix string
 	PromptsDir   string // where role prompt files live; default found from the cwd
+	ProposalsDir string // where a changes verdict writes its proposal
 	Workers      int
 	MaxTasks     int           // tasks per run, i.e. the budget for one run
 	LeaseTTL     time.Duration // must exceed TaskTimeout
@@ -81,6 +82,9 @@ func New(cfg Config) (*Runner, error) {
 	}
 	if cfg.PromptsDir == "" {
 		cfg.PromptsDir = defaultPromptsDir()
+	}
+	if cfg.ProposalsDir == "" {
+		cfg.ProposalsDir = defaultProposalsDir()
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 1
@@ -272,6 +276,17 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		return r.fail(ctx, task, err.Error())
 	}
 
+	review := spec.deliverable == deliverableVerdict
+	if review {
+		deps, err := r.cfg.Store.Deps(ctx, task.ID)
+		if err != nil {
+			return r.record(task, err)
+		}
+		if len(deps) == 0 {
+			return r.fail(ctx, task, "review has nothing to review: it depends on no task")
+		}
+	}
+
 	// A done dependency's branch already carries what that task committed, so a
 	// dependent task starts there instead of at the configured base. The store
 	// picks the dependency that finished last; an empty answer means none
@@ -313,7 +328,25 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	// The prompt file is rendered with the attempt's real worktree, then the
 	// contract is appended. The name and hash go on the row before the prompt is
 	// sent, so everything this attempt produces is attributable to those bytes.
-	text, err := taskPrompt(task, spec.prompt, source, fieldsFor(task, handle.Worktree, handle.Repo, handle.Branch))
+	fields := fieldsFor(task, handle.Worktree, handle.Repo, handle.Branch)
+	if review {
+		diffs, err := r.reviewDiffs(ctx, task, handle)
+		if err != nil {
+			r.stopAndClose(handle, logf)
+			if commits, _ := commitsAhead(ctx, handle.Worktree, handle.Base); commits == 0 {
+				_ = deleteBranch(ctx, handle.Repo, handle.Branch)
+			}
+			return r.fail(ctx, task, err.Error())
+		}
+		if len(diffs) == 0 {
+			r.stopAndClose(handle, logf)
+			_ = deleteBranch(ctx, handle.Repo, handle.Branch)
+			return r.fail(ctx, task, "review has nothing to review: no dependency has a committed change")
+		}
+		fields.Diffs = diffs
+	}
+
+	text, err := taskPromptFor(task, spec, spec.prompt, source, fields)
 	if err != nil {
 		r.stopAndClose(handle, logf)
 		return r.fail(ctx, task, err.Error())
@@ -350,6 +383,9 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	if gitErr != nil {
 		r.stopAndClose(handle, logf)
 		return r.fail(ctx, task, "cannot inspect the worktree: "+gitErr.Error())
+	}
+	if review {
+		return r.finishReview(ctx, task, handle, commits, summary, logf)
 	}
 
 	// Clean up before judging: the checkout is scratch space, the branch is the

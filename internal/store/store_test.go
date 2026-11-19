@@ -1071,7 +1071,7 @@ func TestOpenRejectsBadPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw database: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 7"); err != nil {
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 8"); err != nil {
 		t.Fatalf("set user_version: %v", err)
 	}
 	db.Close()

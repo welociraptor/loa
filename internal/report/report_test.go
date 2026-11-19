@@ -144,6 +144,23 @@ func TestTextRendersEverySectionAndTheGap(t *testing.T) {
 	}
 }
 
+func TestTextRendersTheVerdictAndItsNotes(t *testing.T) {
+	now := time.Now()
+	snap := live.Snapshot{Rows: []live.Row{{Task: store.Task{
+		ID: 7, Title: "review the parser", Workspace: "loa",
+		Status: store.Done, UpdatedAt: now,
+		Verdict:      "changes",
+		VerdictNotes: `[{"file":"parser.go","issue":"drops a field","suggestion":"parse it"}]`,
+	}}}}
+
+	text := report.Build(snap, now.Add(-time.Hour), now).Text()
+	for _, want := range []string{"verdict: changes", "note parser.go: drops a field", "suggested: parse it"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("report is missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestAnEmptyQueueStillStatesTheGap(t *testing.T) {
 	snap, err := live.Read(context.Background(), newStore(t), noSession{})
 	if err != nil {

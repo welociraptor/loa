@@ -74,7 +74,20 @@ func Parse(r io.Reader) (Document, error) {
 func decode(raw []byte, out any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	return dec.Decode(out)
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+
+	// One document is the whole file. Trailing tokens are a malformed document,
+	// not a second thing to ignore.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("unexpected data after the JSON document")
+		}
+		return err
+	}
+	return nil
 }
 
 // Apply is a validated document: positions instead of titles, ready for a store.

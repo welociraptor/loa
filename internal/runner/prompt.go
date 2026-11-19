@@ -20,6 +20,16 @@ type promptFields struct {
 	Worktree string
 	Attempt  int
 	Repo     string
+	Diffs    []promptDiff
+}
+
+// promptDiff is one dependency's change, the subject of a review.
+type promptDiff struct {
+	ID     int64
+	Title  string
+	Branch string
+	Base   string
+	Diff   string
 }
 
 // fieldsFor is the one place task and attempt state become template data.
@@ -52,17 +62,58 @@ func renderTemplate(name string, source []byte, fields promptFields) (string, er
 
 // taskPrompt is the file's intent followed by the contract. The contract stays
 // in code because the judgement enforces it; a prompt file must not be able to
-// weaken "commit, do not push, stay in scope".
+// weaken "commit, do not push, stay in scope". A review is judged differently,
+// so its contract says so.
 func taskPrompt(task *store.Task, name string, source []byte, fields promptFields) (string, error) {
+	spec, err := specForRole(task.Role)
+	if err != nil {
+		spec = roleSpec{}
+	}
+	return taskPromptFor(task, spec, name, source, fields)
+}
+
+func taskPromptFor(task *store.Task, spec roleSpec, name string, source []byte, fields promptFields) (string, error) {
 	rendered, err := renderTemplate(name, source, fields)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimRight(rendered, "\n") + "\n\n" + contract(task), nil
+	rendered = strings.TrimRight(rendered, "\n")
+
+	if spec.deliverable == deliverableVerdict {
+		if diffs := diffSection(fields.Diffs); diffs != "" {
+			rendered += "\n\n" + diffs
+		}
+	}
+	return rendered + "\n\n" + contractFor(task, spec), nil
+}
+
+// diffSection is the change the reviewer is asked about, not a summary it has
+// to reconstruct. An empty section is omitted; the caller has already refused a
+// review with nothing to look at.
+func diffSection(diffs []promptDiff) string {
+	if len(diffs) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("## The change under review\n\n")
+	for _, d := range diffs {
+		fmt.Fprintf(&b, "### Task #%d: %s\n\nBranch `%s` from `%s`:\n\n```diff\n%s\n```\n\n",
+			d.ID, d.Title, d.Branch, d.Base, d.Diff)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // contract is what a worker wakes up to and cannot opt out of.
 func contract(task *store.Task) string {
+	return contractFor(task, roleSpec{})
+}
+
+func contractFor(task *store.Task, spec roleSpec) string {
+	if spec.deliverable == deliverableVerdict {
+		return reviewContract(task)
+	}
+
 	var b strings.Builder
 
 	b.WriteString("## Contract\n\n")
@@ -73,6 +124,25 @@ func contract(task *store.Task) string {
 	}
 	b.WriteString("- If the task cannot be done as described, say why and stop rather than making unrelated changes.\n\n")
 	b.WriteString("Finish with a short summary of what changed and what the human must verify.")
+
+	return b.String()
+}
+
+// reviewContract replaces the commit gate with the verdict gate. A review may
+// leave a commit or not; only the document finishes it.
+func reviewContract(task *store.Task) string {
+	var b strings.Builder
+
+	b.WriteString("## Contract\n\n")
+	b.WriteString("- Write `.loa/verdict.json` in this worktree. It is the deliverable, and a review without it fails.\n")
+	b.WriteString("- The document is `{\"verdict\":\"approve|changes|blocked\",\"notes\":[{\"file\":\"...\",\"issue\":\"...\",\"suggestion\":\"...\"}],\"tasks\":[...]}`. Unknown fields are refused.\n")
+	b.WriteString("- A commit cannot finish a review, and a review does not need one.\n")
+	b.WriteString("- Do not push, do not switch branches, do not touch any other checkout.\n")
+	if len(task.Scopes) > 0 {
+		fmt.Fprintf(&b, "- Stay inside %s. Another agent is excluded from these while you hold them.\n", strings.Join(task.Scopes, ", "))
+	}
+	b.WriteString("- If the task cannot be done as described, say why and stop rather than making unrelated changes.\n\n")
+	b.WriteString("Finish with a short summary of what you found and what the human must verify.")
 
 	return b.String()
 }

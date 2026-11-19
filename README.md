@@ -78,10 +78,10 @@ that workspace's pane, prompts it and reads its terminal. Nothing is exec'd
 except the `herdr` client and `git`, and no worktree is created by this code.
 It has to be safe to interrupt and safe to run twice:
 
-- **Success is read from the repository, not from the agent.** A task is done
-  only if its branch gained a commit. An agent that reports success and
-  commits nothing fails, and its review text is recorded as the failure
-  reason.
+- **Success is read from the repository, not from the agent.** An implementation
+  task is done only if its branch gained a commit; an agent that reports success
+  and commits nothing fails, and its terminal text is recorded as the failure
+  reason. A review task is judged by its verdict instead (see [Reviews](#reviews)).
 - **The workspace is where the work happens.** A task names a Herdr workspace
   *label*, resolved to an id at dispatch: exact match, or the task fails. No
   filesystem path comes from task text at all — Herdr owns the repository.
@@ -196,13 +196,41 @@ is refused because it would sit in the queue forever looking like a runner bug.
 `import` then applies tasks and priority changes in **one transaction**, so a
 document with one bad task creates nothing.
 
+## Reviews
+
+A task whose role is `review` has a verdict as its deliverable, not a commit.
+The runner hands it the diffs of the tasks it depends on — that dependency set
+is the review subject — and reads `.loa/verdict.json` from its worktree:
+
+```json
+{"verdict": "approve|changes|blocked",
+ "notes": [{"file": "...", "issue": "...", "suggestion": "..."}],
+ "tasks": [{"title": "...", "workspace": "...", "body": "..."}]}
+```
+
+Parsing is strict: unknown fields, a missing verdict, or a verdict outside the
+three accepted answers fails the task with the parser's reason. `tasks` is the
+same plan format as a proposal and is optional.
+
+- `approve` finishes the review with the verdict recorded; no commit is needed.
+- `changes` also finishes it, records the verdict, and writes its `tasks` under
+  `$XDG_STATE_HOME/loa/proposals/`. Nothing applies that file — a person reads
+  it and imports it, so an agent cannot turn its own objection into work.
+- `blocked` is the existing human path: the task fails with its pane left open,
+  and a person answers the reviewer there.
+
+A commit alone cannot finish a review, and a review with no dependency diff
+fails rather than approving nothing. `show` renders the verdict and notes;
+`report` includes them with the day's work.
+
 ## Coordinator
 
 A run may be driven by a coordinator agent instead of a person. The coordinator
 writes the queue with `loa add` and `loa import`, starts work with `loa run
 -json`, reads the run record with `loa runs`, and escalates a blocked task to a
-person rather than answering its pane. A worker still sees one task body, and
-done still means a commit on its branch.
+person rather than answering its pane. A worker still sees one task body; an
+implementation is done when its branch gains a commit, and a review is done when
+it writes a verdict.
 
 A run that died without closing does not block the next one: `loa runs -close
 ID` settles it without inventing what it settled.

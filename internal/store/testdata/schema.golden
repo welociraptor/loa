@@ -62,7 +62,7 @@ CREATE TABLE tasks (
     -- same transient condition and starve the rest of the queue.
     not_before       TEXT,
     lease_owner      TEXT,
-    lease_expires_at TEXT, workspace TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '', run_ms INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'implement', prompt TEXT NOT NULL DEFAULT '', prompt_hash TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT, workspace TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '', run_ms INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'implement', prompt TEXT NOT NULL DEFAULT '', prompt_hash TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', verdict_notes TEXT NOT NULL DEFAULT '',
     -- A lease is all-or-nothing: it is either held by someone with an expiry,
     -- or not held at all. Anything else means a writer bypassed the store.
     CHECK (status <> 'leased' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),

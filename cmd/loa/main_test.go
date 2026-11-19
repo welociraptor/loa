@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"loa/internal/runner"
 	"loa/internal/store"
@@ -661,5 +662,31 @@ func TestDefaultRoleIsImplement(t *testing.T) {
 	c.mustRun("add", "-workspace", "loa", "-title", "old style")
 	if show := c.mustRun("show", "1"); !strings.Contains(show, "role:") || !strings.Contains(show, "implement") {
 		t.Errorf("show = %q, want the default role", show)
+	}
+}
+
+func TestShowRendersTheVerdictAndItsNotes(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "review it", "-role", "review")
+
+	s, err := store.Open(context.Background(), c.db)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.Lease(context.Background(), "test", time.Hour, time.Now()); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := s.CompleteReview(context.Background(), 1, "changes",
+		`[{"file":"main.go","issue":"leaks a handle","suggestion":"close it"}]`,
+		"verdict: changes"); err != nil {
+		t.Fatalf("complete review: %v", err)
+	}
+
+	show := c.mustRun("show", "1")
+	for _, want := range []string{"verdict:", "changes", "note:", "main.go: leaks a handle", "suggested:", "close it"} {
+		if !strings.Contains(show, want) {
+			t.Errorf("show = %q, missing %q", show, want)
+		}
 	}
 }

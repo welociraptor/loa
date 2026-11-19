@@ -292,6 +292,19 @@ func cmdShow(ctx context.Context, args []string) error {
 		lines = append(lines, fmt.Sprintf("prompt:\t%s", task.Prompt))
 		lines = append(lines, fmt.Sprintf("prompt hash:\t%s", task.PromptHash))
 	}
+	if task.Verdict != "" {
+		lines = append(lines, fmt.Sprintf("verdict:\t%s", task.Verdict))
+		notes, err := taskspec.ParseNotes(task.VerdictNotes)
+		if err != nil {
+			return fmt.Errorf("show %d: %w", task.ID, err)
+		}
+		for _, note := range notes {
+			lines = append(lines, fmt.Sprintf("note:\t%s: %s", note.File, note.Issue))
+			if suggestion := strings.TrimSpace(note.Suggestion); suggestion != "" {
+				lines = append(lines, fmt.Sprintf("suggested:\t%s", suggestion))
+			}
+		}
+	}
 	if task.Result != "" {
 		lines = append(lines, fmt.Sprintf("result:\t%s", task.Result))
 	}

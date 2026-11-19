@@ -14,14 +14,25 @@ import (
 // column default, so tasks written before roles existed keep working.
 const defaultRole = "implement"
 
-// roleSpec is the fixed part of a role: the prompt file it reads and the tools
-// its agent may use. Roles are a column, not an execution path: adding one here
-// changes what is asked and what can touch the worktree, not how a run is
-// judged.
+// deliverable is what the runner judges instead of the agent's own report. A
+// role either leaves a commit on its branch or writes a document; the judge
+// follows the role, not the presence of a commit.
+type deliverable int
+
+const (
+	deliverableCommit deliverable = iota
+	deliverableVerdict
+)
+
+// roleSpec is the fixed part of a role: the prompt file it reads, the tools its
+// agent may use and what its work is judged by. Roles are a column, not an
+// execution path: adding one here changes what is asked and what can touch the
+// worktree, not how a run is judged.
 type roleSpec struct {
-	role   string
-	prompt string
-	tools  []string
+	role        string
+	prompt      string
+	tools       []string
+	deliverable deliverable
 }
 
 // implementerTools is the tool set the runner has always granted.
@@ -39,8 +50,8 @@ var roles = map[string]roleSpec{
 	"implementer": {role: "implementer", prompt: "implementer.md", tools: implementerTools},
 	"plan":        {role: "plan", prompt: "planner.md", tools: reviewTools},
 	"planner":     {role: "planner", prompt: "planner.md", tools: reviewTools},
-	"review":      {role: "review", prompt: "reviewer.md", tools: reviewTools},
-	"reviewer":    {role: "reviewer", prompt: "reviewer.md", tools: reviewTools},
+	"review":      {role: "review", prompt: "reviewer.md", tools: reviewTools, deliverable: deliverableVerdict},
+	"reviewer":    {role: "reviewer", prompt: "reviewer.md", tools: reviewTools, deliverable: deliverableVerdict},
 }
 
 // specForRole resolves a role. An unknown role fails the task rather than
