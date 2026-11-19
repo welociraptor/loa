@@ -717,6 +717,115 @@ runs next — is invisible outside `sqlite3`.
   35's and the column reuses its formatter, so `list` gains no query. Test: the
   empty case and a three-task chain, through the built binary.
 
+## Phase 9 — a daemon, and the client it serves (planned)
+
+`loa` has no daemon, and that was a decision with a reason: a process that
+outlives the shell is state nobody is watching, and a scheduler spends money with
+nobody in the room. What changed is where the work is written. The queue is now
+filled by triage, by coordinators, and by this document; a run that waits for a
+person to press a key is the slowest part of the loop, and the tab has become a
+poller of the database plus a second caller of Herdr. So the daemon arrives —
+with the two things that made it dangerous written into it rather than hoped
+for: a budget, and a brake.
+
+**The daemon owns only what must be single.** Leases and the runs that take them,
+every Herdr call, the supervision of attempts, and the scheduler move into one
+process. Everything that is a queue operation stays in SQL, reached directly by
+the CLI: `add`, `list`, `show`, `ps`, `report`, `import`, `cancel` and `unblock`
+keep working — and keep working when the daemon is dead. A tool whose `list`
+needs a server is worse than the invariant that server would protect. That is
+the boundary, and it is the point: the store is still the contract and the
+daemon is a supervisor that happens to be the only one.
+
+**No state the database cannot recreate.** The daemon's memory is a cache — the
+active run, the leases, the workspaces it owns are all in SQL, and it reconciles
+at start. `kill -9` on the daemon has to be no worse than `kill -9` on today's
+`loa run`: a lapsed lease, a run row to settle, a workspace to reconcile. The
+lease is still the whole design.
+
+**The socket is the user, not a privilege boundary.** `$XDG_RUNTIME_DIR/loa/sock`
+in a 0700 directory, `SO_PEERCRED` checked against the uid, and no TCP listener
+ever. An NDJSON line protocol over `net.Unix` with `encoding/json`, so the
+dependency list does not move. The first line carries a protocol version and a
+mismatch is refused, the way the database refuses an older binary. Anything
+running as you can already write the queue; the daemon grants nothing new, and
+the documents say that instead of implying a sandbox.
+
+- [ ] **37. The daemon, and its protocol.** `loa daemon` serves `status`, `ping`,
+  `stop`, `pause` and `resume` over the socket and does nothing else: no runs, no
+  scheduler, so it can land and be watched before it moves any work. One instance
+  is an exclusive `flock` on `$XDG_RUNTIME_DIR/loa/lock`; a second daemon exits
+  naming the holder, and a socket left by a crash is reclaimed only when that
+  lock is free — the rule the reconciler already applies to workspaces, prove
+  ownership before touching it. `loa daemon -status` prints the pid, the active
+  run and the uptime, or exits non-zero: "is it up" has to be answerable by a
+  script. The pane requirement is replaced by the probe it always meant:
+  `InSession()` is `HERDR_ENV=1`, which a daemon cannot honestly claim, so the
+  daemon requires `herdr status` and the pane check stays only where it means
+  "the human is looking at a session" (`triage`). Test: the second daemon
+  refuses; a stale socket is reclaimed after `kill -9` and refused while a live
+  holder exists; a wrong-version client is refused; SIGTERM removes the socket;
+  the peer check rejects a foreign uid through an injected credential check, not
+  a second user.
+
+- [ ] **38. Runs move into the daemon.** `loa run` becomes a client: the request
+  starts a run in the daemon and the same outcome line comes back, `-json`
+  unchanged, so coordinator scripts do not notice. The tab's `s`/`S` become
+  `run`/`stop` requests, and **closing the tab no longer cancels a run** — the
+  deliberate reversal of step 22, because the run belongs to the daemon and that
+  is what the daemon is for. Attempts keep their shape (one worktree, one agent,
+  judged by a commit) because the runner moves and does not change. The daemon
+  reconciles at start and settles a dead run's row itself, which is what `loa
+  runs -close` was a command for. `loa lease`/`done`/`fail` stay: they are the
+  store's own API, they are what the tests drive, and a second scheduler
+  competing with the daemon through SQL is legal and pointless rather than
+  unsafe. Test: a client that disconnects leaves the run going; SIGTERM to the
+  daemon leaves the attempt's lease to lapse, which is the existing
+  `TestCancelledRunCleansUpAndLeavesTheLease`; a run started by one client is
+  visible to another; a dead daemon's row is settled on the next start.
+
+- [ ] **39. The scheduler, behind a flag and a brake.** `-auto`, off by default.
+  With it on the daemon starts a run when a task is claimable, no run is active,
+  and the last settled run is older than `-idle`; it stops starting when `-max`
+  (per run) or `-daily` (tasks settled today, counted from `runs`) is spent.
+  `loa pause` and `loa resume` stop and start auto-starting without touching the
+  run in flight; pause lives in the daemon's memory, so a restart resumes —
+  documented, because a brake that survives a restart is a file, and a file that
+  says whether this machine may spend money belongs in the unit, not in a hidden
+  directory. The policy is the unit: flags, checked in, changed by an edit
+  rather than by a conversation with a model. Test: `-auto` starts a run within
+  one interval; `-pause` does not; no second run while one is active; `-daily`
+  exhausted stops it; an empty queue is not a busy loop, the interval is the
+  floor.
+
+- [ ] **40. The unit, and the documents.** A systemd user unit is where the
+  policy lives — `loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12`,
+  `Restart=on-failure`, and the socket path. README gains the daemon section and
+  the honest limits; PLAN.md loses "No timer, no daemon, no scheduler" and gains
+  the boundary in its place, and **Known limitations** moves in both directions:
+  a missed day now has a flag that closes it, and a crashed daemon becomes a new
+  one. Test: the documented command line parses, and `nix flake check` is green
+  on the tree that ships the unit.
+
+The tab is a client of the daemon, so steps 38–40 assume step 34's plain loop —
+task 15 is done and unmerged on `loa/15.1`, and that merge comes first.
+
+What it costs:
+
+- One more process, and its absence is quiet: a daemon that died at 03:00 looks
+  exactly like a queue with nothing claimable until someone reads `report`.
+- Attempts are now supervised by a process that can die mid-attempt. That is
+  already the design's answer to a dead worker — lease lapse, reconcile next
+  start — but it now happens in one place, so that one place must stay correct.
+- Protocol skew is a new failure mode between two binaries on one machine. The
+  version handshake refuses rather than guesses; it does not make skew
+  impossible.
+- Unattended spend is the real cost. `-auto` turns one human decision into many
+  runs, `-daily` and `pause` bound it, and neither is a sandbox.
+- The daemon calls Herdr, so Herdr's session becomes a thing the daemon owns while
+  it runs. A person who closes that session is stopping work in a way the queue
+  did not record.
+
 ## The coordinator (decided)
 
 `loa` may be driven by a coordinator agent, not only by a person. Three
@@ -744,8 +853,10 @@ decisions define that mode; each widens the old design deliberately.
 
 ## Not planned, on purpose
 
-- **No timer, no daemon, no scheduler.** A run is something a person or a
-  coordinator starts, and the dashboard is where a person starts it.
+- **No daemon for the queue.** A daemon supervises runs and owns the leases they
+  take (phase 9); it is not a server the queue needs. `add`, `list`, `show`,
+  `ps`, `report`, `import` and `cancel` reach SQLite directly and keep working
+  while it is dead.
 - **No second execution backend.** Herdr is the only way a task runs. A headless
   path would double every failure mode to save one attach.
 - **No web UI.** The dashboard is a pane because the workers are panes; a
@@ -772,9 +883,10 @@ decisions define that mode; each widens the old design deliberately.
 
 ## Known limitations
 
-- **Nothing runs unless someone starts it.** A person or a coordinator must
-  start a run; a missed day is a real gap. Step 24 reports it, but nothing
-  reminds you beforehand.
+- **Nothing runs unless someone starts it, or `-auto` is on.** A person, a
+  coordinator or the daemon (step 39) must start a run; a missed day is a real
+  gap, and a crashed daemon is a machine quietly not working. Step 24 reports
+  it, but nothing reminds you beforehand.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
