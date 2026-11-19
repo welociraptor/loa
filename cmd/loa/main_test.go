@@ -99,6 +99,44 @@ func showField(t *testing.T, show, label string) string {
 	return ""
 }
 
+// listColumn is a `loa list` row's value keyed by the header, so a test names a
+// column instead of counting tabs.
+func listColumn(t *testing.T, list, id, column string) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(list, "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("list has no rows:\n%s", list)
+	}
+	header := lines[0]
+	start, end, offset := -1, -1, 0
+	for _, name := range strings.Fields(header) {
+		at := strings.Index(header[offset:], name) + offset
+		if start >= 0 {
+			end = at
+			break
+		}
+		if name == column {
+			start = at
+		}
+		offset = at + len(name)
+	}
+	if start < 0 {
+		t.Fatalf("list has no %s column:\n%s", column, list)
+	}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != id {
+			continue
+		}
+		if end < 0 || end > len(line) {
+			end = len(line)
+		}
+		return strings.TrimSpace(line[start:end])
+	}
+	t.Fatalf("list has no row for id %s:\n%s", id, list)
+	return ""
+}
+
 func TestAddListLeaseDone(t *testing.T) {
 	c := newCLI(t)
 
@@ -140,6 +178,30 @@ func TestAddListLeaseDone(t *testing.T) {
 	for _, want := range []string{"branch:", "loa/1.1", "result:", "merged", "already done"} {
 		if !strings.Contains(show, want) {
 			t.Errorf("show = %q, missing %q", show, want)
+		}
+	}
+}
+
+func TestListShowsNoDependencies(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "lonely")
+
+	if got := listColumn(t, c.mustRun("list"), "1", "DEPS"); got != "-" {
+		t.Errorf("DEPS = %q, want -", got)
+	}
+}
+
+func TestListShowsDependenciesInIDOrder(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "root")
+	c.mustRun("add", "-workspace", "loa", "-title", "middle", "-dep", "1")
+	c.mustRun("add", "-workspace", "loa", "-title", "leaf", "-dep", "2")
+	c.mustRun("add", "-workspace", "loa", "-title", "both", "-dep", "1", "-dep", "3")
+
+	list := c.mustRun("list")
+	for id, want := range map[string]string{"1": "-", "2": "1", "3": "2", "4": "1,3"} {
+		if got := listColumn(t, list, id, "DEPS"); got != want {
+			t.Errorf("task %s DEPS = %q, want %q", id, got, want)
 		}
 	}
 }

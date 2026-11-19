@@ -234,7 +234,7 @@ func cmdList(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tPRI\tTRIES\tSCOPES\tDEPS\tTITLE"); err != nil {
 		return err
 	}
 	for _, t := range tasks {
@@ -242,8 +242,9 @@ func cmdList(ctx context.Context, args []string) error {
 		if len(t.Scopes) > 0 {
 			scopes = strings.Join(t.Scopes, ",")
 		}
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\n",
-			t.ID, t.Status, t.Role, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
+		deps := edgeList(t.Deps, ",", func(d store.Dep) string { return strconv.FormatInt(d.ID, 10) })
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\t%s\n",
+			t.ID, t.Status, t.Role, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, deps, t.Title); err != nil {
 			return err
 		}
 	}
@@ -253,16 +254,21 @@ func cmdList(ctx context.Context, args []string) error {
 
 // edgeList is the whole dependency graph in one field, including edges whose
 // task is done. Blockers is the separate explanation of what actually holds a
-// task.
-func edgeList(deps []store.Dep) string {
+// task. Each edge's shape is the caller's: show names it, list shows its id.
+func edgeList(deps []store.Dep, sep string, edge func(store.Dep) string) string {
 	if len(deps) == 0 {
 		return "-"
 	}
 	parts := make([]string, len(deps))
 	for i, d := range deps {
-		parts[i] = fmt.Sprintf("#%d (%s) %q", d.ID, d.Status, d.Title)
+		parts[i] = edge(d)
 	}
-	return strings.Join(parts, ", ")
+	return strings.Join(parts, sep)
+}
+
+// namedEdge is how show renders one dependency: the id, its status and its title.
+func namedEdge(d store.Dep) string {
+	return fmt.Sprintf("#%d (%s) %q", d.ID, d.Status, d.Title)
 }
 
 func cmdShow(ctx context.Context, args []string) error {
@@ -297,8 +303,8 @@ func cmdShow(ctx context.Context, args []string) error {
 		fmt.Sprintf("role:\t%s", task.Role),
 		fmt.Sprintf("priority:\t%d", task.Priority),
 		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
-		fmt.Sprintf("depends on:\t%s", edgeList(task.Deps)),
-		fmt.Sprintf("needed by:\t%s", edgeList(dependents)),
+		fmt.Sprintf("depends on:\t%s", edgeList(task.Deps, ", ", namedEdge)),
+		fmt.Sprintf("needed by:\t%s", edgeList(dependents, ", ", namedEdge)),
 	}
 	if task.PlanID != "" {
 		lines = append(lines, fmt.Sprintf("plan:\t%s", task.PlanID))
