@@ -36,7 +36,7 @@ order, and a database newer than the binary is refused rather than opened.
 nix develop
 go build ./cmd/loa
 
-loa add    -workspace nixos -title "..." -body "..." -priority 5 [-scope repo:loa]... [-dep ID]...
+loa add    -workspace nixos -title "..." -body "..." [-role implement|plan|review] [-priority 5] [-scope repo:loa]... [-dep ID]...
 loa list   [-status new]...
 loa show   ID                      # fields, and why it is not running
 loa ps     [-json]                 # the queue joined with the live session
@@ -48,11 +48,22 @@ loa import FILE [-dry-run]         # apply a proposal: tasks, and priority chang
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5 [-json] # works the queue, inside Herdr
+loa run    -workers 2 -max 5 [-prompts DIR] [-json] # works the queue, inside Herdr
 ```
 
 `LOA_DB` selects the database (default `./loa.db`); every command
 also takes `-db`.
+
+A task's `-role` selects its prompt and tool set. The default, `implement`,
+uses `prompts/implementer.md` and the full tool set; `plan` uses
+`prompts/planner.md`, and `review` uses `prompts/reviewer.md`, both read-only
+plus `write`. The prompt is Markdown rendered with the task fields and then the
+runner appends its contract, which a prompt file cannot weaken. The dispatch
+records the prompt file and its content hash on the task, so a result is
+attributable to the instructions that produced it. `loa list`, `show` and `ps`
+show the role, and `show` shows the recorded prompt once a task has run.
+`loa run -prompts DIR` overrides the directory; otherwise it is found by
+walking up from the working directory to the repository root.
 
 Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
 `github.com/charmbracelet/bubbletea` for the tab. The second brings a renderer
@@ -234,8 +245,10 @@ What is bounded:
 
 - one worktree per attempt, deleted afterwards; uncommitted work is discarded
   and only the branch survives
-- a named tool allowlist (`read`, `edit`, `write`, `bash`, `grep`, `find`, `ls`)
-  rather than whatever the human's settings happen to be
+- a named tool allowlist rather than whatever the human's settings happen to be:
+  implementers get `read`, `edit`, `write`, `bash`, `grep`, `find`, `ls`;
+  planners and reviewers get `read`, `write`, `grep`, `find`, `ls`, with no
+  `bash` and no `edit`
 - no push, no merge, no branch switching: a worker cannot publish or reach
   another checkout through the tools it is told to use
 - the task cannot name a filesystem path: it names a workspace label, and Herdr

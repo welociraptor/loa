@@ -46,6 +46,7 @@ type Task struct {
 	Title       string
 	Body        string
 	Workspace   string // Herdr workspace label; resolved to an id at dispatch
+	Role        string // which prompt file and tool set the worker gets
 	Status      Status
 	Priority    int
 	Attempts    int
@@ -65,6 +66,11 @@ type Task struct {
 
 	// RunMS is how long the last attempt held the task, in milliseconds.
 	RunMS int64
+
+	// What the last dispatch asked the worker with. Empty before the first
+	// dispatch; kept afterwards so a result is attributable to its prompt.
+	Prompt     string
+	PromptHash string
 }
 
 // NewTask is the caller-supplied part of a task.
@@ -72,6 +78,7 @@ type NewTask struct {
 	Title     string
 	Body      string
 	Workspace string
+	Role      string
 	Priority  int
 	MaxTries  int
 	Scopes    []string
@@ -199,9 +206,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 
 func insertTask(ctx context.Context, tx *sql.Tx, t NewTask, now string) (int64, error) {
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (title, body, workspace, priority, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.Title, t.Body, t.Workspace, t.Priority, maxTries(t.MaxTries), now, now)
+		`INSERT INTO tasks (title, body, workspace, role, priority, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Title, t.Body, t.Workspace, roleOf(t.Role), t.Priority, maxTries(t.MaxTries), now, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert task: %w", err)
 	}
@@ -308,11 +315,21 @@ func maxTries(n int) int {
 	return n
 }
 
-const taskColumns = `id, title, body, workspace, status, priority, attempts, max_attempts,
+// roleOf is the column's default, applied on the way in so a caller that does
+// not know about roles, or an old binary, lands on the implementer path.
+func roleOf(role string) string {
+	if strings.TrimSpace(role) == "" {
+		return "implement"
+	}
+	return role
+}
+
+const taskColumns = `id, title, body, workspace, role, status, priority, attempts, max_attempts,
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
-	coalesce(not_before, ''), workspace_id, pane_id, run_ms`
+	coalesce(not_before, ''), workspace_id, pane_id, run_ms,
+	prompt, prompt_hash`
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -326,9 +343,9 @@ type scanner interface {
 func scanTask(sc scanner) (*Task, error) {
 	t := Task{}
 	var status, created, updated, expiry, notBefore string
-	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
+	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &t.Role, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
-		&t.WorkspaceID, &t.PaneID, &t.RunMS)
+		&t.WorkspaceID, &t.PaneID, &t.RunMS, &t.Prompt, &t.PromptHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -538,6 +555,17 @@ func (s *Store) Attach(ctx context.Context, id int64, workspaceID, paneID string
 		`UPDATE tasks SET workspace_id = ?, pane_id = ?, updated_at = ?
 		 WHERE id = ? AND status = 'leased'`,
 		workspaceID, paneID, formatTime(time.Now()), id)
+	return finished(res, err, id)
+}
+
+// RecordPrompt records the prompt file and content hash the attempt used. Like
+// Attach it is refused once the task is no longer leased: the record belongs to
+// whoever holds the task now.
+func (s *Store) RecordPrompt(ctx context.Context, id int64, name, hash string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET prompt = ?, prompt_hash = ?, updated_at = ?
+		 WHERE id = ? AND status = 'leased'`,
+		name, hash, formatTime(time.Now()), id)
 	return finished(res, err, id)
 }
 

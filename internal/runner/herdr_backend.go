@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"loa/internal/herdr"
@@ -67,7 +68,7 @@ func (h *Herdr) Open(ctx context.Context, req OpenRequest) (Handle, error) {
 		Name:    req.AgentName,
 		Kind:    h.agentKind(),
 		PaneID:  created.PaneID,
-		Args:    h.AgentArgs,
+		Args:    h.agentArgs(req.Tools),
 		Timeout: h.readyTimeout(),
 	}); err != nil {
 		// A workspace without a working agent is garbage the human would have to
@@ -173,6 +174,24 @@ func (h *Herdr) TaskWorkspaces(ctx context.Context) ([]TaskWorkspace, error) {
 		}
 	}
 	return out, nil
+}
+
+// agentArgs applies a role's tool set to the configured arguments. A nil set
+// keeps the backend's own arguments, so a caller that does not know about roles
+// behaves as before.
+func (h *Herdr) agentArgs(tools []string) []string {
+	args := append([]string(nil), h.AgentArgs...)
+	if len(tools) == 0 {
+		return args
+	}
+	joined := strings.Join(tools, ",")
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--tools" {
+			args[i+1] = joined
+			return args
+		}
+	}
+	return append(args, "--tools", joined)
 }
 
 func (h *Herdr) agentKind() string {

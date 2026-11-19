@@ -1718,3 +1718,55 @@ func TestApplyRollsBackWhenAnyPartFails(t *testing.T) {
 		t.Errorf("a failed apply created %d task(s)", len(after)-len(before))
 	}
 }
+
+func TestRoleDefaultsToImplementAndRoundTrips(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+
+	old := add(t, s, store.NewTask{Title: "before roles", Workspace: "loa"})
+	task, err := s.Get(ctx, old)
+	if err != nil {
+		t.Fatalf("get default role: %v", err)
+	}
+	if task.Role != "implement" {
+		t.Errorf("default role = %q, want implement", task.Role)
+	}
+
+	id := add(t, s, store.NewTask{Title: "plan it", Workspace: "loa", Role: "planner"})
+	task, err = s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get explicit role: %v", err)
+	}
+	if task.Role != "planner" {
+		t.Errorf("role = %q, want planner", task.Role)
+	}
+	if task.Prompt != "" || task.PromptHash != "" {
+		t.Errorf("prompt record = (%q, %q), want empty before dispatch", task.Prompt, task.PromptHash)
+	}
+}
+
+func TestRecordPromptNeedsTheLeaseAndIsKept(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	id := add(t, s, store.NewTask{Title: "implement it", Workspace: "loa"})
+
+	if err := s.RecordPrompt(ctx, id, "implementer.md", "abc"); !errors.Is(err, store.ErrNotLeased) {
+		t.Errorf("record on an unleased task: %v, want ErrNotLeased", err)
+	}
+
+	lease(t, s, time.Now())
+	if err := s.RecordPrompt(ctx, id, "implementer.md", "abc"); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := s.Complete(ctx, id, "loa/1.1", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	task, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Prompt != "implementer.md" || task.PromptHash != "abc" {
+		t.Errorf("prompt record = (%q, %q), want the dispatch's file and hash", task.Prompt, task.PromptHash)
+	}
+}

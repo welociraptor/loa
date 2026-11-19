@@ -32,7 +32,7 @@ import (
 const usage = `loa — task queue for a multi-agent workflow
 
 usage:
-  loa add    -title TEXT -workspace LABEL [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
+  loa add    -title TEXT -workspace LABEL [-role ROLE] [-body TEXT] [-priority N] [-max N] [-scope SCOPE]... [-dep ID]...
   loa list   [-status STATUS]...
   loa show   ID
   loa ps     [-json]               # the queue joined with the live session
@@ -44,7 +44,7 @@ usage:
   loa resolve ID [-fail] [-result TEXT]
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
-  loa run    [-workers N] [-max N] [-timeout 45m] [-json]
+  loa run    [-workers N] [-max N] [-timeout 45m] [-prompts DIR] [-json]
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
 
@@ -160,6 +160,7 @@ func cmdAdd(ctx context.Context, args []string) error {
 		title     string
 		body      string
 		workspace string
+		role      string
 		priority  int
 		maxTries  int
 	)
@@ -167,6 +168,7 @@ func cmdAdd(ctx context.Context, args []string) error {
 		fs.StringVar(&title, "title", "", "task title")
 		fs.StringVar(&body, "body", "", "task body handed to the agent")
 		fs.StringVar(&workspace, "workspace", "", "Herdr workspace label the task belongs to")
+		fs.StringVar(&role, "role", "implement", "which prompt file and tool set the worker gets")
 		fs.IntVar(&priority, "priority", 0, "higher runs first")
 		fs.IntVar(&maxTries, "max", 2, "attempts before the task is blocked")
 		fs.Var(&scopes, "scope", "mutual-exclusion domain; repeatable")
@@ -187,8 +189,8 @@ func cmdAdd(ctx context.Context, args []string) error {
 	}
 
 	id, err := s.Add(ctx, store.NewTask{
-		Title: title, Body: body, Workspace: workspace, Priority: priority, MaxTries: maxTries,
-		Scopes: scopes, Deps: ids,
+		Title: title, Body: body, Workspace: workspace, Role: role,
+		Priority: priority, MaxTries: maxTries, Scopes: scopes, Deps: ids,
 	})
 	if err != nil {
 		return err
@@ -225,7 +227,7 @@ func cmdList(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tWORKSPACE\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tPRI\tTRIES\tSCOPES\tTITLE"); err != nil {
 		return err
 	}
 	for _, t := range tasks {
@@ -233,8 +235,8 @@ func cmdList(ctx context.Context, args []string) error {
 		if len(t.Scopes) > 0 {
 			scopes = strings.Join(t.Scopes, ",")
 		}
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d/%d\t%s\t%s\n",
-			t.ID, t.Status, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\n",
+			t.ID, t.Status, t.Role, workspaceOf(&t), t.Priority, t.Attempts, t.MaxAttempts, scopes, t.Title); err != nil {
 			return err
 		}
 	}
@@ -267,6 +269,7 @@ func cmdShow(ctx context.Context, args []string) error {
 		fmt.Sprintf("id:\t%d", task.ID),
 		fmt.Sprintf("title:\t%s", task.Title),
 		fmt.Sprintf("status:\t%s", task.Status),
+		fmt.Sprintf("role:\t%s", task.Role),
 		fmt.Sprintf("priority:\t%d", task.Priority),
 		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
 	}
@@ -284,6 +287,10 @@ func cmdShow(ctx context.Context, args []string) error {
 	}
 	if task.RunMS > 0 {
 		lines = append(lines, fmt.Sprintf("ran:\t%s", (time.Duration(task.RunMS)*time.Millisecond).Round(time.Second)))
+	}
+	if task.Prompt != "" {
+		lines = append(lines, fmt.Sprintf("prompt:\t%s", task.Prompt))
+		lines = append(lines, fmt.Sprintf("prompt hash:\t%s", task.PromptHash))
 	}
 	if task.Result != "" {
 		lines = append(lines, fmt.Sprintf("result:\t%s", task.Result))
@@ -316,6 +323,7 @@ type psRow struct {
 	ID          int64  `json:"id"`
 	Title       string `json:"title"`
 	Status      string `json:"status"`
+	Role        string `json:"role"`
 	Workspace   string `json:"workspace"`
 	Priority    int    `json:"priority"`
 	Attempts    int    `json:"attempts"`
@@ -362,7 +370,7 @@ func cmdPs(ctx context.Context, args []string) error {
 		for _, row := range snap.Rows {
 			out.Rows = append(out.Rows, psRow{
 				ID: row.Task.ID, Title: row.Task.Title, Status: string(row.Task.Status),
-				Workspace: row.Task.Workspace, Priority: row.Task.Priority,
+				Role: row.Task.Role, Workspace: row.Task.Workspace, Priority: row.Task.Priority,
 				Attempts: row.Task.Attempts, MaxAttempts: row.Task.MaxAttempts,
 				Branch: row.Task.Branch, Session: row.Session(),
 				WorkspaceID: row.WorkspaceID, AgentName: row.AgentName, AgentState: row.AgentState,
@@ -382,12 +390,12 @@ func cmdPs(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tWORKSPACE\tTRIES\tSESSION\tTITLE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATUS\tROLE\tWORKSPACE\tTRIES\tSESSION\tTITLE"); err != nil {
 		return err
 	}
 	for _, row := range snap.Rows {
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d/%d\t%s\t%s\n",
-			row.Task.ID, row.Task.Status, workspaceOf(&row.Task),
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d/%d\t%s\t%s\n",
+			row.Task.ID, row.Task.Status, row.Task.Role, workspaceOf(&row.Task),
 			row.Task.Attempts, row.Task.MaxAttempts, row.Session(), row.Task.Title); err != nil {
 			return err
 		}
@@ -716,27 +724,24 @@ func workspaceOf(task *store.Task) string {
 	return task.Workspace
 }
 
-// allowlist is the tool set a worker gets. It is named here rather than
-// inherited from the human's settings, so a change there cannot silently widen
-// what an autonomous agent may do.
-var allowlist = []string{"read", "edit", "write", "bash", "grep", "find", "ls"}
-
 // runFlags is what both `run` and `dash` need to start a run of the queue.
 type runFlags struct {
-	workers  int
-	maxTasks int
-	base     string
-	timeout  time.Duration
-	ttl      time.Duration
-	owner    string
-	model    string
-	kind     string
+	workers    int
+	maxTasks   int
+	base       string
+	promptsDir string
+	timeout    time.Duration
+	ttl        time.Duration
+	owner      string
+	model      string
+	kind       string
 }
 
 func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
 	fs.IntVar(&f.workers, "workers", 2, "tasks run concurrently")
 	fs.IntVar(&f.maxTasks, "max", 5, "tasks this run may start; the budget")
 	fs.StringVar(&f.base, "base", "HEAD", "commit or ref worktrees branch from")
+	fs.StringVar(&f.promptsDir, "prompts", "", "role prompt directory (default: found from the cwd)")
 	fs.DurationVar(&f.timeout, "timeout", 45*time.Minute, "limit for one agent run")
 	fs.DurationVar(&f.ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
 	fs.StringVar(&f.owner, "owner", defaultOwner(), "who holds the leases")
@@ -756,7 +761,7 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer
 		return nil, err
 	}
 
-	agentArgs := []string{"--no-session", "--tools", strings.Join(allowlist, ",")}
+	agentArgs := []string{"--no-session"}
 	if f.model != "" {
 		agentArgs = append(agentArgs, "--model", f.model)
 	}
@@ -769,6 +774,7 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer
 			AgentArgs: agentArgs,
 		},
 		Base:        f.base,
+		PromptsDir:  f.promptsDir,
 		Workers:     f.workers,
 		MaxTasks:    f.maxTasks,
 		LeaseTTL:    f.ttl,

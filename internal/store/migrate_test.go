@@ -173,7 +173,7 @@ func TestRealMigrationsFromEveryVersion(t *testing.T) {
 	ctx := context.Background()
 	const created = "2024-01-02T03:04:05Z"
 
-	for n := 1; n <= 5; n++ {
+	for n := 1; n <= 6; n++ {
 		t.Run(fmt.Sprintf("from_v%d", n), func(t *testing.T) {
 			db := rawDB(t)
 			applyMigrationsUpTo(t, db, n)
@@ -218,18 +218,18 @@ func TestRealMigrationsFromEveryVersion(t *testing.T) {
 			if err := migrate(ctx, db, migrationsFS); err != nil {
 				t.Fatalf("migrate to the newest version: %v", err)
 			}
-			if got := version(t, db); got != 5 {
-				t.Errorf("user_version = %d, want 5", got)
+			if got := version(t, db); got != 6 {
+				t.Errorf("user_version = %d, want 6", got)
 			}
 			if !hasTable(t, db, "runs") {
 				t.Error("runs table missing after the chain")
 			}
 
-			var title, workspace, workspaceID, paneID string
+			var title, workspace, role, prompt, promptHash, workspaceID, paneID string
 			var runMS int64
 			err = db.QueryRowContext(ctx,
-				`SELECT title, workspace, workspace_id, pane_id, run_ms FROM tasks WHERE id = ?`, id).
-				Scan(&title, &workspace, &workspaceID, &paneID, &runMS)
+				`SELECT title, workspace, role, prompt, prompt_hash, workspace_id, pane_id, run_ms FROM tasks WHERE id = ?`, id).
+				Scan(&title, &workspace, &role, &prompt, &promptHash, &workspaceID, &paneID, &runMS)
 			if err != nil {
 				t.Fatalf("read migrated task: %v", err)
 			}
@@ -239,6 +239,10 @@ func TestRealMigrationsFromEveryVersion(t *testing.T) {
 			if workspace != "" || workspaceID != "" || paneID != "" || runMS != 0 {
 				t.Errorf("new columns = (%q, %q, %q, %d), want empty defaults",
 					workspace, workspaceID, paneID, runMS)
+			}
+			if role != "implement" || prompt != "" || promptHash != "" {
+				t.Errorf("role/prompt/hash = (%q, %q, %q), want implement with an empty dispatch record",
+					role, prompt, promptHash)
 			}
 
 			var scope string
@@ -399,8 +403,8 @@ func TestConcurrentOpenMigratesOnce(t *testing.T) {
 	}
 
 	db := rawDBAt(t, path)
-	if got := version(t, db); got != 5 {
-		t.Errorf("user_version = %d, want 5", got)
+	if got := version(t, db); got != 6 {
+		t.Errorf("user_version = %d, want 6", got)
 	}
 	if !hasTable(t, db, "tasks") {
 		t.Error("migrations did not produce the schema")

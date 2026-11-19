@@ -623,3 +623,43 @@ func TestRunJSONWithoutASessionExitsOneAndPrintsNothing(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+func TestRoleIsAddedAndShown(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "plan the phase", "-role", "planner")
+
+	list := c.mustRun("list")
+	if !strings.Contains(list, "ROLE") || !strings.Contains(list, "planner") {
+		t.Errorf("list = %q, want the role", list)
+	}
+
+	show := c.mustRun("show", "1")
+	if !strings.Contains(show, "role:") || !strings.Contains(show, "planner") {
+		t.Errorf("show = %q, want the role", show)
+	}
+
+	ps := c.mustRun("ps")
+	if !strings.Contains(ps, "ROLE") || !strings.Contains(ps, "planner") {
+		t.Errorf("ps = %q, want the role", ps)
+	}
+
+	var snap struct {
+		Rows []struct {
+			Role string `json:"role"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("ps", "-json")), &snap); err != nil {
+		t.Fatalf("ps -json: %v", err)
+	}
+	if len(snap.Rows) != 1 || snap.Rows[0].Role != "planner" {
+		t.Errorf("rows = %+v, want the role", snap.Rows)
+	}
+}
+
+func TestDefaultRoleIsImplement(t *testing.T) {
+	c := newCLI(t)
+	c.mustRun("add", "-workspace", "loa", "-title", "old style")
+	if show := c.mustRun("show", "1"); !strings.Contains(show, "role:") || !strings.Contains(show, "implement") {
+		t.Errorf("show = %q, want the default role", show)
+	}
+}
