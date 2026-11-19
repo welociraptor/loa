@@ -695,3 +695,172 @@ func TestShowRendersTheVerdictAndItsNotes(t *testing.T) {
 		}
 	}
 }
+
+func TestImportPhasesCompilesTheBarrierAndNamesThePlan(t *testing.T) {
+	c := newCLI(t)
+	file := filepath.Join(t.TempDir(), "plan-example.json")
+	doc := `{"phases":[
+		{"name":"schema","tasks":[{"title":"schema","workspace":"loa"}]},
+		{"name":"writer","tasks":[{"title":"writer","workspace":"loa"}]}
+	]}`
+	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	out := strings.Split(strings.TrimSpace(c.mustRun("import", file)), "\n")
+	if len(out) != 2 {
+		t.Fatalf("import printed %q, want two ids", out)
+	}
+
+	show := c.mustRun("show", out[1])
+	for _, want := range []string{"waiting on #" + out[0], "plan:", "plan-example.json"} {
+		if !strings.Contains(show, want) {
+			t.Errorf("show = %q, missing %q", show, want)
+		}
+	}
+
+	report := c.mustRun("report")
+	if !strings.Contains(report, "plan: plan-example.json") {
+		t.Errorf("report does not name the plan:\n%s", report)
+	}
+
+	var r struct {
+		Queued []struct {
+			Plan string `json:"plan"`
+		} `json:"queued"`
+	}
+	if err := json.Unmarshal([]byte(c.mustRun("report", "-json")), &r); err != nil {
+		t.Fatalf("report -json: %v", err)
+	}
+	if len(r.Queued) != 2 || r.Queued[0].Plan != "plan-example.json" {
+		t.Errorf("report plans = %+v", r.Queued)
+	}
+}
+
+func TestImportRefusesAPhaseCycleAndCreatesNothing(t *testing.T) {
+	c := newCLI(t)
+	file := filepath.Join(t.TempDir(), "cycle.json")
+	doc := `{"phases":[
+		{"name":"one","after":"two","tasks":[{"title":"a","workspace":"loa"}]},
+		{"name":"two","tasks":[{"title":"b","workspace":"loa"}]}
+	]}`
+	if err := os.WriteFile(file, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, errOut, code := c.run("import", file)
+	if code != 1 || !strings.Contains(errOut, "dependency cycle") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	if list := c.mustRun("list"); strings.Contains(list, "a") || strings.Contains(list, "b") {
+		t.Errorf("a refused plan created tasks:\n%s", list)
+	}
+}
+
+func TestPlanRejectsABadWorkflowBeforeLookingForASession(t *testing.T) {
+	t.Setenv("LOA_DB", filepath.Join(t.TempDir(), "tasks.db"))
+	t.Setenv("HERDR_ENV", "")
+	workflow := filepath.Join(t.TempDir(), "workflow.json")
+	if err := os.WriteFile(workflow, []byte(`{
+		"prompts": {"plan": "prompts/planner.md"},
+		"check": "go test ./...",
+		"merge": "auto",
+		"stages": ["plan"],
+		"cheks": "typo"
+	}`), 0o600); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	err := cmdPlan(context.Background(), []string{"-workflow", workflow, "ship the report"})
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("err = %v, want the workflow typo named", err)
+	}
+}
+
+func TestPlanWritesUnderProposalsAndDoesNotApply(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	outDir := filepath.Join(dir, "proposals")
+	db := filepath.Join(dir, "tasks.db")
+	cwdFile := filepath.Join(dir, "scratch-cwd")
+
+	// The fake Herdr answers the five calls `plan` makes. On prompt it writes the
+	// plan into the scratch directory Herdr was asked to open, so the test sees
+	// exactly what a real planner would leave.
+	script := `#!/bin/sh
+cmd="$1 $2"
+case "$cmd" in
+  "status --json") printf '%s\n' '{"client":{"version":"0.9.5"},"server":{"running":true,"compatible":true,"protocol":22}}' ;;
+  "workspace create")
+    shift 2
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --cwd) printf '%s' "$2" > "$PLAN_CWD_FILE"; shift 2 ;;
+        --label) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s\n' '{"id":"cli:workspace:create","result":{"workspace":{"workspace_id":"w1"},"root_pane":{"pane_id":"w1:p1"}}}'
+    ;;
+  "agent start") printf '%s\n' '{"id":"cli:agent:start","result":{"type":"ok"}}' ;;
+  "agent prompt")
+    printf '%s' '{"phases":[{"name":"one","tasks":[{"title":"schemas","workspace":"loa"}]}]}' > "$(cat "$PLAN_CWD_FILE")/plan.json"
+    printf '%s\n' '{"id":"cli:agent:prompt","result":{"type":"ok"}}'
+    ;;
+  "workspace close") printf '%s\n' '{"id":"cli:workspace:close","result":{"type":"ok"}}' ;;
+  *) printf 'unexpected: %s\n' "$*" >&2; exit 9 ;;
+esac
+`
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "herdr"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the fake must be executable
+		t.Fatalf("write fake herdr: %v", err)
+	}
+	workflow := filepath.Join(dir, "workflow.json")
+	if err := os.WriteFile(workflow, []byte(`{
+		"prompts": {"plan": "prompts/planner.md"},
+		"check": "go test ./...",
+		"merge": "auto",
+		"stages": ["plan"]
+	}`), 0o600); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("LOA_DB", db)
+	t.Setenv("PLAN_CWD_FILE", cwdFile)
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	if err := cmdPlan(context.Background(), []string{
+		"-workflow", workflow, "-out", outDir, "ship the report",
+	}); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	plans, err := filepath.Glob(filepath.Join(outDir, "plan-*.json"))
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans = %v, %v; want one written under proposals", plans, err)
+	}
+	raw, err := os.ReadFile(plans[0]) //nolint:gosec // G304: the path is the file the test just made
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if !strings.Contains(string(raw), `"phases"`) {
+		t.Errorf("saved plan = %s", raw)
+	}
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, db)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	tasks, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("plan applied %d task(s): %+v", len(tasks), tasks)
+	}
+}

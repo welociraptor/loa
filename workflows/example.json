@@ -1,0 +1,10 @@
+{
+  "prompts": {
+    "plan": "prompts/planner.md",
+    "implement": "prompts/implementer.md",
+    "review": "prompts/reviewer.md"
+  },
+  "check": "nix develop -c go test ./...",
+  "merge": "auto",
+  "stages": ["plan", "implement", "review"]
+}
