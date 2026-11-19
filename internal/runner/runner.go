@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,11 +33,26 @@ type Config struct {
 	Logger       *log.Logger
 }
 
-// Stats is what one run did.
+// TaskOutcome is what became of one dispatched task, as recorded in the store.
+// The ids and branch are read back from the task row rather than taken from the
+// backend's handle: the row is what the dashboard, the report, and the next run
+// see, so it is the only source of truth here.
+type TaskOutcome struct {
+	ID          int64
+	Done        bool
+	Blocked     bool
+	Branch      string
+	WorkspaceID string
+	PaneID      string
+}
+
+// Stats is what one run did. Run is the run row this run closed.
 type Stats struct {
+	Run       store.Run
 	Tasks     int
 	Completed int
 	Failed    int
+	Outcomes  []TaskOutcome
 }
 
 // Runner works the queue. It is safe to run two of them against one database:
@@ -99,11 +115,35 @@ func New(cfg Config) (*Runner, error) {
 // as many runnable tasks as it has workers and runs them concurrently, so a
 // task freed by a finishing sibling is picked up by the next round instead of
 // being missed by a worker that already gave up.
-func (r *Runner) Run(ctx context.Context) (Stats, error) {
-	var stats Stats
-
+func (r *Runner) Run(ctx context.Context) (stats Stats, runErr error) {
 	// Whatever a previous, dead run left open is closed before new work starts.
 	r.reconcile(ctx, time.Now())
+
+	run, err := r.startRun(ctx)
+	if err != nil {
+		return stats, err
+	}
+	stats.Run = run
+
+	// The row is closed on every way out of this function, including a cancelled
+	// run: an open row would keep the next run from starting until a person
+	// noticed it. Cleanup gets its own context for the same reason.
+	defer func() {
+		sort.Slice(stats.Outcomes, func(i, j int) bool { return stats.Outcomes[i].ID < stats.Outcomes[j].ID })
+		stats.Run.Done = stats.Completed
+		stats.Run.Failed = stats.Failed
+
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := r.cfg.Store.FinishRun(closeCtx, run.ID, stats.Completed, stats.Failed); err != nil {
+			r.log.Printf("run %d: close: %v", run.ID, err)
+			if runErr == nil {
+				runErr = fmt.Errorf("runner: close run %d: %w", run.ID, err)
+			}
+			return
+		}
+		stats.Run.EndedAt = time.Now().UTC().Format(time.RFC3339)
+	}()
 
 	for stats.Tasks < r.cfg.MaxTasks {
 		if err := ctx.Err(); err != nil {
@@ -139,6 +179,7 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 		}
 		wg.Wait()
 
+		stats.Outcomes = append(stats.Outcomes, r.taskOutcomes(batch)...)
 		for _, o := range outcomes {
 			if o.err != nil {
 				return stats, o.err
@@ -152,6 +193,52 @@ func (r *Runner) Run(ctx context.Context) (Stats, error) {
 		}
 	}
 	return stats, nil
+}
+
+// startRun opens this run's row. A refusal names the run that already owns the
+// slot, because "a run is active" alone does not tell a person which pane to
+// look at.
+func (r *Runner) startRun(ctx context.Context) (store.Run, error) {
+	run, err := r.cfg.Store.StartRun(ctx, r.owner, r.cfg.Workers, r.cfg.MaxTasks)
+	if errors.Is(err, store.ErrRunActive) {
+		active, lookupErr := r.cfg.Store.ActiveRun(ctx)
+		if lookupErr == nil && active != nil {
+			return store.Run{}, fmt.Errorf("runner: run %d is already active (owner %s): %w",
+				active.ID, active.Owner, err)
+		}
+		return store.Run{}, fmt.Errorf("runner: another run is already active (owner %s unknown): %w", r.owner, err)
+	}
+	if err != nil {
+		return store.Run{}, fmt.Errorf("runner: start run: %w", err)
+	}
+	return run, nil
+}
+
+// taskOutcomes reads each task's row after dispatch, so the reported branch,
+// workspace and pane are the recorded ones rather than a handle that may never
+// have been attachable. A read failure still reports the task, as failed.
+func (r *Runner) taskOutcomes(tasks []*store.Task) []TaskOutcome {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out := make([]TaskOutcome, 0, len(tasks))
+	for _, task := range tasks {
+		got, err := r.cfg.Store.Get(ctx, task.ID)
+		if err != nil {
+			r.log.Printf("task %d: read outcome: %v", task.ID, err)
+			out = append(out, TaskOutcome{ID: task.ID})
+			continue
+		}
+		out = append(out, TaskOutcome{
+			ID:          got.ID,
+			Done:        got.Status == store.Done,
+			Blocked:     got.Status == store.Blocked,
+			Branch:      got.Branch,
+			WorkspaceID: got.WorkspaceID,
+			PaneID:      got.PaneID,
+		})
+	}
+	return out
 }
 
 // outcome is one task's fate. err is reserved for failures of the runner
