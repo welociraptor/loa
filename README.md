@@ -2,8 +2,9 @@
 
 Task queue for a multi-agent daily workflow. The SQLite database is the only
 shared state: the runner leases one task at a time, hands it to an agent in a
-Herdr worktree workspace, and records the outcome. Agents never write to the
-store, so a crashed or misbehaving worker cannot corrupt the queue.
+Herdr worktree workspace, and records the outcome. Workers do not write to the
+store; a coordinator may (see [Coordinator](#coordinator)), and that boundary is
+policy rather than a sandbox.
 
 Named for the loa of Gibson's *Count Zero*: a spirit that takes up residence in
 a host and works through it.
@@ -41,12 +42,13 @@ loa show   ID                      # fields, and why it is not running
 loa ps     [-json]                 # the queue joined with the live session
 loa dash                           # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
+loa runs                           # the run record, newest first
 loa triage                         # ask an agent to propose work; never applies it
 loa import FILE [-dry-run]         # apply a proposal: tasks, and priority changes
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5       # works the queue, inside Herdr
+loa run    -workers 2 -max 5 [-json] # works the queue, inside Herdr
 ```
 
 `LOA_DB` selects the database (default `./loa.db`); every command
@@ -115,7 +117,7 @@ does anything.
 ## The tab
 
 `loa dash` is a full-screen view of the queue joined with the session, and
-the only place a run is started from:
+the place a person starts a run from:
 
 ```
 loa  1 running  0 blocked  2 queued
@@ -152,7 +154,8 @@ outcome.
 
 ## Proposals
 
-An agent may propose work; only a person applies it. `loa triage` writes the
+An agent may propose work; a person, or a trusted coordinator agent, applies
+it. `loa triage` writes the
 queue into a scratch directory (bodies included, dependencies resolved), runs a
 `read,grep,find,ls,write` agent there with no `bash`, and keeps whatever
 `proposal.json` comes back under `$XDG_STATE_HOME/loa/proposals/`. It never
@@ -179,6 +182,19 @@ than ignored, a title referenced but absent is an error, and a dependency cycle
 is refused because it would sit in the queue forever looking like a runner bug.
 `import` then applies tasks and priority changes in **one transaction**, so a
 document with one bad task creates nothing.
+
+## Coordinator
+
+A run may be driven by a coordinator agent instead of a person. The coordinator
+writes the queue with `loa add` and `loa import`, starts work with `loa run
+-json`, reads the run record with `loa runs`, and escalates a blocked task to a
+person rather than answering its pane. A worker still sees one task body, and
+done still means a commit on its branch.
+
+The boundary is policy, not a sandbox. A coordinator may write the queue because
+it is trusted to; a worker with `bash` can run `loa` too, and nothing in the
+store tells them apart. Review what a coordinator queued as you would review a
+worker's branch.
 
 ## The day
 
