@@ -547,7 +547,7 @@ func TestRunJSONShape(t *testing.T) {
 			EndedAt: "2026-11-19T10:05:00Z", Workers: 4, MaxTasks: 4, Done: 1, Failed: 2,
 		},
 		Outcomes: []runner.TaskOutcome{
-			{ID: 1, Done: true, Branch: "loa/1.1", WorkspaceID: "w4", PaneID: "w4:p1"},
+			{ID: 1, Done: true, Branch: "loa/1.1", WorkspaceID: "w4", PaneID: "w4:p1", Verdict: "approve", CheckPassed: true},
 			{ID: 2, Blocked: true, Branch: "loa/2.1", WorkspaceID: "w5", PaneID: "w5:p1"},
 			{ID: 3},
 		},
@@ -576,6 +576,8 @@ func TestRunJSONShape(t *testing.T) {
 			WorkspaceID string `json:"workspace_id"`
 			PaneID      string `json:"pane_id"`
 			Blocked     bool   `json:"blocked"`
+			Verdict     string `json:"verdict"`
+			CheckPassed bool   `json:"check_passed"`
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
@@ -591,21 +593,24 @@ func TestRunJSONShape(t *testing.T) {
 		t.Fatalf("tasks = %+v", got.Tasks)
 	}
 	want := []struct {
-		id     int64
-		status string
-		branch string
-		ws     string
-		pane   string
-		block  bool
+		id      int64
+		status  string
+		branch  string
+		ws      string
+		pane    string
+		block   bool
+		verdict string
+		check   bool
 	}{
-		{1, "done", "loa/1.1", "w4", "w4:p1", false},
-		{2, "blocked", "loa/2.1", "w5", "w5:p1", true},
-		{3, "failed", "", "", "", false},
+		{1, "done", "loa/1.1", "w4", "w4:p1", false, "approve", true},
+		{2, "blocked", "loa/2.1", "w5", "w5:p1", true, "", false},
+		{3, "failed", "", "", "", false, "", false},
 	}
 	for i, w := range want {
 		task := got.Tasks[i]
 		if task.ID != w.id || task.Status != w.status || task.Branch != w.branch ||
-			task.WorkspaceID != w.ws || task.PaneID != w.pane || task.Blocked != w.block {
+			task.WorkspaceID != w.ws || task.PaneID != w.pane || task.Blocked != w.block ||
+			task.Verdict != w.verdict || task.CheckPassed != w.check {
 			t.Errorf("task %d = %+v, want %+v", i, task, w)
 		}
 	}

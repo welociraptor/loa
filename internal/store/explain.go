@@ -68,6 +68,30 @@ func (s *Store) DependencyBase(ctx context.Context, id int64) (string, error) {
 	return branch, nil
 }
 
+// ReviewFor returns the newest review task that depends on id. A merge is
+// allowed to name either the review (which has the verdict and check) or the
+// implementation task (which has the branch); this is how the latter finds the
+// former. It returns nil when no review depends on the task.
+func (s *Store) ReviewFor(ctx context.Context, id int64) (*Task, error) {
+	t, err := scanTask(s.db.QueryRowContext(ctx,
+		`SELECT `+taskColumns+`
+		 FROM tasks r
+		 JOIN task_deps d ON d.task_id = r.id
+		 WHERE d.depends_on = ? AND r.role IN ('review', 'reviewer')
+		 ORDER BY r.id DESC
+		 LIMIT 1`, id))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := loadScopes(ctx, s.db, t); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
 // Blockers explains why a task cannot be claimed at now. An empty result means
 // it is runnable. The checks mirror the claim predicate in Lease; when one
 // changes, the other changes with it.

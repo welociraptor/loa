@@ -28,6 +28,7 @@ type Config struct {
 	BranchPrefix string
 	PromptsDir   string // where role prompt files live; default found from the cwd
 	ProposalsDir string // where a changes verdict writes its proposal
+	Check        string // command run in a review worktree; exit status decides pass
 	Workers      int
 	MaxTasks     int           // tasks per run, i.e. the budget for one run
 	LeaseTTL     time.Duration // must exceed TaskTimeout
@@ -46,6 +47,8 @@ type TaskOutcome struct {
 	Branch      string
 	WorkspaceID string
 	PaneID      string
+	Verdict     string // a review's answer, empty for other roles
+	CheckPassed bool   // whether the review's check passed
 }
 
 // Stats is what one run did. Run is the run row this run closed.
@@ -244,6 +247,8 @@ func (r *Runner) taskOutcomes(tasks []*store.Task) []TaskOutcome {
 			Branch:      got.Branch,
 			WorkspaceID: got.WorkspaceID,
 			PaneID:      got.PaneID,
+			Verdict:     got.Verdict,
+			CheckPassed: got.CheckPassed,
 		})
 	}
 	return out

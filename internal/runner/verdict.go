@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -112,10 +113,36 @@ func (r *Runner) finishReview(ctx context.Context, task *store.Task, handle Hand
 		return outcome{ok: true}
 
 	case taskspec.Approve:
+		verdict := review.Verdict
+		result := "verdict: approve\n" + summary
+
+		if r.cfg.Check != "" {
+			passed, output := runCheck(ctx, handle.Worktree, r.cfg.Check, r.cfg.TaskTimeout)
+			if err := r.cfg.Store.RecordCheck(ctx, task.ID, r.cfg.Check, passed, output); err != nil {
+				r.stopAndClose(handle, logf)
+				r.discardEmptyBranch(ctx, handle, commits, logf)
+				return r.record(task, err)
+			}
+			if !passed {
+				// A green check is what makes an approval a merge candidate. The
+				// opinion is downgraded rather than trusted for its own sake.
+				verdict = taskspec.Changes
+				result = fmt.Sprintf("verdict: changes; check failed: %s\n%s\n%s",
+					r.cfg.Check, output, summary)
+				r.stopAndClose(handle, logf)
+				r.discardEmptyBranch(ctx, handle, commits, logf)
+				if err := r.cfg.Store.CompleteReview(ctx, task.ID, string(verdict), notes, result); err != nil {
+					return r.record(task, err)
+				}
+				logf("done: verdict changes; check failed: %s", r.cfg.Check)
+				return outcome{ok: true}
+			}
+			result = fmt.Sprintf("verdict: approve; check passed: %s\n%s", r.cfg.Check, summary)
+		}
+
 		r.stopAndClose(handle, logf)
 		r.discardEmptyBranch(ctx, handle, commits, logf)
-		if err := r.cfg.Store.CompleteReview(ctx, task.ID, string(review.Verdict), notes,
-			"verdict: approve\n"+summary); err != nil {
+		if err := r.cfg.Store.CompleteReview(ctx, task.ID, string(verdict), notes, result); err != nil {
 			return r.record(task, err)
 		}
 		logf("done: verdict approve")
@@ -125,6 +152,28 @@ func (r *Runner) finishReview(ctx context.Context, task *store.Task, handle Hand
 	r.stopAndClose(handle, logf)
 	r.discardEmptyBranch(ctx, handle, commits, logf)
 	return r.fail(ctx, task, fmt.Sprintf("unknown verdict %q", review.Verdict))
+}
+
+// runCheck runs the workflow's check in the review worktree. Only the exit
+// status is a pass: text on either stream is kept for the row, never read as a
+// result. The command is bounded by the task's own timeout.
+func runCheck(ctx context.Context, worktree, command string, timeout time.Duration) (bool, string) {
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(checkCtx, "sh", "-c", command)
+	cmd.Dir = worktree
+	// Killing the shell is not enough if a child inherited the pipe: WaitDelay
+	// closes it, so a check cannot outlive its timeout through a grandchild.
+	cmd.WaitDelay = time.Second
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, tail(string(output), 4000)
+	}
+	if errors.Is(checkCtx.Err(), context.DeadlineExceeded) {
+		return false, tail("timed out after "+timeout.String()+"\n"+string(output), 4000)
+	}
+	return false, tail(err.Error()+"\n"+string(output), 4000)
 }
 
 // readReview loads the one file a reviewer must write. Its errors name the

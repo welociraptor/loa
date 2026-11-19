@@ -45,10 +45,11 @@ loa report [-since 24h|-json]      # what the day did, and how long it has been 
 loa runs                           # the run record, newest first
 loa triage                         # ask an agent to propose work; never applies it
 loa import FILE [-dry-run]         # apply a proposal: tasks, and priority changes
+loa merge ID [-into BRANCH]        # merge an approved, green review; never pushes
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5 [-prompts DIR] [-json] # works the queue, inside Herdr
+loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
 ```
 
 `LOA_DB` selects the database (default `./loa.db`); every command
@@ -213,6 +214,9 @@ three accepted answers fails the task with the parser's reason. `tasks` is the
 same plan format as a proposal and is optional.
 
 - `approve` finishes the review with the verdict recorded; no commit is needed.
+  If a check is configured, it is run in the review worktree first: only its
+  exit status decides, and an `approve` with a red check is recorded as
+  `changes`. A verdict is not a build.
 - `changes` also finishes it, records the verdict, and writes its `tasks` under
   `$XDG_STATE_HOME/loa/proposals/`. Nothing applies that file — a person reads
   it and imports it, so an agent cannot turn its own objection into work.
@@ -220,8 +224,31 @@ same plan format as a proposal and is optional.
   and a person answers the reviewer there.
 
 A commit alone cannot finish a review, and a review with no dependency diff
-fails rather than approving nothing. `show` renders the verdict and notes;
-`report` includes them with the day's work.
+fails rather than approving nothing. `show` renders the verdict, the check and
+its output; `report` includes the verdict with the day's work.
+
+## Merge
+
+`loa merge` is the only command that writes into a workspace checkout, and it
+performs one deterministic transition rather than a review of its own. It
+merges only when the review's verdict is `approve`, its check is recorded and
+passed, and the current checkout is clean and on the branch named by `-into`
+(default `main`). It runs one `git merge --no-ff`, records `merged_at` and
+`merge_commit` on the implementation task, and never pushes or deletes a
+branch. `ID` may be the review task or its implementation task.
+
+Everything else is a refusal that names the reason: a dirty checkout, a wrong
+branch, a conflict, a red or missing check, a verdict other than `approve`, an
+unfinished task, or a task already merged. A conflict is aborted and the
+branch is left for a person; no agent resolves it. A second merge for the same
+task is refused, not a second merge commit. A workflow's `merge: auto` is the
+coordinator calling `loa merge` per approved review; the guard stays in loa.
+
+The runner runs `-check CMD` in the review worktree after an `approve`, bounded
+by the same timeout as the task. Only the exit status is read as a pass; the
+output is kept on the row for the person reading a refusal. Without `-check`,
+an `approve` is still a verdict, but nothing merges: a review with no check
+recorded is refused by `loa merge`.
 
 ## Coordinator
 
@@ -278,7 +305,8 @@ What is bounded:
   planners and reviewers get `read`, `write`, `grep`, `find`, `ls`, with no
   `bash` and no `edit`
 - no push, no merge, no branch switching: a worker cannot publish or reach
-  another checkout through the tools it is told to use
+  another checkout through the tools it is told to use. `loa merge` is a
+  separate command with its own guard, not a worker tool
 - the task cannot name a filesystem path: it names a workspace label, and Herdr
   resolves it
 - `-timeout` and `-max` bound how long and how often a worker runs

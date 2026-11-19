@@ -44,8 +44,9 @@ usage:
   loa resolve ID [-fail] [-result TEXT]
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
-  loa run    [-workers N] [-max N] [-timeout 45m] [-prompts DIR] [-json]
+  loa run    [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR] [-json]
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
+  loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
 
 all commands accept -db PATH (default $LOA_DB, else loa.db)`
@@ -87,6 +88,8 @@ func main() {
 		err = cmdRun(ctx, os.Args[2:])
 	case "runs":
 		err = cmdRuns(ctx, os.Args[2:])
+	case "merge":
+		err = cmdMerge(ctx, os.Args[2:])
 	case "dash":
 		err = cmdDash(ctx, os.Args[2:])
 	case "-h", "--help", "help":
@@ -304,6 +307,19 @@ func cmdShow(ctx context.Context, args []string) error {
 				lines = append(lines, fmt.Sprintf("suggested:\t%s", suggestion))
 			}
 		}
+	}
+	if task.CheckCommand != "" {
+		check := "failed"
+		if task.CheckPassed {
+			check = "passed"
+		}
+		lines = append(lines, fmt.Sprintf("check:\t%s (%s)", task.CheckCommand, check))
+		if task.CheckOutput != "" {
+			lines = append(lines, fmt.Sprintf("check output:\t%s", strings.ReplaceAll(strings.TrimSpace(task.CheckOutput), "\n", "\n\t")))
+		}
+	}
+	if task.MergeCommit != "" {
+		lines = append(lines, fmt.Sprintf("merged:\t%s at %s", task.MergeCommit, task.MergedAt.Format(time.RFC3339)))
 	}
 	if task.Result != "" {
 		lines = append(lines, fmt.Sprintf("result:\t%s", task.Result))
@@ -743,6 +759,7 @@ type runFlags struct {
 	maxTasks   int
 	base       string
 	promptsDir string
+	check      string
 	timeout    time.Duration
 	ttl        time.Duration
 	owner      string
@@ -755,6 +772,7 @@ func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
 	fs.IntVar(&f.maxTasks, "max", 5, "tasks this run may start; the budget")
 	fs.StringVar(&f.base, "base", "HEAD", "commit or ref worktrees branch from")
 	fs.StringVar(&f.promptsDir, "prompts", "", "role prompt directory (default: found from the cwd)")
+	fs.StringVar(&f.check, "check", "", "command run in a review worktree; its exit status gates merge")
 	fs.DurationVar(&f.timeout, "timeout", 45*time.Minute, "limit for one agent run")
 	fs.DurationVar(&f.ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
 	fs.StringVar(&f.owner, "owner", defaultOwner(), "who holds the leases")
@@ -788,6 +806,7 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer
 		},
 		Base:        f.base,
 		PromptsDir:  f.promptsDir,
+		Check:       f.check,
 		Workers:     f.workers,
 		MaxTasks:    f.maxTasks,
 		LeaseTTL:    f.ttl,
@@ -850,6 +869,8 @@ type runTaskJSON struct {
 	WorkspaceID string `json:"workspace_id"`
 	PaneID      string `json:"pane_id"`
 	Blocked     bool   `json:"blocked"`
+	Verdict     string `json:"verdict,omitempty"`
+	CheckPassed bool   `json:"check_passed"`
 }
 
 type runReportJSON struct {
@@ -882,6 +903,7 @@ func printRunJSON(w io.Writer, stats runner.Stats) error {
 		out.Tasks = append(out.Tasks, runTaskJSON{
 			ID: task.ID, Status: status, Branch: task.Branch,
 			WorkspaceID: task.WorkspaceID, PaneID: task.PaneID, Blocked: task.Blocked,
+			Verdict: task.Verdict, CheckPassed: task.CheckPassed,
 		})
 	}
 

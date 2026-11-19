@@ -98,6 +98,80 @@ func TestReviewApproveFinishesWithoutACommit(t *testing.T) {
 	}
 }
 
+func TestReviewApproveWithGreenCheckRecordsIt(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	dep := committedDependency(ctx, t, s, b)
+	review := addReview(t, s, dep)
+
+	const check = `test -f work-1.1.txt && echo green`
+	b.agent = verdictAgent(`{"verdict":"approve","notes":[]}`)
+	stats, err := newRunner(t, s, b, func(c *runner.Config) {
+		c.MaxTasks = 1
+		c.Check = check
+	}).Run(ctx)
+	if err != nil {
+		t.Fatalf("run review: %v", err)
+	}
+	if stats.Completed != 1 {
+		t.Fatalf("stats = %+v, want the review done", stats)
+	}
+
+	got, err := s.Get(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("get review: %v", err)
+	}
+	if got.Status != store.Done || got.Verdict != string(taskspec.Approve) {
+		t.Errorf("review = %+v, want done with an approve verdict", got)
+	}
+	if got.CheckCommand != check || !got.CheckPassed {
+		t.Errorf("check = (%q, %v), want the command and a pass", got.CheckCommand, got.CheckPassed)
+	}
+	if !strings.Contains(got.CheckOutput, "green") {
+		t.Errorf("check output = %q, want what the command printed", got.CheckOutput)
+	}
+	if !strings.Contains(got.Result, "check passed") {
+		t.Errorf("result = %q, want the check recorded", got.Result)
+	}
+}
+
+func TestReviewApproveWithRedCheckBecomesChanges(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	b := newFakeBackend(t, newRepo(t, "demo"))
+	dep := committedDependency(ctx, t, s, b)
+	review := addReview(t, s, dep)
+
+	const check = `echo red >&2; exit 1`
+	b.agent = verdictAgent(`{"verdict":"approve","notes":[]}`)
+	stats, err := newRunner(t, s, b, func(c *runner.Config) {
+		c.MaxTasks = 1
+		c.Check = check
+	}).Run(ctx)
+	if err != nil {
+		t.Fatalf("run review: %v", err)
+	}
+	if stats.Completed != 1 {
+		t.Fatalf("stats = %+v, want the review to finish as changes", stats)
+	}
+
+	got, err := s.Get(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("get review: %v", err)
+	}
+	if got.Status != store.Done || got.Verdict != string(taskspec.Changes) {
+		t.Errorf("review = %+v, want done with a changes verdict, not approve", got)
+	}
+	if got.CheckCommand != check || got.CheckPassed {
+		t.Errorf("check = (%q, %v), want the command and a failure", got.CheckCommand, got.CheckPassed)
+	}
+	if !strings.Contains(got.CheckOutput, "red") || !strings.Contains(got.Result, "check failed") {
+		t.Errorf("output/result = (%q, %q), want the failure named", got.CheckOutput, got.Result)
+	}
+}
+
 func TestReviewChangesWritesAProposalAndDoesNotApplyIt(t *testing.T) {
 	ctx := context.Background()
 	repo := newRepo(t, "demo")
