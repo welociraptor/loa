@@ -19,12 +19,33 @@ import (
 
 func open(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "tasks.db"))
+	return openAt(t, filepath.Join(t.TempDir(), "tasks.db"))
+}
+
+func openAt(t *testing.T, path string) *store.Store {
+	t.Helper()
+	s, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// backdate sets a task's updated_at directly: timestamps have one-second
+// resolution, so this is the only way to make "finished last" deterministic
+// without sleeping between completions.
+func backdate(t *testing.T, path string, id int64, when time.Time) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE tasks SET updated_at = ? WHERE id = ?`, when.UTC().Format(time.RFC3339), id); err != nil {
+		t.Fatalf("backdate %d: %v", id, err)
+	}
 }
 
 func add(t *testing.T, s *store.Store, task store.NewTask) int64 {
@@ -1512,6 +1533,92 @@ func TestDepsOrderAndMissingTask(t *testing.T) {
 	}
 	if len(missing) != 0 {
 		t.Errorf("missing task has deps %+v", missing)
+	}
+}
+
+func TestDependencyBaseIsTheNewestDoneDependency(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.db")
+	s := openAt(t, path)
+
+	first := add(t, s, store.NewTask{Workspace: "loa", Title: "first"})
+	second := add(t, s, store.NewTask{Workspace: "loa", Title: "second"})
+	child := add(t, s, store.NewTask{Workspace: "loa", Title: "child", Deps: []int64{first, second}})
+
+	branches := map[int64]string{first: "b/first", second: "b/second"}
+	for range branches {
+		task := lease(t, s, time.Now())
+		if task == nil {
+			t.Fatal("nothing to lease")
+		}
+		if err := s.Complete(ctx, task.ID, branches[task.ID], "done"); err != nil {
+			t.Fatalf("complete %d: %v", task.ID, err)
+		}
+	}
+
+	// The lower id finished last, so picking by id would return the wrong branch.
+	backdate(t, path, first, time.Date(2024, 2, 2, 0, 0, 0, 0, time.UTC))
+	backdate(t, path, second, time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC))
+
+	got, err := s.DependencyBase(ctx, child)
+	if err != nil {
+		t.Fatalf("dependency base: %v", err)
+	}
+	if got != "b/first" {
+		t.Errorf("dependency base = %q, want b/first (the one that finished last)", got)
+	}
+}
+
+func TestDependencyBaseIgnoresRequeuedAndBranchlessDependencies(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	done := add(t, s, store.NewTask{Workspace: "loa", Title: "done"})
+	lease(t, s, time.Now())
+	if err := s.Complete(ctx, done, "b/done", "done"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// A failure returns the task to the queue: it is no longer done.
+	requeued := add(t, s, store.NewTask{Workspace: "loa", Title: "requeued"})
+	lease(t, s, time.Now())
+	if err := s.Fail(ctx, requeued, "compiler blew up"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	// A human can settle a task done without a branch to point at.
+	branchless := add(t, s, store.NewTask{Workspace: "loa", Title: "settled by hand"})
+	if err := s.Resolve(ctx, branchless, true, "approved by hand"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		deps []int64
+		want string
+	}{
+		{"requeued ignored beside a done dependency", []int64{done, requeued}, "b/done"},
+		{"only a requeued dependency", []int64{requeued}, ""},
+		{"a done dependency without a branch", []int64{branchless}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := add(t, s, store.NewTask{Workspace: "loa", Title: tc.name, Deps: tc.deps})
+			got, err := s.DependencyBase(ctx, child)
+			if err != nil {
+				t.Fatalf("dependency base: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("dependency base = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	got, err := s.DependencyBase(ctx, 999)
+	if err != nil {
+		t.Fatalf("dependency base of a missing task: %v", err)
+	}
+	if got != "" {
+		t.Errorf("a missing task has dependency base %q", got)
 	}
 }
 

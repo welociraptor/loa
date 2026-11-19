@@ -78,7 +78,9 @@ It has to be safe to interrupt and safe to run twice:
   exclusion domain: two leased tasks never share one, so two workers never
   fight over the same repository.
 - **Each attempt gets its own worktree workspace and branch**
-  (`loa/<id>.<attempt>`), branched from `-base`, labelled
+  (`loa/<id>.<attempt>`), branched from `-base` or, so that a chain stacks
+  commits, from the newest done dependency's recorded branch; a re-queued or
+  branchless dependency leaves `-base` in force. It is labelled
   `loa #<id>` so it can be found again. `herdr worktree remove` deletes the
   checkout and the workspace; the branch is the deliverable. Attempts that
   commit nothing also delete their branch, so a bad day does not litter the

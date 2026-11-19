@@ -257,12 +257,26 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 		return r.fail(ctx, task, "no workspace: a task needs -workspace LABEL to be dispatched")
 	}
 
+	// A done dependency's branch already carries what that task committed, so a
+	// dependent task starts there instead of at the configured base. The store
+	// picks the dependency that finished last; an empty answer means none
+	// qualifies and the base stands.
+	base := r.cfg.Base
+	depBase, err := r.cfg.Store.DependencyBase(ctx, task.ID)
+	if err != nil {
+		return r.record(task, err)
+	}
+	if depBase != "" {
+		base = depBase
+		logf("branching from done dependency %s", depBase)
+	}
+
 	handle, err := r.cfg.Backend.Open(ctx, OpenRequest{
 		TaskID:         task.ID,
 		Attempt:        task.Attempts,
 		WorkspaceLabel: task.Workspace,
 		Branch:         r.cfg.BranchPrefix + fmt.Sprintf("%d.%d", task.ID, task.Attempts),
-		Base:           r.cfg.Base,
+		Base:           base,
 		AgentName:      fmt.Sprintf("loa-%d-%d", task.ID, task.Attempts),
 	})
 	if err != nil {
