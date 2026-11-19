@@ -33,12 +33,13 @@ type Session = live.Session
 // refreshEvery is how often the queue is re-read while the tab is open.
 const refreshEvery = time.Second
 
-// SnapshotMsg is a completed read of the queue. The refresh command produces it;
-// a caller may also send one directly, which is how the view is tested without a
-// terminal.
+// SnapshotMsg is a completed read of the queue and the active run. The refresh
+// command produces it; a caller may also send one directly, which is how the
+// view is tested without a terminal.
 type SnapshotMsg struct {
-	Snap live.Snapshot
-	Err  error
+	Snap   live.Snapshot
+	Active *store.Run
+	Err    error
 }
 
 type (
@@ -74,8 +75,11 @@ type Model struct {
 	message     string
 	prompt      prompt
 
-	running bool
-	cancel  context.CancelFunc
+	// active is the run the store reports, whoever started it. The tab's own
+	// run is a separate fact: cancel is set only by this tab, so S can never
+	// stop a coordinator's run.
+	active *store.Run
+	cancel context.CancelFunc
 }
 
 // New builds the tab.
@@ -92,13 +96,21 @@ func tick() tea.Cmd {
 	return tea.Tick(refreshEvery, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-// refresh re-reads the queue and the session. It runs as a command, never in
-// Update, so the view never blocks on a store query.
+// refresh re-reads the queue, the session and the active run. It runs as a
+// command, never in Update, so the view never blocks on a store query.
 func (m Model) refresh() tea.Cmd {
 	s, session := m.store, m.session
 	return func() tea.Msg {
-		snap, err := live.Read(context.Background(), s, session)
-		return SnapshotMsg{Snap: snap, Err: err}
+		ctx := context.Background()
+		snap, err := live.Read(ctx, s, session)
+		if err != nil {
+			return SnapshotMsg{Err: err}
+		}
+		active, err := s.ActiveRun(ctx)
+		if err != nil {
+			return SnapshotMsg{Err: err}
+		}
+		return SnapshotMsg{Snap: snap, Active: active}
 	}
 }
 
@@ -128,6 +140,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.rows, m.orphans, m.unavailable = msg.Snap.Rows, msg.Snap.Orphans, msg.Snap.Unavailable
+		m.active = msg.Active
 		if m.cursor >= len(m.rows) {
 			m.cursor = max(0, len(m.rows)-1)
 		}
@@ -142,7 +155,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 
 	case runDoneMsg:
-		m.running, m.cancel = false, nil
+		m.cancel = nil
 		if msg.err != nil {
 			m.message = "run: " + msg.err.Error()
 		} else {
@@ -197,7 +210,7 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "q", "ctrl+c":
-		if m.running && m.cancel != nil {
+		if m.cancel != nil {
 			m.cancel()
 		}
 		return m, tea.Quit
@@ -243,13 +256,20 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.prompt = prompt{active: true, done: msg.String() == "d"}
 		}
 	case "s":
-		if m.running {
+		// The store's StartRun is the guard; this is the explanation. The
+		// local cancel also counts, since the next snapshot may not have
+		// caught the run this tab just started.
+		if m.active != nil {
+			m.message = fmt.Sprintf("a run is already active (%s)", m.active.Owner)
+			return m, nil
+		}
+		if m.cancel != nil {
 			m.message = "a run is already in flight"
 			return m, nil
 		}
 		// Its own context, so quitting the tab does not leave a run half-done.
 		ctx, cancel := context.WithCancel(context.Background())
-		m.running, m.cancel = true, cancel
+		m.cancel = cancel
 		m.message = "run started"
 		return m, func() tea.Msg {
 			err := m.controls.Run(ctx)
@@ -257,7 +277,8 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return runDoneMsg{err: err}
 		}
 	case "S":
-		if m.running && m.cancel != nil {
+		// Only this tab can stop its own run.
+		if m.cancel != nil {
 			m.cancel()
 			m.message = "stopping the run"
 		}
@@ -288,8 +309,8 @@ func (m Model) View() string {
 		}
 	}
 	fmt.Fprintf(&b, "loa  %d running  %d blocked  %d queued", leased, blocked, fresh)
-	if m.running {
-		b.WriteString("  [running]")
+	if m.active != nil {
+		fmt.Fprintf(&b, "  [run %d %s]", m.active.ID, m.active.Owner)
 	}
 	b.WriteString("\n\n")
 

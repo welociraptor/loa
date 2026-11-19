@@ -124,6 +124,22 @@ func seed(t *testing.T) (*store.Store, fakeSession, int64, int64) {
 	}, running, blocked
 }
 
+// readMsg is the snapshot the refresh command would produce: the queue and the
+// run the store knows about.
+func readMsg(t *testing.T, s *store.Store, session fakeSession) dash.SnapshotMsg {
+	t.Helper()
+	ctx := context.Background()
+	snap, err := live.Read(ctx, s, session)
+	if err != nil {
+		t.Fatalf("live read: %v", err)
+	}
+	active, err := s.ActiveRun(ctx)
+	if err != nil {
+		t.Fatalf("active run: %v", err)
+	}
+	return dash.SnapshotMsg{Snap: snap, Active: active}
+}
+
 // loaded returns a model that has already read the queue.
 func loaded(t *testing.T, s *store.Store, session fakeSession, c dash.Controls) dash.Model {
 	t.Helper()
@@ -131,11 +147,7 @@ func loaded(t *testing.T, s *store.Store, session fakeSession, c dash.Controls) 
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = asModel(t, next)
 
-	snap, err := live.Read(context.Background(), s, session)
-	if err != nil {
-		t.Fatalf("live read: %v", err)
-	}
-	next, _ = m.Update(dash.SnapshotMsg{Snap: snap})
+	next, _ = m.Update(readMsg(t, s, session))
 	return asModel(t, next)
 }
 
@@ -293,7 +305,52 @@ func TestEscapeAbandonsThePrompt(t *testing.T) {
 	}
 }
 
-func TestOneRunAtATime(t *testing.T) {
+func TestActiveRunFromAnotherOwnerIsShownAndRefusesRun(t *testing.T) {
+	s, session, _, _ := seed(t)
+	c := &fakeControls{}
+	m := loaded(t, s, session, c)
+
+	msg := readMsg(t, s, session)
+	msg.Active = &store.Run{ID: 12, Owner: "coordinator"}
+	m = step(t, m, msg)
+
+	if !strings.Contains(m.View(), "[run 12 coordinator]") {
+		t.Fatalf("the header does not show the run the store knows:\n%s", m.View())
+	}
+
+	next, cmd := m.Update(key("s"))
+	if cmd != nil {
+		t.Fatal("s started a run while another owner's run is active")
+	}
+	view := asModel(t, next).View()
+	if !strings.Contains(view, "already active (coordinator)") {
+		t.Errorf("the refusal does not name the owner:\n%s", view)
+	}
+	if len(c.calls) != 0 {
+		t.Errorf("the tab called controls while a run was active: %v", c.calls)
+	}
+}
+
+func TestStopIsANoOpWithoutALocalRun(t *testing.T) {
+	s, session, _, _ := seed(t)
+	c := &fakeControls{}
+	m := loaded(t, s, session, c)
+
+	msg := readMsg(t, s, session)
+	msg.Active = &store.Run{ID: 12, Owner: "coordinator"}
+	m = step(t, m, msg)
+
+	next, cmd := m.Update(key("S"))
+	if cmd != nil {
+		t.Fatal("S produced a command for a run this tab did not start")
+	}
+	view := asModel(t, next).View()
+	if strings.Contains(view, "stopping") {
+		t.Errorf("S claimed to stop another owner's run:\n%s", view)
+	}
+}
+
+func TestLocalRunStartsAndStops(t *testing.T) {
 	s, session, _, _ := seed(t)
 	c := &fakeControls{}
 	block := make(chan struct{})
@@ -308,10 +365,11 @@ func TestOneRunAtATime(t *testing.T) {
 		t.Fatal("s produced no command")
 	}
 	m = asModel(t, next)
-	if !strings.Contains(m.View(), "[running]") {
-		t.Errorf("the tab does not say a run is in flight")
+	if !strings.Contains(m.View(), "run started") {
+		t.Errorf("the tab does not say the run started:\n%s", m.View())
 	}
 
+	// Before the next snapshot, the local cancel keeps a second run out.
 	next, second := m.Update(key("s"))
 	if second != nil {
 		t.Fatal("a second run was started")
@@ -320,10 +378,19 @@ func TestOneRunAtATime(t *testing.T) {
 		t.Errorf("no explanation for the refusal")
 	}
 
+	next, _ = m.Update(key("S"))
+	if !strings.Contains(asModel(t, next).View(), "stopping the run") {
+		t.Errorf("S did not stop this tab's run")
+	}
+
 	close(block)
 	next, _ = m.Update(run(t, cmd))
-	if strings.Contains(asModel(t, next).View(), "[running]") {
-		t.Errorf("the tab still claims a run is in flight")
+	m = asModel(t, next)
+	if !strings.Contains(m.View(), "run finished") {
+		t.Errorf("the run did not finish:\n%s", m.View())
+	}
+	if _, again := m.Update(key("s")); again == nil {
+		t.Error("a run cannot be started after the previous one finished")
 	}
 }
 
