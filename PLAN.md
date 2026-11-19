@@ -669,7 +669,7 @@ What it costs:
   (`when`) would unstick it and are deliberately deferred until this loop is
   proven.
 
-## Phase 8 — the queue you can see (planned)
+## Phase 8 — the queue you can see (done)
 
 Two gaps, neither of them in the rules. The tab carries a framework it no longer
 needs, and the graph the claim predicate enforces — the thing that decides what
@@ -699,7 +699,7 @@ runs next — is invisible outside `sqlite3`.
   path runs against a fake terminal that records the escapes, once on a normal
   exit and once on a panic.
 
-- [ ] **35. `loa show` names the graph, in both directions.** Step 3 made a
+- [x] **35. `loa show` names the graph, in both directions.** Step 3 made a
   dependency readable as a *blocker* and nothing else, so a task whose
   dependencies are `done` reads exactly like a task with none, and "what is
   waiting on this?" has no answer short of SQL. `Task.Deps` becomes a field
@@ -714,12 +714,19 @@ runs next — is invisible outside `sqlite3`.
   `needed by: -`; `TestBlockersAgreeWithLease` is untouched, so the explanation
   cannot drift from the claim.
 
-- [ ] **36. `loa list` shows dependencies.** One `DEPS` column, `-` when there
+- [x] **36. `loa list` shows dependencies.** One `DEPS` column, `-` when there
   are none and `5,12` otherwise, joined the way `SCOPES` already is. A chain is
   the shape of the day's work, and a table that omits it asks a person to run
   `show` on every row to find out. Presentation only: the store work is step
   35's and the column reuses its formatter, so `list` gains no query. Test: the
   empty case and a three-task chain, through the built binary.
+
+Shipped alongside the phase, outside the two planned gaps: `loa ps` lists the
+queue newest first, because the newest task is the one a person is watching;
+`loa cancel` deletes a queued task and refuses a leased, done, or
+depended-on one, so the delete cannot put a hole in the chain; and
+`loa version` prints the release and build commit, so a bug report names the
+binary it came from.
 
 ## Phase 9 — a daemon, and the client it serves (planned)
 
