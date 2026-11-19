@@ -15,13 +15,13 @@
         {
           # The checks are the gate: this derivation runs the tests and the
           # linter, so `nix flake check` answers "is it good" on a clean machine.
-          default = pkgs.buildGoModule {
+          default = let version = "0.1.0"; in pkgs.buildGoModule {
             pname = "loa";
-            version = "0.0.0";
+            inherit version;
             src = self;
             vendorHash = "sha256-lm3SAmSuo9aLEVG451A6XhzwbZ3YyDBRzsXcq0F9ldk=";
             ldflags = [
-              "-X main.version=0.0.0"
+              "-X main.version=${version}"
               "-X main.commit=${self.shortRev or self.dirtyShortRev or ""}"
             ];
 
