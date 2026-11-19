@@ -51,10 +51,11 @@ loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
 loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
+loa version                         # the release and commit this binary was built from
 ```
 
 `LOA_DB` selects the database (default `./loa.db`); every command
-also takes `-db`.
+except `version` also takes `-db`.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses

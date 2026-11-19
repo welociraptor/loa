@@ -41,8 +41,9 @@ func TestMain(m *testing.M) {
 }
 
 type cli struct {
-	t  *testing.T
-	db string
+	t   *testing.T
+	db  string
+	dir string
 }
 
 func newCLI(t *testing.T) *cli {
@@ -64,6 +65,9 @@ func (c *cli) run(args ...string) (stdout, stderr string, code int) {
 		env = append(env, kv)
 	}
 	cmd.Env = env
+	if c.dir != "" {
+		cmd.Dir = c.dir
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
