@@ -552,6 +552,120 @@ limit worth fixing rather than documenting.
   dependency's commit; a task whose dependency was re-queued still branches from
   the base.
 
+## Phase 7 — the factory (planned)
+
+A plan becomes a workflow: a planner turns a goal into phases of parallel
+tasks, each change is implemented and reviewed, and an approved change with a
+green check is merged without a person. The queue stays the only coordination
+channel. What is new is that a task carries a *role*, the reviewer's deliverable
+is a *verdict* instead of a commit, and `loa` performs a *merge* as a
+deterministic transition.
+
+Two documents, both data:
+
+- **The workflow** is authored by a person and versioned with the repository:
+  role → prompt file, the check command, the merge policy and the stage list.
+  It changes rarely, so it is reviewable like code.
+- **The plan** is authored by the planner from a goal: phases, and the tasks
+  inside them.
+
+Compilation is where a scheduler would otherwise go: every task in phase *N*
+depends on every task in phase *N−1*, and every implementation task gets a
+review task depending on it. The claim predicate is then the whole scheduler —
+a phase is a barrier over dependencies, and a parallel phase is the absence of
+edges between its tasks. `taskspec` already parses a proposal, resolves `after`
+by title and rejects cycles; the plan is that format plus `phases` and `role`.
+
+Three decisions hold the trust model:
+
+- **A green check is mandatory for auto-merge.** The runner runs the workflow's
+  check in the review worktree and judges it by exit status. A reviewer's
+  opinion is not a build: Phase 2 shipped a branch whose tests were green in its
+  own worktree and failed the gate, and nothing caught it until the merge.
+  `approve` with a red check is `changes`.
+- **`changes` needs a human.** A verdict that asks for changes carries a
+  proposal in the plan format; the runner writes it under `proposals/` and
+  nothing applies it. A person edits it, and applying it is the approval that
+  starts the next round of implementation. The loop is human-paced on purpose:
+  an agent that can turn its own objection into work is an LLM scheduler.
+- **Prompts live in the repository**, as `prompts/<role>.md`. A prompt is code —
+  reviewable, diffable, and the reason a verdict can be trusted to have been
+  asked the right question. The task row records the prompt's name and content
+  hash at dispatch, so a verdict is attributable to the instructions that
+  produced it. The runner still appends its own contract (commit, no push, stay
+  in scope), because that is the part the judgement enforces.
+
+Roles are a column, not an execution path: `implement` commits, `review` writes
+`verdict.json`, `plan` writes `plan.json`. The role selects the prompt file and
+the tool set, and the other roles' deliverables are validated the way a
+proposal is. A verdict is `approve`, `changes` or `blocked`; `blocked` is the
+existing path — the pane stays open and a person answers it.
+
+Merge is the only new capability, and it is deterministic: `loa merge ID` runs
+one clean `git merge --no-ff` of the task's branch into the named branch of the
+workspace checkout, refuses a dirty checkout, a wrong branch or a conflict,
+records `merged_at` and `merge_commit`, and never pushes. Nothing an agent does
+can merge, and nothing merges without an `approve` and a green check. A
+workflow's `merge: auto` is acted on by the coordinator, which reads the run's
+JSON and calls `loa merge` for each approved review: the guard lives in loa, the
+policy in the workflow, and no model is trusted with either.
+
+- [ ] **29. A task branches from its newest done dependency.** (Step 28, as a
+  prerequisite.) `Base` becomes the newest done dependency's branch with a
+  recorded one, falling back to the configured base. Test: the worktree for a
+  task with a done dependency contains that dependency's commit; a dependency
+  that was re-queued still branches from the base.
+
+- [ ] **30. Roles and prompt files.** `0006_task_role.sql` adds `role`, `prompt`
+  and `prompt_hash`, defaulting to `implement` so existing tasks keep working.
+  `prompts/{planner,implementer,reviewer}.md` render the task fields and the
+  role's instructions; the runner appends the contract and fails a task whose
+  role has no file, naming it. `loa add -role`, and `list`/`show`/`ps` show it.
+  Test: a prompt file renders; a missing one fails the task; the hash is stored.
+
+- [ ] **31. A verdict is the reviewer's deliverable.** `0007_task_verdict.sql`
+  stores it. The runner hands a review
+  task the diffs of the tasks it depends on, validates `.loa/verdict.json`
+  (strict parse, unknown fields rejected), and stores the verdict. `approve`
+  finishes the review; `changes` finishes it with the verdict recorded and the
+  proposal written under `proposals/`, and queues nothing; `blocked` is the
+  existing human path. A review never needs a commit, and a commit alone cannot
+  finish it. Test: each verdict, a malformed document, a review with nothing to
+  review.
+
+- [ ] **32. Merge, and the check it requires.** `0008_task_check.sql` records
+  the check's outcome on the review task; `-check CMD` is run in the review
+  worktree by the runner. `0009_task_merge.sql` records `merged_at` and
+  `merge_commit` on the implementation task. `loa merge ID` merges only when the
+  review verdict is `approve`, the check passed, and the workspace checkout is
+  clean and on the named branch; a conflict fails it and leaves the branch for a
+  person. Test: approve and green merges; a red check refuses; a conflict
+  refuses; a wrong branch refuses.
+
+- [ ] **33. The plan, and `loa apply`.** `taskspec` learns `phases` and compiles
+  them into dependencies; `0010_task_plan.sql` gives them a plan id so `report`
+  names the plan. `loa plan -workflow FILE GOAL` runs the planner agent like
+  `triage` (a scratch workspace, `plan.json`, never applied) and `loa import`
+  applies it, teaching the planner that its output is a dependency graph, not
+  prose. Test: phases compile to a barrier; a plan naming a missing dependency
+  is refused; `plan` writes and does not apply.
+
+What it costs:
+
+- Three agent calls per change (one plan per goal, one review per change), so a
+  factory run is the most expensive thing in this design; cost is still visible
+  only as wall time.
+- The reviewer reads text an agent wrote. Prompt injection moves from "a worker
+  wastes an attempt" to "a worker tries to talk a reviewer into a merge"; the
+  check and the clean-merge rule bound what that can land, but `approve` is
+  still a model deciding that code merges.
+- Prompts are code, and a worker can edit them. The recorded hash makes drift
+  visible; reviewing prompt changes is the only thing that prevents it.
+- A `changes` verdict stops the workflow until a person applies the proposal, so
+  a twenty-task plan halts at its first rejection. Conditional dependency edges
+  (`when`) would unstick it and are deliberately deferred until this loop is
+  proven.
+
 ## The coordinator (decided)
 
 `loa` may be driven by a coordinator agent, not only by a person. Three
@@ -570,11 +684,12 @@ decisions define that mode; each widens the old design deliberately.
   emits machine-readable results for a coordinator. The single-active-run
   invariant is the partial unique index `runs_one_active`, so a second process
   racing to start a run loses in SQLite, not in Go or in the tab.
-- **There is no check command.** Done still means a commit on the task's
-  branch, and `loa run` judges that itself. A coordinator may read the result
-  and decide what to queue next, but it cannot mark work done without a commit.
-  A separate check command would be a second definition of done, free to
-  disagree with the first.
+- **There is no check command for a coordinator run.** Done still means a
+  commit on the task's branch, and `loa run` judges that itself. A coordinator
+  may read the result and decide what to queue next, but it cannot mark work
+  done without a commit. Phase 7 adds a check only where a person is removed
+  from the path: an auto-merge needs one. Everywhere a commit is the gate, a
+  second definition of done would be free to disagree with the first.
 
 ## Not planned, on purpose
 
@@ -595,8 +710,9 @@ decisions define that mode; each widens the old design deliberately.
 - **No answering approval dialogs.** A blocked agent is the human's decision,
   and the dashboard makes it a two-second one.
 - **No LLM scheduler.** Priority, dependency and scope rules are SQL.
-- **No push, no merge, no branch deletion by an agent.** The runner keeps
-  branches; a human merges them.
+- **No push, and no merge by an agent.** Loa merges an approved branch with one
+  deterministic command (step 32); anything without an `approve` verdict and a
+  green check is still a human's merge. No agent resolves a conflict.
 - **No sandbox around the queue.** A coordinator may write it, and a worker
   with `bash` can too. The rules that matter are SQL transitions, not the
   absence of a command.
@@ -633,8 +749,10 @@ decisions define that mode; each widens the old design deliberately.
   a second run sharing the database, so two sessions cannot split the queue.
   Two separate databases can still be driven independently; nothing joins
   them.
-- **Dependencies order execution, not content** (step 28): two tasks in a chain
-  do not share a base, so the later one cannot build on the earlier one's commit.
+- **Dependencies order execution, not content** (step 28, fixed by step 29): two
+  tasks in a chain do not share a base, so the later one cannot build on the
+  earlier one's commit. Until step 29 lands, a chained plan needs a merge
+  between runs.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It
   is found by `report` (step 24) or by the dashboard's blocked row — both of
   which require someone to look.
