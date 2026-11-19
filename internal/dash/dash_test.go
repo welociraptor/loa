@@ -323,8 +323,10 @@ func TestActiveRunFromAnotherOwnerIsShownAndRefusesRun(t *testing.T) {
 		t.Fatal("s started a run while another owner's run is active")
 	}
 	view := asModel(t, next).View()
-	if !strings.Contains(view, "already active (coordinator)") {
-		t.Errorf("the refusal does not name the owner:\n%s", view)
+	for _, want := range []string{"run 12 is active (owner coordinator)", "loa runs -close 12"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, view)
+		}
 	}
 	if len(c.calls) != 0 {
 		t.Errorf("the tab called controls while a run was active: %v", c.calls)

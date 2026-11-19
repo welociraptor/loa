@@ -113,6 +113,31 @@ func (s *Store) FinishRun(ctx context.Context, id int64, done, failed int) error
 	return nil
 }
 
+// SettleRun closes an active run whose worker is gone, so a dead run cannot
+// keep the slot forever. It records only the moment the run stopped: the
+// counts stay as that run left them, because making them up would misreport
+// what it settled. FinishRun remains the only writer of ended_at.
+func (s *Store) SettleRun(ctx context.Context, id int64) error {
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !run.Active() {
+		return fmt.Errorf("store: settle run %d: %w", id, ErrRunFinished)
+	}
+	return s.FinishRun(ctx, id, run.Done, run.Failed)
+}
+
+// GetRun returns one run by id.
+func (s *Store) GetRun(ctx context.Context, id int64) (*Run, error) {
+	r, err := scanRun(s.db.QueryRowContext(ctx,
+		`SELECT `+runColumns+` FROM runs WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 // explainUnfinished tells a caller whether the run never existed or had
 // already ended. It runs only on the error path.
 func (s *Store) explainUnfinished(ctx context.Context, id int64) error {

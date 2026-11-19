@@ -45,7 +45,7 @@ usage:
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
   loa run    [-workers N] [-max N] [-timeout 45m] [-json]
-  loa runs   [-limit N] [-json]    # every run, newest first
+  loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
 
 all commands accept -db PATH (default $LOA_DB, else loa.db)`
@@ -871,16 +871,19 @@ func printRunJSON(w io.Writer, stats runner.Stats) error {
 	return enc.Encode(out)
 }
 
-// cmdRuns lists every run, newest first. The open row is marked rather than
-// hidden: a run left active by a crash is exactly what a person needs to see.
+// cmdRuns lists every run, newest first, or settles one with -close. The open
+// row is marked rather than hidden: a run left active by a crash is exactly
+// what a person needs to see, and -close is the way out of it.
 func cmdRuns(ctx context.Context, args []string) error {
 	var (
-		asJSON bool
-		limit  int
+		asJSON  bool
+		limit   int
+		closeID int64
 	)
 	s, positional, err := open(ctx, "runs", args, func(fs *flag.FlagSet) {
 		fs.BoolVar(&asJSON, "json", false, "emit the runs as JSON")
 		fs.IntVar(&limit, "limit", 20, "how many runs to show")
+		fs.Int64Var(&closeID, "close", 0, "settle the run with this id")
 	})
 	if err != nil {
 		return err
@@ -890,12 +893,30 @@ func cmdRuns(ctx context.Context, args []string) error {
 	if len(positional) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
+	if closeID < 0 {
+		return fmt.Errorf("-close %d: run id must be positive", closeID)
+	}
+
+	if closeID > 0 {
+		if err := s.SettleRun(ctx, closeID); err != nil {
+			return err
+		}
+		run, err := s.GetRun(ctx, closeID)
+		if err != nil {
+			return err
+		}
+		return printRuns([]store.Run{*run}, asJSON)
+	}
 
 	runs, err := s.Runs(ctx, limit)
 	if err != nil {
 		return err
 	}
+	return printRuns(runs, asJSON)
+}
 
+// printRuns writes the run record as one JSON document, or as the table.
+func printRuns(runs []store.Run, asJSON bool) error {
 	if asJSON {
 		out := struct {
 			Runs []runJSON `json:"runs"`

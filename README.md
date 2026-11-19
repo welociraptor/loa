@@ -191,6 +191,9 @@ writes the queue with `loa add` and `loa import`, starts work with `loa run
 person rather than answering its pane. A worker still sees one task body, and
 done still means a commit on its branch.
 
+A run that died without closing does not block the next one: `loa runs -close
+ID` settles it without inventing what it settled.
+
 The boundary is policy, not a sandbox. A coordinator may write the queue because
 it is trusted to; a worker with `bash` can run `loa` too, and nothing in the
 store tells them apart. Review what a coordinator queued as you would review a

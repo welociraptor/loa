@@ -260,7 +260,8 @@ func (m Model) updateKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// local cancel also counts, since the next snapshot may not have
 		// caught the run this tab just started.
 		if m.active != nil {
-			m.message = fmt.Sprintf("a run is already active (%s)", m.active.Owner)
+			m.message = fmt.Sprintf("run %d is active (owner %s); if it is dead, close it with `loa runs -close %d`",
+				m.active.ID, m.active.Owner, m.active.ID)
 			return m, nil
 		}
 		if m.cancel != nil {
