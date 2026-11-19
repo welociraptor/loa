@@ -18,6 +18,7 @@ type Item struct {
 	ID        int64           `json:"id"`
 	Title     string          `json:"title"`
 	Workspace string          `json:"workspace"`
+	Plan      string          `json:"plan,omitempty"`
 	Branch    string          `json:"branch,omitempty"`
 	Session   string          `json:"session,omitempty"`
 	Result    string          `json:"result,omitempty"`
@@ -65,6 +66,7 @@ func Build(snap live.Snapshot, since, now time.Time) Report {
 			ID:        task.ID,
 			Title:     task.Title,
 			Workspace: task.Workspace,
+			Plan:      task.PlanID,
 			Branch:    task.Branch,
 			Session:   row.Session(),
 			Result:    task.Result,
@@ -109,14 +111,14 @@ func (r Report) Text() string {
 		r.Since.UTC().Format(time.RFC3339), r.Until.Sub(r.Since).Round(time.Minute))
 
 	section(&b, "done", r.Done, func(i Item) string {
-		return fmt.Sprintf("#%d  %s   %s   %s   %s%s",
-			i.ID, i.Title, branch(i.Branch), ran(i.RunMS), oneLine(i.Result), verdict(i.Verdict))
+		return fmt.Sprintf("#%d  %s   %s   %s   %s%s%s",
+			i.ID, i.Title, branch(i.Branch), ran(i.RunMS), oneLine(i.Result), verdict(i.Verdict), plan(i.Plan))
 	})
 	section(&b, "needs a human", r.Blocked, func(i Item) string {
-		return fmt.Sprintf("#%d  %s   %s%s", i.ID, i.Title, oneLine(i.Result), verdict(i.Verdict))
+		return fmt.Sprintf("#%d  %s   %s%s%s", i.ID, i.Title, oneLine(i.Result), verdict(i.Verdict), plan(i.Plan))
 	})
 	section(&b, "queued", r.Queued, func(i Item) string {
-		return fmt.Sprintf("#%d  %s", i.ID, i.Title)
+		return fmt.Sprintf("#%d  %s%s", i.ID, i.Title, plan(i.Plan))
 	})
 	section(&b, "still open", r.Open, func(i Item) string {
 		return fmt.Sprintf("#%d  %s   %s", i.ID, i.Title, i.Session)
@@ -189,6 +191,15 @@ func verdict(v string) string {
 		return ""
 	}
 	return "   verdict: " + v
+}
+
+// plan names the document a task was imported from, so work from one plan is
+// recognisable even when its rows are spread across the report's sections.
+func plan(id string) string {
+	if id == "" {
+		return ""
+	}
+	return "   plan: " + id
 }
 
 // ran reports the attempt's wall time. Zero means it was never measured, which

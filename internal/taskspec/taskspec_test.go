@@ -106,3 +106,111 @@ func TestValidateRequiresWorkspaceAndSaneNumbers(t *testing.T) {
 		}
 	}
 }
+
+func TestPhasesCompileToABarrier(t *testing.T) {
+	applied := parse(t, `{"phases":[
+		{"name":"first","tasks":[
+			{"title":"schema","workspace":"nixos"},
+			{"title":"proto","workspace":"nixos"}
+		]},
+		{"name":"second","tasks":[
+			{"title":"writer","workspace":"nixos"},
+			{"title":"reader","workspace":"nixos"}
+		]}
+	]}`)
+
+	if len(applied.Tasks) != 4 {
+		t.Fatalf("tasks = %d, want 4", len(applied.Tasks))
+	}
+	// Every second-phase task waits for every first-phase task, and none of the
+	// tasks inside a phase wait on each other: that is what makes it parallel.
+	for _, task := range []int{2, 3} {
+		if want := []int{0, 1}; !equal(applied.After[task], want) {
+			t.Errorf("after[%d] = %v, want %v", task, applied.After[task], want)
+		}
+	}
+	for _, task := range []int{0, 1} {
+		if len(applied.After[task]) != 0 {
+			t.Errorf("after[%d] = %v, want no dependency inside the phase", task, applied.After[task])
+		}
+	}
+}
+
+func TestPhaseAfterNamesAnotherPhase(t *testing.T) {
+	applied := parse(t, `{"phases":[
+		{"name":"schema","tasks":[{"title":"schema","workspace":"nixos"}]},
+		{"name":"api","tasks":[{"title":"api","workspace":"nixos"}]},
+		{"name":"docs","after":"schema","tasks":[{"title":"docs","workspace":"nixos"}]}
+	]}`)
+
+	// docs already waits on api because it is the previous phase, and on schema
+	// because the phase names it. The duplicate is collapsed.
+	if want := []int{0, 1}; !equal(applied.After[2], want) {
+		t.Fatalf("after[2] = %v, want %v", applied.After[2], want)
+	}
+
+	// A phase-level edge alone can cross phases that are not adjacent.
+	applied = parse(t, `{"phases":[
+		{"name":"schema","tasks":[{"title":"schema","workspace":"nixos"}]},
+		{"name":"api","tasks":[{"title":"api","workspace":"nixos"}]},
+		{"name":"docs","after":"schema","tasks":[{"title":"docs","workspace":"nixos"}]},
+		{"name":"release","after":"schema","tasks":[{"title":"release","workspace":"nixos"}]}
+	]}`)
+	if want := []int{0, 2}; !equal(applied.After[3], want) {
+		t.Errorf("after[3] = %v, want %v", applied.After[3], want)
+	}
+}
+
+func TestPhaseErrorsAreRefusedWhole(t *testing.T) {
+	cases := map[string]string{
+		"missing phase": `{"phases":[
+			{"name":"one","tasks":[{"title":"a","workspace":"nixos"}]},
+			{"name":"two","after":"nope","tasks":[{"title":"b","workspace":"nixos"}]}
+		]}`,
+		"cycle": `{"phases":[
+			{"name":"one","after":"two","tasks":[{"title":"a","workspace":"nixos"}]},
+			{"name":"two","tasks":[{"title":"b","workspace":"nixos"}]}
+		]}`,
+		"self phase": `{"phases":[
+			{"name":"one","after":"one","tasks":[{"title":"a","workspace":"nixos"}]}
+		]}`,
+		"duplicate across phases": `{"phases":[
+			{"name":"one","tasks":[{"title":"a","workspace":"nixos"}]},
+			{"name":"two","tasks":[{"title":"a","workspace":"nixos"}]}
+		]}`,
+		"duplicate phase name": `{"phases":[
+			{"name":"one","tasks":[{"title":"a","workspace":"nixos"}]},
+			{"name":"one","tasks":[{"title":"b","workspace":"nixos"}]}
+		]}`,
+		"unknown phase field": `{"phases":[
+			{"name":"one","owner":"me","tasks":[{"title":"a","workspace":"nixos"}]}
+		]}`,
+		"unknown task field": `{"phases":[
+			{"name":"one","tasks":[{"title":"a","workspace":"nixos","assignee":"me"}]}
+		]}`,
+	}
+	for name, doc := range cases {
+		parsed, err := taskspec.Parse(strings.NewReader(doc))
+		if err != nil {
+			if !strings.Contains(name, "unknown") {
+				t.Errorf("%s: parse: %v", name, err)
+			}
+			continue
+		}
+		if _, err := taskspec.Validate(parsed); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func equal(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}

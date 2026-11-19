@@ -44,7 +44,8 @@ loa dash                           # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
 loa runs                           # the run record, newest first
 loa triage                         # ask an agent to propose work; never applies it
-loa import FILE [-dry-run]         # apply a proposal: tasks, and priority changes
+loa plan -workflow FILE GOAL       # ask an agent for a plan graph; never applies it
+loa import FILE [-dry-run]         # apply a proposal or plan: tasks, priorities, edges
 loa merge ID [-into BRANCH]        # merge an approved, green review; never pushes
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
@@ -196,6 +197,60 @@ than ignored, a title referenced but absent is an error, and a dependency cycle
 is refused because it would sit in the queue forever looking like a runner bug.
 `import` then applies tasks and priority changes in **one transaction**, so a
 document with one bad task creates nothing.
+
+## Plans and workflows
+
+`loa` reads three JSON documents. A **proposal** is the flat task list in
+[Proposals](#proposals). A **plan** adds phases and is what `loa plan` asks an
+agent for. A **workflow** describes how a plan is worked and is authored by a
+person, not a model.
+
+A plan is a proposal with `phases` instead of a flat `tasks` list:
+
+```json
+{"phases": [
+  {"name": "schema", "tasks": [
+    {"title": "add the table", "body": "...", "workspace": "nixos", "role": "implement"}
+  ]},
+  {"name": "writer", "after": "schema", "tasks": [
+    {"title": "write the report", "body": "...", "workspace": "nixos", "role": "implement",
+     "after": ["another task title in this file"]}
+  ]}
+]}
+```
+
+Phases run in the order they appear. Every task in a phase waits for every task
+in the previous phase, so a phase is a barrier and the tasks inside it can run
+in parallel. `after` on a phase names another phase that this one must also
+wait for. The compiler collapses repeated edges; `after` inside a task still
+names a task title. Cycles, a phase named but absent, a task title that appears
+twice, and unknown fields are refused whole, exactly as for a proposal. The
+import is one transaction, and the tasks of a phased document share a plan id
+(the source file's name) so `report` can name the plan.
+
+`loa plan -workflow FILE GOAL` runs a planner agent in a scratch workspace,
+with `read,grep,find,ls,write` and no `bash`. It tells the agent that its output
+is a dependency graph, not prose, validates `plan.json`, saves it under
+`$XDG_STATE_HOME/loa/proposals/`, and never applies it. A person applies it with
+`loa import`.
+
+A workflow is versioned with the repository, for example
+`workflows/example.json`:
+
+```json
+{"prompts": {"plan": "prompts/planner.md", "implement": "prompts/implementer.md",
+             "review": "prompts/reviewer.md"},
+ "check": "nix develop -c go test ./...",
+ "merge": "auto",
+ "stages": ["plan", "implement", "review"]}
+```
+
+`prompts` maps a role to its prompt file, `check` is the command whose exit
+status gates a merge, `merge` is `auto` or `manual`, and `stages` is the ordered
+list a plan passes through. Parsing is strict: an unknown field, a missing
+prompt, a stage named twice, or `merge: auto` without a check command is an
+error. The merge guard stays in `loa merge`; the workflow only states the
+policy.
 
 ## Reviews
 

@@ -50,6 +50,7 @@ type Task struct {
 	Body        string
 	Workspace   string // Herdr workspace label; resolved to an id at dispatch
 	Role        string // which prompt file and tool set the worker gets
+	PlanID      string // the plan this task was imported from; empty if it was not planned
 	Status      Status
 	Priority    int
 	Attempts    int
@@ -98,6 +99,7 @@ type NewTask struct {
 	Body      string
 	Workspace string
 	Role      string
+	PlanID    string
 	Priority  int
 	MaxTries  int
 	Scopes    []string
@@ -225,9 +227,9 @@ func (s *Store) Add(ctx context.Context, t NewTask) (int64, error) {
 
 func insertTask(ctx context.Context, tx *sql.Tx, t NewTask, now string) (int64, error) {
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (title, body, workspace, role, priority, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.Title, t.Body, t.Workspace, roleOf(t.Role), t.Priority, maxTries(t.MaxTries), now, now)
+		`INSERT INTO tasks (title, body, workspace, role, plan_id, priority, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.Title, t.Body, t.Workspace, roleOf(t.Role), t.PlanID, t.Priority, maxTries(t.MaxTries), now, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert task: %w", err)
 	}
@@ -343,7 +345,7 @@ func roleOf(role string) string {
 	return role
 }
 
-const taskColumns = `id, title, body, workspace, role, status, priority, attempts, max_attempts,
+const taskColumns = `id, title, body, workspace, role, plan_id, status, priority, attempts, max_attempts,
 	coalesce(branch, ''), coalesce(result, ''),
 	created_at, updated_at,
 	coalesce(lease_owner, ''), coalesce(lease_expires_at, ''),
@@ -364,7 +366,7 @@ func scanTask(sc scanner) (*Task, error) {
 	t := Task{}
 	var status, created, updated, expiry, notBefore, mergedAt string
 	var checkPassed int
-	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &t.Role, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
+	err := sc.Scan(&t.ID, &t.Title, &t.Body, &t.Workspace, &t.Role, &t.PlanID, &status, &t.Priority, &t.Attempts, &t.MaxAttempts,
 		&t.Branch, &t.Result, &created, &updated, &t.LeaseOwner, &expiry, &notBefore,
 		&t.WorkspaceID, &t.PaneID, &t.RunMS, &t.Prompt, &t.PromptHash,
 		&t.Verdict, &t.VerdictNotes, &t.CheckCommand, &checkPassed, &t.CheckOutput,

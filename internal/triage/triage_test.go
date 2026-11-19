@@ -92,3 +92,84 @@ func taskspecParse(doc string) (taskspec.Document, error) {
 	}
 	return parsed, nil
 }
+
+func TestPlanPromptCallsThePlanADependencyGraph(t *testing.T) {
+	prompt := triage.PlanPrompt("ship the report", []string{"plan", "implement", "review"})
+	for _, want := range []string{
+		"ship the report",
+		"dependency graph, not prose",
+		"plan.json",
+		`"phases"`,
+		"barrier",
+		"plan, implement, review",
+		"Do not use bash",
+		"Do not apply anything",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt is missing %q", want)
+		}
+	}
+}
+
+func TestReadPlanRequiresPhasesAndValidTasks(t *testing.T) {
+	dir := t.TempDir()
+	valid := `{"phases":[{"name":"one","tasks":[{"title":"a","workspace":"demo"}]}]}`
+	if err := os.WriteFile(filepath.Join(dir, "plan.json"), []byte(valid), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	doc, err := triage.ReadPlan(dir)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if len(doc.Phases) != 1 || doc.Phases[0].Tasks[0].Title != "a" {
+		t.Fatalf("plan = %+v", doc)
+	}
+
+	cases := map[string]string{
+		"missing":       ``,
+		"invalid":       `{"phases":[{"name":"one","tasks":[{"title":"a"}]}]}`,
+		"no phases":     `{"tasks":[{"title":"a","workspace":"demo"}]}`,
+		"unknown field": `{"phases":[{"name":"one","owner":"me","tasks":[]}]}`,
+	}
+	for name, body := range cases {
+		sub := t.TempDir()
+		if body != "" {
+			if err := os.WriteFile(filepath.Join(sub, "plan.json"), []byte(body), 0o600); err != nil {
+				t.Fatalf("%s: write: %v", name, err)
+			}
+		}
+		if _, err := triage.ReadPlan(sub); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestSavePlanKeepsAPlanWithTheProposals(t *testing.T) {
+	dir := t.TempDir()
+	doc := taskspec.Document{Phases: []taskspec.Phase{{
+		Name:  "one",
+		Tasks: []taskspec.Task{{Title: "a", Workspace: "demo"}},
+	}}}
+	path, err := triage.SavePlan(dir, doc, time.Date(2026, 11, 18, 9, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if filepath.Base(path) != "plan-20261118T093000Z.json" {
+		t.Errorf("path = %s", path)
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path comes from the function under test
+	if err != nil {
+		t.Fatalf("read saved plan: %v", err)
+	}
+	parsed, err := taskspec.Parse(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatalf("parse saved plan: %v", err)
+	}
+	applied, err := taskspec.Validate(parsed)
+	if err != nil {
+		t.Fatalf("validate saved plan: %v", err)
+	}
+	if len(applied.Tasks) != 1 || applied.Tasks[0].Title != "a" {
+		t.Errorf("saved plan = %+v", applied)
+	}
+}

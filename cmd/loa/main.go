@@ -27,6 +27,7 @@ import (
 	"loa/internal/store"
 	"loa/internal/taskspec"
 	"loa/internal/triage"
+	"loa/workflows"
 )
 
 const usage = `loa — task queue for a multi-agent workflow
@@ -39,6 +40,7 @@ usage:
   loa report [-since 24h|-since 2026-11-18] [-json]   # what the day did
   loa import [FILE|-] [-dry-run]   # apply a proposal: tasks, and priority changes
   loa triage [-timeout 10m]        # ask an agent to propose one
+  loa plan   -workflow FILE GOAL   # ask an agent for a plan graph; never applies it
   loa lease  [-owner NAME] [-ttl 1h]
   loa unblock ID
   loa resolve ID [-fail] [-result TEXT]
@@ -74,6 +76,8 @@ func main() {
 		err = cmdImport(ctx, os.Args[2:])
 	case "triage":
 		err = cmdTriage(ctx, os.Args[2:])
+	case "plan":
+		err = cmdPlan(ctx, os.Args[2:])
 	case "lease":
 		err = cmdLease(ctx, os.Args[2:])
 	case "unblock":
@@ -275,6 +279,9 @@ func cmdShow(ctx context.Context, args []string) error {
 		fmt.Sprintf("role:\t%s", task.Role),
 		fmt.Sprintf("priority:\t%d", task.Priority),
 		fmt.Sprintf("attempts:\t%d/%d", task.Attempts, task.MaxAttempts),
+	}
+	if task.PlanID != "" {
+		lines = append(lines, fmt.Sprintf("plan:\t%s", task.PlanID))
 	}
 	if len(task.Scopes) > 0 {
 		lines = append(lines, fmt.Sprintf("scopes:\t%s", strings.Join(task.Scopes, ", ")))
@@ -555,6 +562,118 @@ func cmdTriage(ctx context.Context, args []string) error {
 	return nil
 }
 
+// cmdPlan runs one planner agent against a goal and keeps the plan it writes.
+// It is triage for a plan: a scratch workspace, a fixed plan format, and never
+// an application of the result. A person imports the file with the same door as
+// any other proposal.
+func cmdPlan(ctx context.Context, args []string) error {
+	var (
+		workflowPath string
+		timeout      time.Duration
+		model        string
+		kind         string
+		outDir       string
+	)
+	s, positional, err := open(ctx, "plan", args, func(fs *flag.FlagSet) {
+		fs.StringVar(&workflowPath, "workflow", "", "workflow file the plan is made for")
+		fs.DurationVar(&timeout, "timeout", 10*time.Minute, "limit for the planner agent")
+		fs.StringVar(&model, "model", "", "model passed to the agent")
+		fs.StringVar(&kind, "kind", "pi", "agent kind Herdr starts")
+		fs.StringVar(&outDir, "out", "", "where proposals are kept (default $XDG_STATE_HOME/loa/proposals)")
+	})
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	if len(positional) != 1 {
+		return fmt.Errorf("plan: need exactly one goal")
+	}
+	goal := strings.TrimSpace(positional[0])
+	if goal == "" {
+		return errors.New("plan: the goal is empty")
+	}
+	if strings.TrimSpace(workflowPath) == "" {
+		return errors.New("plan: -workflow is required")
+	}
+
+	// Validate the workflow before asking for a session: a typo in a file should
+	// not depend on where the command runs.
+	workflow, err := workflows.Load(workflowPath)
+	if err != nil {
+		return err
+	}
+
+	if !herdr.InSession() {
+		return errors.New("plan: not inside a Herdr pane, so there is no session to run an agent in")
+	}
+	if outDir == "" {
+		outDir = defaultProposalDir()
+	}
+
+	client := &herdr.Client{}
+	if _, err := client.CheckStatus(ctx); err != nil {
+		return err
+	}
+
+	scratch, err := os.MkdirTemp("", "loa-plan-")
+	if err != nil {
+		return fmt.Errorf("plan: scratch dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+
+	workspace, err := client.CreateWorkspace(ctx, scratch, "loa plan")
+	if err != nil {
+		return fmt.Errorf("plan: %w", err)
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := client.CloseWorkspace(cleanup, workspace.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "plan: close workspace %s: %v\n", workspace.ID, err)
+		}
+	}()
+
+	agentName := "loa-plan"
+	agentArgs := []string{"--no-session", "--tools", "read,grep,find,ls,write"}
+	if model != "" {
+		agentArgs = append(agentArgs, "--model", model)
+	}
+	if err := client.StartAgent(ctx, herdr.StartAgentRequest{
+		Name: agentName, Kind: kind, PaneID: workspace.PaneID,
+		Args: agentArgs, Timeout: time.Minute,
+	}); err != nil {
+		return fmt.Errorf("plan: %w", err)
+	}
+
+	if err := client.Prompt(ctx, agentName, triage.PlanPrompt(goal, workflow.Stages), timeout); err != nil {
+		if herdr.CodeOf(err) == "agent_blocked" {
+			return fmt.Errorf("plan: the agent is waiting for input in workspace %s (pane %s); answer it there, then run plan again",
+				workspace.ID, workspace.PaneID)
+		}
+		return fmt.Errorf("plan: %w", err)
+	}
+
+	doc, err := triage.ReadPlan(scratch)
+	if err != nil {
+		return fmt.Errorf("%w (the agent's scratch directory is %s)", err, scratch)
+	}
+	path, err := triage.SavePlan(outDir, doc, time.Now())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(path)
+	tasks := 0
+	for _, phase := range doc.Phases {
+		tasks += len(phase.Tasks)
+	}
+	fmt.Fprintf(os.Stderr, "plan: %d phase(s), %d task(s) from workflow %s\n",
+		len(doc.Phases), tasks, workflowPath)
+	fmt.Fprintf(os.Stderr, "apply with: loa import %s\n", path)
+	return nil
+}
+
 // defaultStateDir is where loa keeps what outlives one command.
 func defaultStateDir() string {
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
@@ -612,11 +731,13 @@ func cmdImport(ctx context.Context, args []string) error {
 		return err
 	}
 
+	planID := planIDFor(source, doc, time.Now())
 	items := make([]store.BatchItem, len(applied.Tasks))
 	for i, task := range applied.Tasks {
 		items[i] = store.BatchItem{
 			NewTask: store.NewTask{
 				Title: task.Title, Body: task.Body, Workspace: task.Workspace,
+				Role: task.Role, PlanID: planID,
 				Priority: task.Priority, MaxTries: task.MaxAttempts, Scopes: task.Scopes,
 			},
 			Deps:  task.Deps,
@@ -630,10 +751,12 @@ func cmdImport(ctx context.Context, args []string) error {
 
 	if dryRun {
 		out := struct {
+			Plan         string              `json:"plan,omitempty"`
 			Tasks        []taskspec.Task     `json:"tasks"`
+			Phases       []taskspec.Phase    `json:"phases,omitempty"`
 			Reprioritise []taskspec.Priority `json:"reprioritise"`
 			Notes        []string            `json:"notes,omitempty"`
-		}{doc.Tasks, doc.Reprioritise, doc.Notes}
+		}{planID, doc.Tasks, doc.Phases, doc.Reprioritise, doc.Notes}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(out); err != nil {
@@ -656,6 +779,19 @@ func cmdImport(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, "note: %s\n", note)
 	}
 	return nil
+}
+
+// planIDFor names the plan a document came from. A document with phases is a
+// plan; its tasks are imported together, so they share the source file's name.
+// A proposal without phases is not a plan and has no id.
+func planIDFor(source string, doc taskspec.Document, now time.Time) string {
+	if len(doc.Phases) == 0 {
+		return ""
+	}
+	if source == "-" {
+		return "plan-" + now.UTC().Format("20060102T150405Z")
+	}
+	return filepath.Base(source)
 }
 
 // cmdReport is the page a person reads after a day away: deterministic, no model.

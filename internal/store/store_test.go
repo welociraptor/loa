@@ -1071,7 +1071,7 @@ func TestOpenRejectsBadPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw database: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 10"); err != nil {
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 11"); err != nil {
 		t.Fatalf("set user_version: %v", err)
 	}
 	db.Close()
@@ -1662,8 +1662,8 @@ func TestApplyCreatesTheBatchInOneTransaction(t *testing.T) {
 	existing := add(t, s, store.NewTask{Title: "existing", Workspace: "loa", Priority: 1})
 
 	ids, err := s.Apply(ctx, []store.BatchItem{
-		{NewTask: store.NewTask{Title: "first", Workspace: "loa", Scopes: []string{"repo:a"}}},
-		{NewTask: store.NewTask{Title: "second", Workspace: "loa"},
+		{NewTask: store.NewTask{Title: "first", Workspace: "loa", PlanID: "plan-a", Scopes: []string{"repo:a"}}},
+		{NewTask: store.NewTask{Title: "second", Workspace: "loa", PlanID: "plan-a"},
 			After: []int{0}, Deps: []int64{existing}},
 	}, []store.Priority{{ID: existing, Priority: 9}})
 	if err != nil {
@@ -1681,7 +1681,7 @@ func TestApplyCreatesTheBatchInOneTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deps: %v", err)
 	}
-	if second.Title != "second" || len(deps) != 2 {
+	if second.Title != "second" || second.PlanID != "plan-a" || len(deps) != 2 {
 		t.Fatalf("second = %+v deps = %+v", second, deps)
 	}
 	first, err := s.Get(ctx, existing)

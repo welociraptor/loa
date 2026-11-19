@@ -335,8 +335,8 @@ func TestRunMigrationAppliesToV4DatabaseWithData(t *testing.T) {
 	}
 
 	s := openAt(t, path)
-	if got := version(t, s.db); got != 9 {
-		t.Fatalf("user_version = %d, want 9", got)
+	if got := version(t, s.db); got != 10 {
+		t.Fatalf("user_version = %d, want 10", got)
 	}
 
 	task, err := s.Get(ctx, id)
@@ -359,7 +359,7 @@ func TestRunDatabaseNewerThanBinaryIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw database: %v", err)
 	}
-	if _, err := db.ExecContext(context.Background(), "PRAGMA user_version = 10"); err != nil {
+	if _, err := db.ExecContext(context.Background(), "PRAGMA user_version = 11"); err != nil {
 		t.Fatalf("set user_version: %v", err)
 	}
 	if err := db.Close(); err != nil {

@@ -10,16 +10,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
 // Document is what a proposal file contains. A bare array is accepted too, and
 // means Tasks only.
+//
+// A plan is the same document with phases instead of a flat task list. Phases
+// are ordered by their position; every task in a phase waits for every task in
+// the previous one, which makes a phase a barrier without a scheduler.
 type Document struct {
 	Tasks        []Task     `json:"tasks"`
+	Phases       []Phase    `json:"phases"`
 	Reprioritise []Priority `json:"reprioritise"`
 	// Notes are for the human reading the proposal. They are never applied.
 	Notes []string `json:"notes"`
+}
+
+// Phase is one stage of a plan. Its tasks run in parallel with each other; the
+// barrier comes from the phase order and from After, which names another phase.
+type Phase struct {
+	Name  string `json:"name"`
+	After string `json:"after"`
+	Tasks []Task `json:"tasks"`
 }
 
 // Task is a task to create.
@@ -27,6 +41,7 @@ type Task struct {
 	Title       string   `json:"title"`
 	Body        string   `json:"body"`
 	Workspace   string   `json:"workspace"`
+	Role        string   `json:"role"`
 	Priority    int      `json:"priority"`
 	MaxAttempts int      `json:"max_attempts"`
 	Scopes      []string `json:"scopes"`
@@ -91,6 +106,8 @@ func decode(raw []byte, out any) error {
 }
 
 // Apply is a validated document: positions instead of titles, ready for a store.
+// Tasks are flattened in document order, with the flat task list first and the
+// phases after it.
 type Apply struct {
 	Tasks        []Task
 	After        [][]int // per task, positions in Tasks
@@ -101,10 +118,33 @@ type Apply struct {
 // Validate checks the whole document and resolves title references. It returns
 // the first problem; partial application is never an option.
 func Validate(doc Document) (Apply, error) {
-	applied := Apply{Tasks: doc.Tasks, Reprioritise: doc.Reprioritise, Notes: doc.Notes}
+	applied := Apply{Reprioritise: doc.Reprioritise, Notes: doc.Notes}
 
-	positions := make(map[string]int, len(doc.Tasks))
-	for i, task := range doc.Tasks {
+	// Flatten first: phases are sugar for dependencies between their tasks, and
+	// everything after this point works on one list.
+	applied.Tasks = make([]Task, 0, len(doc.Tasks))
+	applied.Tasks = append(applied.Tasks, doc.Tasks...)
+
+	starts := make([]int, len(doc.Phases))
+	ends := make([]int, len(doc.Phases))
+	phaseIndex := make(map[string]int, len(doc.Phases))
+	for i, phase := range doc.Phases {
+		name := strings.TrimSpace(phase.Name)
+		if name == "" {
+			return Apply{}, fmt.Errorf("phases[%d]: name is required", i)
+		}
+		if previous, duplicate := phaseIndex[name]; duplicate {
+			return Apply{}, fmt.Errorf("phases[%d] and phases[%d] share the name %q, so `after` cannot refer to one of them",
+				previous, i, name)
+		}
+		phaseIndex[name] = i
+		starts[i] = len(applied.Tasks)
+		applied.Tasks = append(applied.Tasks, phase.Tasks...)
+		ends[i] = len(applied.Tasks)
+	}
+
+	positions := make(map[string]int, len(applied.Tasks))
+	for i, task := range applied.Tasks {
 		if strings.TrimSpace(task.Title) == "" {
 			return Apply{}, fmt.Errorf("tasks[%d]: title is required", i)
 		}
@@ -131,8 +171,38 @@ func Validate(doc Document) (Apply, error) {
 		positions[task.Title] = i
 	}
 
-	applied.After = make([][]int, len(doc.Tasks))
-	for i, task := range doc.Tasks {
+	// A phase is a barrier over the previous phase, plus any phase it names in
+	// `after`. A set per task keeps those edges from being inserted twice.
+	edges := make([]map[int]bool, len(applied.Tasks))
+	for i := range edges {
+		edges[i] = make(map[int]bool)
+	}
+	addEdge := func(task, dep int) {
+		edges[task][dep] = true
+	}
+	for i, phase := range doc.Phases {
+		for task := starts[i]; task < ends[i]; task++ {
+			if i > 0 {
+				for dep := starts[i-1]; dep < ends[i-1]; dep++ {
+					addEdge(task, dep)
+				}
+			}
+			after := strings.TrimSpace(phase.After)
+			if after == "" {
+				continue
+			}
+			target, ok := phaseIndex[after]
+			if !ok {
+				return Apply{}, fmt.Errorf("phases[%d] %q: `after` refers to %q, which is not a phase in this document",
+					i, phase.Name, after)
+			}
+			for dep := starts[target]; dep < ends[target]; dep++ {
+				addEdge(task, dep)
+			}
+		}
+	}
+
+	for i, task := range applied.Tasks {
 		for _, title := range task.After {
 			if strings.TrimSpace(title) == "" {
 				return Apply{}, fmt.Errorf("tasks[%d] %q: empty `after` reference", i, task.Title)
@@ -142,12 +212,17 @@ func Validate(doc Document) (Apply, error) {
 				return Apply{}, fmt.Errorf("tasks[%d] %q: `after` refers to %q, which is not in this document",
 					i, task.Title, title)
 			}
-			applied.After[i] = append(applied.After[i], position)
+			edges[i][position] = true
 		}
 	}
 
-	titles := make([]string, len(doc.Tasks))
-	for i, task := range doc.Tasks {
+	applied.After = make([][]int, len(applied.Tasks))
+	for i, set := range edges {
+		applied.After[i] = sortedPositions(set)
+	}
+
+	titles := make([]string, len(applied.Tasks))
+	for i, task := range applied.Tasks {
 		titles[i] = task.Title
 	}
 	if err := cycles(applied.After, titles); err != nil {
@@ -172,6 +247,17 @@ func Validate(doc Document) (Apply, error) {
 	}
 
 	return applied, nil
+}
+
+// sortedPositions makes the compiled edges deterministic, so a test failure and
+// a cycle path read the same on every run.
+func sortedPositions(set map[int]bool) []int {
+	positions := make([]int, 0, len(set))
+	for position := range set {
+		positions = append(positions, position)
+	}
+	sort.Ints(positions)
+	return positions
 }
 
 // cycles rejects a document whose dependencies cannot ever be satisfied: a task
