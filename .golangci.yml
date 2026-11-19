@@ -37,8 +37,9 @@ linters:
         - (*loa/internal/store.Store).Close
     gosec:
       excludes:
-        # Commands are run through exec with an argument slice and no shell, so
-        # there is no injection surface for a variable command line.
+        # Every command but the workflow's check runs through exec with an
+        # argument slice and no shell; the check is a line of configuration
+        # written by the person who writes the unit, not by a task.
         - G204
         # Redundant with errcheck, which is enabled and configured above.
         - G104

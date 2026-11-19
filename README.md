@@ -36,15 +36,17 @@ order, and a database newer than the binary is refused rather than opened.
 nix develop
 go build ./cmd/loa
 
-loa add    -workspace nixos -title "..." -body "..." [-role implement|plan|review] [-priority 5] [-scope repo:loa]... [-dep ID]...
-loa list   [-status new]...
-loa show   ID                      # fields, and why it is not running
+loa add    -workspace nixos -title "..." -body "..." [-role implement|plan|review] [-priority 5] [-max 3] [-scope repo:loa]... [-dep ID]...
+loa list   [-status STATUS]...     # the queue: role, workspace, scopes, deps per row
+loa show   ID                      # fields, the graph both ways, and why it is not running
 loa cancel ID                      # delete a queued task; refuses leased, done, or depended-on work
+loa unblock ID                     # a blocked task back to the queue, one more attempt
+loa resolve ID [-fail] [-result TEXT] # settle a blocked task by hand, no lease needed
 loa ps     [-json]                 # the queue joined with the live session
-loa dash                           # the tab: state, and the keys to act on it
+loa dash   [-workers N] [-max N]   # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
-loa runs                           # the run record, newest first
-loa triage                         # ask an agent to propose work; never applies it
+loa runs   [-limit N] [-json] [-close ID] # every run, newest first; -close settles a dead one
+loa triage [-timeout 10m]          # ask an agent to propose work; never applies it
 loa plan -workflow FILE GOAL       # ask an agent for a plan graph; never applies it
 loa import FILE [-dry-run]         # apply a proposal or plan: tasks, priorities, edges
 loa merge ID [-into BRANCH]        # merge an approved, green review; never pushes
@@ -52,7 +54,7 @@ loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
 loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
-loa version                         # the release and commit this binary was built from
+loa version                        # the release and commit this binary was built from
 ```
 
 Every other transition leaves a row behind; `cancel` deletes one, which is why
@@ -83,8 +85,10 @@ dependency list stays at two.
 Everything runs inside Herdr: the runner itself is started in a pane, creates a
 worktree workspace per task with `herdr worktree create`, starts the agent in
 that workspace's pane, prompts it and reads its terminal. Nothing is exec'd
-except the `herdr` client and `git`, and no worktree is created by this code.
-It has to be safe to interrupt and safe to run twice:
+except the `herdr` client, `git`, and the workflow's `-check` command, which runs
+through `sh -c` in the review worktree on the person's instruction rather than
+the task's; no worktree is created by this code. It has to be safe to interrupt
+and safe to run twice:
 
 - **Success is read from the repository, not from the agent.** An implementation
   task is done only if its branch gained a commit; an agent that reports success
@@ -98,8 +102,10 @@ It has to be safe to interrupt and safe to run twice:
   fight over the same repository.
 - **Each attempt gets its own worktree workspace and branch**
   (`loa/<id>.<attempt>`), branched from `-base` or, so that a chain stacks
-  commits, from the newest done dependency's recorded branch; a re-queued or
-  branchless dependency leaves `-base` in force. It is labelled
+  commits, from the newest done dependency's recorded branch. A re-queued or
+  branchless dependency leaves `-base` in force, and so does one whose branch is
+  gone — a merged dependency's branch is tidied away by a person, and the
+  attempt should not fail for it. It is labelled
   `loa #<id>` so it can be found again. `herdr worktree remove` deletes the
   checkout and the workspace; the branch is the deliverable. Attempts that
   commit nothing also delete their branch, so a bad day does not litter the
@@ -421,7 +427,9 @@ group. Exemptions are narrow and each has a reason:
 - errcheck ignores cleanup calls (`Close`, `Rollback`) on handles that are
   already going away; everything else is enforced.
 - gosec ignores `G104` (unhandled errors — errcheck already owns that) and
-  `G204` (variable command lines — commands are run through `exec` with an
-  argument slice and no shell).
-- one `//nolint:gosec` marks the single place where SQL text is assembled from
-  placeholders while the values stay bound parameters.
+  `G204` (variable command lines — every command but the workflow's check runs
+  through `exec` with an argument slice and no shell).
+- `//nolint:gosec` marks each place a path is named by the person or by
+  configuration rather than by task text (`G304`, `G703`), and the single place
+  where SQL text is assembled from placeholders while the values stay bound
+  parameters (`G202`).

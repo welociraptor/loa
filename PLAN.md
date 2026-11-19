@@ -15,25 +15,34 @@ is something to look at rather than a timeout to interpret.
 
 ## Where things stand
 
-    cmd/loa/main.go             444   add | list | show | lease | done | fail | run
-    internal/store/store.go     440   lease, deps, scopes, retries
-    internal/store/explain.go   121   deps, blockers ("why is this not running")
-    internal/store/migrate.go   119   numbered, transactional migrations
-    internal/store/migrations/   57   0001_initial.sql, 0002_task_workspace.sql
-    internal/herdr/client.go    337   typed CLI client; JSON is the contract
-    internal/runner/runner.go   314   rounds, judgement, reconciliation
-    internal/runner/backend.go   63   Backend interface (the seam the fake sits on)
-    internal/runner/herdr_backend.go 207   resolve, worktree, agent, blocked, close
-    internal/runner/git.go       80   commit count, screen-to-summary
-    internal/runner/prompt.go    34
-    internal/live/live.go       187   queue joined with the session (`ps`)
-    internal/dash/dash.go       437   the tab: model, keys, view (plain strings)
-    internal/dash/run.go        250   raw mode, key decoding, one select loop
-    internal/report/report.go   187   the day: done, blocked, queued, open, gap
-    internal/taskspec/taskspec.go 204   a proposal: strict parse, resolve, validate
-    internal/triage/triage.go   148   what the triage agent reads and writes back
-    internal/store/migrations/   91   0001–0005, including runs and its active index
-    tests                     3,124   93 tests, `-race` clean
+    cmd/loa/main.go                 1367   the CLI: add | list | show | cancel | ps | report
+                                           import | triage | plan | lease | unblock | resolve
+                                           done | fail | run | runs | merge | dash
+    cmd/loa/merge.go                 232   loa merge: the one deterministic transition
+    cmd/loa/version.go                52   what the binary was built from
+    internal/store/store.go          878   lease, deps, scopes, retries, cancel
+    internal/store/run.go            193   runs: one active, and the record
+    internal/store/explain.go        203   deps, dependents, blockers ("why not running")
+    internal/store/migrate.go        119   numbered, transactional migrations
+    internal/store/migrations/       123   0001–0010, up to task_plan
+    internal/herdr/client.go         371   typed CLI client; JSON is the contract
+    internal/herdr/labels.go          54   the `loa #N` label, parsed in one place
+    internal/runner/runner.go        531   rounds, judgement, reconciliation
+    internal/runner/backend.go        69   Backend interface (the fake's seam)
+    internal/runner/herdr_backend.go  233   resolve, worktree, agent, blocked, close
+    internal/runner/roles.go         111   a role's prompt file and tool set
+    internal/runner/verdict.go       217   the reviewer's deliverable, and its check
+    internal/runner/git.go            87   commit count, summary, branch delete
+    internal/runner/prompt.go        148   render the task, then the contract
+    internal/live/live.go            201   queue joined with the session (`ps`)
+    internal/dash/dash.go            437   the tab: model, keys, view (plain strings)
+    internal/dash/run.go             259   raw mode, key decoding, one select loop
+    internal/report/report.go        221   the day: done, blocked, queued, open, gap
+    internal/taskspec/taskspec.go    303   a proposal or plan: strict parse, compile
+    internal/taskspec/verdict.go     146   verdict.json: strict parse
+    internal/triage/triage.go        236   what the triage agent reads and writes back
+    workflows/workflow.go            125   prompts, check, merge policy, stages
+    tests                           9270   274 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -53,7 +62,13 @@ Invariants that have tests behind them:
 - `show` agrees with the claim predicate on every state it can explain, so the
   reason it prints is the reason the queue is holding the task;
 - a database is created owner-only and an existing mode is never narrowed;
-- a migration applies once, in order, and a newer database is refused.
+- a migration applies once, in order, and a newer database is refused;
+- the dependency graph is readable in both directions, and `show` still agrees
+  with the claim predicate on why a task is held;
+- `cancel` refuses a leased, done, or depended-on task, so no row disappears
+  while something still points at it;
+- a task branches from its newest done dependency's branch, and falls back to
+  the configured base when that branch no longer exists.
 
 Everything above survives the change below. What changes is where the agent
 runs and who owns the worktree.
@@ -536,13 +551,13 @@ reconciliation decides what it may close. A task's live state is joined as:
   Notes are printed by `import` as well as by `triage`, because they are the part
   a person has to act on.
 
-## Phase 6 — what dogfooding found
+## Phase 6 — what dogfooding found (done)
 
 `loa` was used to add `QUICKSTART.md` and the `unblock`/`resolve` commands. The
 loop worked — two tasks, two commits, four minutes — and it surfaced one design
 limit worth fixing rather than documenting.
 
-- [ ] **28. Dependencies order work; they do not stack it.** A dependent task
+- [x] **28. Dependencies order work; they do not stack it.** A dependent task
   branches from the base commit, not from its dependency's branch, so it cannot
   see what the earlier task committed. A doc task that depends on a code task
   therefore describes the pre-merge world: the QUICKSTART written this way claims
@@ -553,7 +568,9 @@ limit worth fixing rather than documenting.
   `Base` is already a parameter, so this is a lookup, not a new concept. Test: a
   task with a done dependency opens a worktree whose HEAD contains that
   dependency's commit; a task whose dependency was re-queued still branches from
-  the base.
+  the base. *Fixed by step 29*, which is why this is ticked here: the branch a
+  dependent starts from is its dependency's, with the configured base as the
+  fallback when that branch has already been deleted.
 
 ## Phase 7 — the factory (done)
 
@@ -645,7 +662,7 @@ policy in the workflow, and no model is trusted with either.
   person. Test: approve and green merges; a red check refuses; a conflict
   refuses; a wrong branch refuses.
 
-- [x] **33. The plan, and `loa apply`.** `taskspec` learns `phases` and compiles
+- [x] **33. The plan, and `loa import`.** `taskspec` learns `phases` and compiles
   them into dependencies; `0010_task_plan.sql` gives them a plan id so `report`
   names the plan. `loa plan -workflow FILE GOAL` runs the planner agent like
   `triage` (a scratch workspace, `plan.json`, never applied) and `loa import`
@@ -812,14 +829,14 @@ the documents say that instead of implying a sandbox.
 - [ ] **40. The unit, and the documents.** A systemd user unit is where the
   policy lives — `loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12`,
   `Restart=on-failure`, and the socket path. README gains the daemon section and
-  the honest limits; PLAN.md loses "No timer, no daemon, no scheduler" and gains
-  the boundary in its place, and **Known limitations** moves in both directions:
+  the honest limits; the "Starting a run" decision and this phase's no-daemon
+  rationale are rewritten, and **Known limitations** moves in both directions:
   a missed day now has a flag that closes it, and a crashed daemon becomes a new
   one. Test: the documented command line parses, and `nix flake check` is green
   on the tree that ships the unit.
 
-The tab is a client of the daemon, so steps 38–40 assume step 34's plain loop —
-task 15 is done and unmerged on `loa/15.1`, and that merge comes first.
+The tab is a client of the daemon, so steps 38–40 assume step 34's plain loop,
+which is now on `main`.
 
 What it costs:
 
@@ -894,10 +911,10 @@ decisions define that mode; each widens the old design deliberately.
 
 ## Known limitations
 
-- **Nothing runs unless someone starts it, or `-auto` is on.** A person, a
-  coordinator or the daemon (step 39) must start a run; a missed day is a real
-  gap, and a crashed daemon is a machine quietly not working. Step 24 reports
-  it, but nothing reminds you beforehand.
+- **Nothing runs unless someone starts it.** A person, a coordinator or the
+  daemon (step 39) must start a run; a missed day is a real gap, and a crashed
+  daemon is a machine quietly not working. Step 24 reports it, but nothing
+  reminds you beforehand.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
@@ -923,9 +940,11 @@ decisions define that mode; each widens the old design deliberately.
   a second run sharing the database, so two sessions cannot split the queue.
   Two separate databases can still be driven independently; nothing joins
   them.
-- **Dependencies order execution, not content** (step 28, fixed by step 29): two
-  tasks in a chain do not share a base, so the later one cannot build on the
-  earlier one's commit. Until step 29 lands, a chained plan needs a merge
+- **Dependencies order execution, not content.** A task branches from its
+  newest done dependency's branch (step 29), so a chain stacks its commits — but
+  only while that branch exists. Once a dependency is merged and its branch is
+  deleted, the dependent branches from the configured base and cannot see it,
+  so a chained plan still needs the dependency's branch to survive or a merge
   between runs.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It
   is found by `report` (step 24) or by the dashboard's blocked row — both of
