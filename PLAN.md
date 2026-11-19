@@ -609,20 +609,20 @@ workflow's `merge: auto` is acted on by the coordinator, which reads the run's
 JSON and calls `loa merge` for each approved review: the guard lives in loa, the
 policy in the workflow, and no model is trusted with either.
 
-- [ ] **29. A task branches from its newest done dependency.** (Step 28, as a
+- [x] **29. A task branches from its newest done dependency.** (Step 28, as a
   prerequisite.) `Base` becomes the newest done dependency's branch with a
   recorded one, falling back to the configured base. Test: the worktree for a
   task with a done dependency contains that dependency's commit; a dependency
   that was re-queued still branches from the base.
 
-- [ ] **30. Roles and prompt files.** `0006_task_role.sql` adds `role`, `prompt`
+- [x] **30. Roles and prompt files.** `0006_task_role.sql` adds `role`, `prompt`
   and `prompt_hash`, defaulting to `implement` so existing tasks keep working.
   `prompts/{planner,implementer,reviewer}.md` render the task fields and the
   role's instructions; the runner appends the contract and fails a task whose
   role has no file, naming it. `loa add -role`, and `list`/`show`/`ps` show it.
   Test: a prompt file renders; a missing one fails the task; the hash is stored.
 
-- [ ] **31. A verdict is the reviewer's deliverable.** `0007_task_verdict.sql`
+- [x] **31. A verdict is the reviewer's deliverable.** `0007_task_verdict.sql`
   stores it. The runner hands a review
   task the diffs of the tasks it depends on, validates `.loa/verdict.json`
   (strict parse, unknown fields rejected), and stores the verdict. `approve`
@@ -632,7 +632,7 @@ policy in the workflow, and no model is trusted with either.
   finish it. Test: each verdict, a malformed document, a review with nothing to
   review.
 
-- [ ] **32. Merge, and the check it requires.** `0008_task_check.sql` records
+- [x] **32. Merge, and the check it requires.** `0008_task_check.sql` records
   the check's outcome on the review task; `-check CMD` is run in the review
   worktree by the runner. `0009_task_merge.sql` records `merged_at` and
   `merge_commit` on the implementation task. `loa merge ID` merges only when the
