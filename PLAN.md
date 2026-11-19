@@ -107,16 +107,15 @@ What it costs, and why the trade still holds:
 
 ## Constraints
 
-- **One dependency:** `modernc.org/sqlite`. Pure Go, no cgo, static binary.
+- **Two dependencies:** `modernc.org/sqlite` (pure Go, no cgo, static binary)
+  and `golang.org/x/term` for raw mode and the window size. The tab used to
+  carry the TUI framework `bubbletea` and, measured with `go list -deps`,
+  eighteen packages of renderer behind it; step 34 removes them, because what
+  the framework bought here was async commands and a select loop is the same
+  thing with fewer moving parts. The view stays a plain string built by a pure
+  function, so it is testable without a terminal either way.
 - **One binary:** the runner and the dashboard are `loa` subcommands, not
   separate services, and the dashboard *is* where a run starts.
-- **Three dependencies:** `modernc.org/sqlite`, and `github.com/charmbracelet/bubbletea`
-  for the tab — a real TUI framework rather than hand-rolled raw mode, which
-  brings its own input loop, resize handling and alt-screen. It also brings
-  eighteen packages of renderer (lipgloss, termenv, term, cellbuf, colorprofile,
-  uniseg, runewidth, …), measured with `go list -deps`. That is the price of not
-  writing a terminal loop; the view is still a plain string built by a pure
-  function, so it is testable without a terminal.
 - **One run at a time, enforced by SQL.** A partial unique index on `runs`
   allows only one active run, so two dashboards, two panes or two processes
   cannot both spend the budget. The run itself is a row; `loa runs` is the
@@ -666,6 +665,58 @@ What it costs:
   (`when`) would unstick it and are deliberately deferred until this loop is
   proven.
 
+## Phase 8 — the queue you can see (planned)
+
+Two gaps, neither of them in the rules. The tab carries a framework it no longer
+needs, and the graph the claim predicate enforces — the thing that decides what
+runs next — is invisible outside `sqlite3`.
+
+- [ ] **34. The tab loses its framework.** `bubbletea` bought async commands,
+  resize handling and an alt screen, and cost twenty-odd modules on a binary
+  whose other dependency is a SQLite driver, plus a `tea.Cmd` indirection in
+  front of every call the tab makes. `internal/dash` keeps the state machine and
+  drops the framework: `Update`/`View` stay pure values over plain messages, and
+  the loop becomes one goroutine selecting over four channels — decoded keys, a
+  one-second `time.Ticker`, action results and the window size — with
+  `golang.org/x/term` for raw mode and `GetSize`, which is what step 20 always
+  said the source would be. Alt screen, cursor and restore are plain escapes,
+  restored by a `defer` and on SIGTERM, so a panic or a kill leaves a usable
+  terminal; `dash` on a non-tty says so instead of emitting escapes. Nothing
+  moves onto the render path: refresh, actions and the run stay in goroutines,
+  because a tab that blocks on a store query is worse than no tab. `go.mod` ends
+  with two direct requirements, `flake.nix`'s `vendorHash` moves, and the
+  documents that justified the framework are corrected — the two duelling
+  dependency bullets under Constraints, "No styling beyond bubbletea itself",
+  step 20's account of what shipped, and README's dependency paragraph. Test:
+  every existing `dash_test.go` case still drives the model directly — keys, the
+  result prompt, `s`/`S`, the message line, selection at both edges, 80×24
+  against 200×50 — with only the key type and the command plumbing changed, and
+  none deleted on the grounds that it tested the framework. New: the restore
+  path runs against a fake terminal that records the escapes, once on a normal
+  exit and once on a panic.
+
+- [ ] **35. `loa show` names the graph, in both directions.** Step 3 made a
+  dependency readable as a *blocker* and nothing else, so a task whose
+  dependencies are `done` reads exactly like a task with none, and "what is
+  waiting on this?" has no answer short of SQL. `Task.Deps` becomes a field
+  loaded the way `Scopes` is — one query per list, never one per row — and
+  `store.Dependents` answers the other direction with the same `Dep` type.
+  `show` prints `depends on:` and `needed by:` unconditionally, each edge
+  carrying the other task's id, status and title, and `-` for the empty case.
+  `Blockers` keeps its own wording, because it is the claim predicate's
+  explanation and not an edge list; showing both is the point — one says why the
+  queue is holding the task, the other says where it sits. Test: a dependency
+  that is already `done` still appears; a task nothing waits on prints
+  `needed by: -`; `TestBlockersAgreeWithLease` is untouched, so the explanation
+  cannot drift from the claim.
+
+- [ ] **36. `loa list` shows dependencies.** One `DEPS` column, `-` when there
+  are none and `5,12` otherwise, joined the way `SCOPES` already is. A chain is
+  the shape of the day's work, and a table that omits it asks a person to run
+  `show` on every row to find out. Presentation only: the store work is step
+  35's and the column reuses its formatter, so `list` gains no query. Test: the
+  empty case and a three-task chain, through the built binary.
+
 ## The coordinator (decided)
 
 `loa` may be driven by a coordinator agent, not only by a person. Three
@@ -699,9 +750,9 @@ decisions define that mode; each widens the old design deliberately.
   path would double every failure mode to save one attach.
 - **No web UI.** The dashboard is a pane because the workers are panes; a
   browser tab would be further from the work than the terminal already is.
-- **No styling beyond bubbletea itself.** No `bubbles` widgets, no `lipgloss`
-  calls: the view is padded strings, which is what keeps it testable and what
-  keeps the dependency at one framework.
+- **No TUI framework, and no styling.** No `bubbletea`, no `bubbles`, no
+  `lipgloss`: the tab is padded strings drawn by our own loop (step 34), which
+  is what keeps it testable and the dependency list at two.
 - **No worktrees created by the runner.** Anything that touches `git worktree`
   belongs in Herdr, where the stale-registration bug is already someone else's.
 - **No agent-to-agent messaging.** Coordination goes through the queue; two
