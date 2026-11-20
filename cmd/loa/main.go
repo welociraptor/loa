@@ -1046,6 +1046,20 @@ func runOptionsFrom(fs *flag.FlagSet, f runFlags) daemon.RunOptions {
 	return o
 }
 
+// resolvePrompts makes a relative -prompts absolute against the caller's cwd.
+// The daemon has its own cwd, so a path left relative would name a different
+// checkout, or no prompts at all.
+func resolvePrompts(dir string) (string, error) {
+	if dir == "" || filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("-prompts %q: %w", dir, err)
+	}
+	return abs, nil
+}
+
 // newRunnerBackend is the real backend. A run invoked by the daemon cannot
 // claim to be inside a pane, so the session check belongs to the commands that
 // mean "the human is looking at one", not here.
@@ -1114,7 +1128,11 @@ func cmdRun(ctx context.Context, args []string) error {
 		case <-runDone:
 		}
 	}()
-	stats, runErr := client.Run(ctx, runOptionsFrom(fs, flags))
+	opts := runOptionsFrom(fs, flags)
+	if opts.PromptsDir, err = resolvePrompts(opts.PromptsDir); err != nil {
+		return err
+	}
+	stats, runErr := client.Run(ctx, opts)
 	close(runDone)
 
 	// A run that never started has no row to report; the error says why.

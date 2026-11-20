@@ -199,9 +199,13 @@ record). These flags are the cap, not a default: a client may narrow them but
 cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client may only
 lower; `-check` is the daemon's check, and a client may supply one only when the
 daemon has none. A client may still choose `-base`, `-prompts`, `-model` and
-`-kind`. Change the unit, not a config file: a checked-in flag is a reviewed
-decision, while a file in a hidden directory drifts. `-interval` (default `1m`) is
-how often the queue is checked and the floor for an empty queue.
+`-kind`; a relative `-prompts` is resolved against the client's working
+directory before it is sent. When a run has no prompts directory, the daemon
+walks up from its own working directory, which is why the unit sets
+`WorkingDirectory`. Change the unit, not a config file: a checked-in flag is a
+reviewed decision, while a file in a hidden directory drifts. `-interval`
+(default `1m`) is how often the queue is checked and the floor for an empty
+queue.
 
 The socket is `$XDG_RUNTIME_DIR/loa/sock`, protocol 1; `XDG_RUNTIME_DIR` must be
 set and absolute (the unit supplies `%t`). The control socket is Linux-only: on
