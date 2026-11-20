@@ -64,8 +64,13 @@ Every other transition leaves a row behind; `cancel` deletes one, which is why
 it refuses a leased, done, or still-depended-on task rather than cascading a
 hole into the queue.
 
-`LOA_DB` selects the database (default `./loa.db`); every command
-except `version` also takes `-db`.
+`LOA_DB` selects the database (default `./loa.db`). Commands that open SQLite
+directly accept `-db PATH`: `add`, `list`, `show`, `cancel`, `ps`, `report`,
+`import`, `triage`, `plan`, `lease`, `unblock`, `resolve`, `done`, `fail`,
+`runs`, `merge`, and `dash` for the queue it draws. `run`, `pause`, `resume` and
+`daemon -status` are clients of the daemon and take no `-db`: the daemon decides
+which database they work. `daemon` itself takes `-db` because it opens the queue
+for the whole process.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses
@@ -157,10 +162,14 @@ they open a workspace for a person to watch.
 
 The daemon owns the leases and the runs that take them, and every Herdr call a
 run makes: start, prompt, read, interrupt and close. The queue is not behind it:
-`add`, `list`, `show`, `ps`, `report`, `import`, `cancel`, `unblock` and
-`resolve` open SQLite directly and work whether the daemon is up or dead. `ps`
-and `dash` still read the session directly for display, but they start nothing
-and own nothing.
+`add`, `list`, `show`, `ps`, `report`, `import`, `cancel`, `lease`, `unblock`,
+`resolve`, `done`, `fail`, `runs`, `merge`, `triage` and `plan` open SQLite
+directly and work whether the daemon is up or dead. `ps` and `dash` still read
+the session directly for display, but they start nothing and own nothing.
+`loa daemon -status` reports the database the daemon works. `dash` opens its own
+database to draw, compares the daemon's reported path with it, and when the two
+differ it says so in the message line and refuses `s`/`S` rather than driving a
+queue nobody is looking at.
 
 Install the unit and start it:
 

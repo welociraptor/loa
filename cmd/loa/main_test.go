@@ -1136,3 +1136,18 @@ esac
 		t.Errorf("plan applied %d task(s): %+v", len(tasks), tasks)
 	}
 }
+
+func TestDBMismatchNamesBothPaths(t *testing.T) {
+	if got := dbMismatch("/a/tasks.db", "/a/tasks.db"); got != "" {
+		t.Errorf("equal paths = %q, want no mismatch", got)
+	}
+	if got := dbMismatch("/a/tasks.db", ""); got != "" {
+		t.Errorf("an unreported daemon database = %q, want no invented mismatch", got)
+	}
+	got := dbMismatch("/tab/tasks.db", "/daemon/tasks.db")
+	for _, want := range []string{"/tab/tasks.db", "/daemon/tasks.db", "run and stop are refused"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("mismatch = %q, missing %q", got, want)
+		}
+	}
+}

@@ -131,7 +131,7 @@ func TestDaemonStatusAnswersWithoutRunOrHerdr(t *testing.T) {
 	if strings.Count(out, "\n") != 1 {
 		t.Errorf("status is not one line: %q", out)
 	}
-	for _, want := range []string{"pid " + strconv.Itoa(p.cmd.Process.Pid), "up ", "protocol 1", "no active run"} {
+	for _, want := range []string{"pid " + strconv.Itoa(p.cmd.Process.Pid), "up ", "protocol 1", "db " + filepath.Join(p.dir, "tasks.db"), "no active run"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status = %q, missing %q", out, want)
 		}
@@ -150,6 +150,47 @@ func TestDaemonStatusAnswersWithoutRunOrHerdr(t *testing.T) {
 	}
 	if got := sockInfo.Mode().Perm(); got != 0o600 {
 		t.Errorf("socket mode = %o, want 600", got)
+	}
+}
+
+func TestRunRefusesADatabaseFlagAndCreatesNoFile(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+	other := filepath.Join(p.dir, "other.db")
+
+	_, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), "run", "-db", other)
+	if code != 2 {
+		t.Fatalf("run -db exited %d, want the flag parse refusal (2); stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "-db") {
+		t.Errorf("stderr = %q, want the refused flag named", errOut)
+	}
+	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("run created or migrated %s: %v", other, err)
+	}
+}
+
+func TestClientCommandsRefuseTheDatabaseFlag(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+	other := filepath.Join(p.dir, "other.db")
+
+	for _, command := range []string{"pause", "resume"} {
+		_, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), command, "-db", other)
+		if code != 2 || !strings.Contains(errOut, "-db") {
+			t.Errorf("%s -db exited %d with %q, want the flag parse refusal", command, code, errOut)
+		}
+	}
+	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a client command created or migrated %s: %v", other, err)
+	}
+}
+
+func TestDaemonStatusRefusesTheDatabaseFlag(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+	other := filepath.Join(p.dir, "other.db")
+
+	_, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), "daemon", "-status", "-db", other)
+	if code != 1 || !strings.Contains(errOut, "the daemon decides the database") {
+		t.Errorf("daemon -status -db exited %d with %q, want the client refusal", code, errOut)
 	}
 }
 

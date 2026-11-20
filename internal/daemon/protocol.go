@@ -125,6 +125,7 @@ type Status struct {
 	Uptime   string     `json:"uptime"`
 	Protocol int        `json:"protocol"`
 	Paused   bool       `json:"paused"`
+	DB       string     `json:"db,omitempty"`
 	Run      *ActiveRun `json:"run,omitempty"`
 }
 

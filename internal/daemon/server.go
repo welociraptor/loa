@@ -47,6 +47,10 @@ type Config struct {
 	Backend   runner.Backend
 	Runner    runner.Config
 
+	// DBPath is the database the daemon works. Status reports it so a client
+	// can tell whether it is looking at the same queue.
+	DBPath string
+
 	Auto     bool
 	Idle     time.Duration
 	Daily    int
@@ -61,6 +65,7 @@ type Server struct {
 	probeFn   func(context.Context) error
 	started   time.Time
 	runner    runner.Config
+	dbPath    string
 
 	mu           sync.Mutex
 	paused       bool
@@ -217,6 +222,7 @@ func newServer(cfg Config) *Server {
 		probeFn:   cfg.Probe,
 		started:   time.Now(),
 		runner:    runCfg,
+		dbPath:    canonicalPath(cfg.DBPath),
 		auto:      cfg.Auto,
 		idle:      cfg.Idle,
 		daily:     cfg.Daily,
@@ -667,6 +673,20 @@ func (s *Server) status() Status {
 		Uptime:   time.Since(s.started).Round(time.Second).String(),
 		Protocol: Protocol,
 		Paused:   s.paused,
+		DB:       s.dbPath,
 		Run:      s.run,
 	}
+}
+
+// canonicalPath makes the reported database comparable with a client's own
+// absolute path. An unusable path is reported as it was given.
+func canonicalPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
 }

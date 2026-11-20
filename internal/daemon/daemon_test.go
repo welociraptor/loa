@@ -196,6 +196,21 @@ func TestStatusShowsNoRunAndPauseSurvives(t *testing.T) {
 	}
 }
 
+func TestStatusReportsTheDaemonDatabase(t *testing.T) {
+	dir := t.TempDir()
+	want := filepath.Join(dir, "tasks.db")
+	r := start(t, Config{DBPath: want})
+	defer r.stop(t)
+
+	status, err := (&Client{Path: r.sock}).Status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.DB != want {
+		t.Errorf("status.DB = %q, want %q", status.DB, want)
+	}
+}
+
 func TestRunRefusesWithoutARuntimeDirectory(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	err := Run(context.Background(), Config{})

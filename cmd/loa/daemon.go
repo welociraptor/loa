@@ -54,6 +54,9 @@ func cmdDaemon(ctx context.Context, args []string) error {
 	}
 
 	if status {
+		if flagWasSet(fs, "db") {
+			return fmt.Errorf("daemon -status: the daemon decides the database; drop -db")
+		}
 		return daemonStatus(ctx)
 	}
 
@@ -76,6 +79,9 @@ func cmdDaemon(ctx context.Context, args []string) error {
 
 	return daemon.Run(sigctx, daemon.Config{
 		Logger: log.New(os.Stderr, "loa: ", log.LstdFlags),
+		// The daemon is the authority on the queue, so its status names the
+		// database a client would have to agree with.
+		DBPath: *db,
 		Probe: func(ctx context.Context) error {
 			_, err := (&herdr.Client{}).CheckStatus(ctx)
 			return err
@@ -99,9 +105,8 @@ func cmdResume(ctx context.Context, args []string) error {
 }
 
 func cmdDaemonControl(ctx context.Context, verb string, args []string) error {
-	fs := flag.NewFlagSet(verb, flag.ExitOnError)
-	fs.String("db", defaultDB(), "path to the task database (accepted for consistency; the daemon chooses it)")
-	positional, err := parseFlags(fs, args)
+	// No -db: pause and resume are client calls, and the daemon owns the queue.
+	positional, _, err := parseClientFlags(verb, args, func(*flag.FlagSet) {})
 	if err != nil {
 		return err
 	}
@@ -150,7 +155,11 @@ func daemonStatus(ctx context.Context) error {
 			run += " (" + status.Run.Owner + ")"
 		}
 	}
-	fmt.Printf("pid %d, up %s, protocol %d, paused %t, %s\n",
-		status.PID, status.Uptime, status.Protocol, status.Paused, run)
+	db := status.DB
+	if db == "" {
+		db = "(not reported)"
+	}
+	fmt.Printf("pid %d, up %s, protocol %d, paused %t, db %s, %s\n",
+		status.PID, status.Uptime, status.Protocol, status.Paused, db, run)
 	return nil
 }

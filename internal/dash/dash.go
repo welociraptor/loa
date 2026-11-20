@@ -147,11 +147,20 @@ type Model struct {
 	// the first.
 	active     *store.Run
 	runPending bool
+
+	// queueMismatch explains why the database this tab draws is not the one the
+	// daemon works. While it is set, s and S refuse rather than drive a queue
+	// nobody is looking at.
+	queueMismatch string
 }
 
-// New builds the tab.
-func New(s *store.Store, session Session, controls Controls) Model {
-	return Model{store: s, session: session, controls: controls, width: 80, height: 24}
+// New builds the tab. queueMismatch is the composition root's explanation of a
+// database disagreement, empty when the two agree or no daemon answered.
+func New(s *store.Store, session Session, controls Controls, queueMismatch string) Model {
+	return Model{
+		store: s, session: session, controls: controls, queueMismatch: queueMismatch,
+		message: queueMismatch, width: 80, height: 24,
+	}
 }
 
 // refresh re-reads the queue, the session and the active run. It runs as a
@@ -312,6 +321,10 @@ func (m Model) updateKeys(msg Key) (Model, Cmd) {
 			m.prompt = prompt{active: true, done: msg.String() == "d"}
 		}
 	case "s":
+		if m.queueMismatch != "" {
+			m.message = m.queueMismatch
+			return m, nil
+		}
 		// The store's StartRun is the guard; this is the explanation. The
 		// pending request also counts, since the next snapshot may not have
 		// caught the run this tab just started.
@@ -332,6 +345,10 @@ func (m Model) updateKeys(msg Key) (Model, Cmd) {
 			return runDoneMsg{err: err}
 		}
 	case "S":
+		if m.queueMismatch != "" {
+			m.message = m.queueMismatch
+			return m, nil
+		}
 		if m.active == nil && !m.runPending {
 			m.message = "no run to stop"
 			return m, nil

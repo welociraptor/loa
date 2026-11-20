@@ -158,7 +158,7 @@ func readMsg(t *testing.T, s *store.Store, session fakeSession) dash.SnapshotMsg
 // loaded returns a model that has already read the queue.
 func loaded(t *testing.T, s *store.Store, session fakeSession, c dash.Controls) dash.Model {
 	t.Helper()
-	m := dash.New(s, session, c)
+	m := dash.New(s, session, c, "")
 	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
 	m = asModel(t, next)
 
@@ -414,6 +414,38 @@ func TestLocalRunStartsAndStops(t *testing.T) {
 	}
 	if _, again := m.Update(key("s")); again == nil {
 		t.Error("a run cannot be started after the previous one finished")
+	}
+}
+
+func TestDatabaseMismatchRefusesRunAndStop(t *testing.T) {
+	s, session, _, _ := seed(t)
+	c := &fakeControls{}
+	mismatch := "the daemon works /daemon/tasks.db but this tab draws /tab/tasks.db; run and stop are refused"
+
+	m := dash.New(s, session, c, mismatch)
+	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
+	m = asModel(t, next)
+	next, _ = m.Update(readMsg(t, s, session))
+	m = asModel(t, next)
+
+	view := m.View()
+	for _, want := range []string{"/daemon/tasks.db", "/tab/tasks.db", "run and stop are refused"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the message line is missing %q:\n%s", want, view)
+		}
+	}
+
+	for _, k := range []string{"s", "S"} {
+		next, cmd := m.Update(key(k))
+		if cmd != nil {
+			t.Fatalf("%q drove the daemon while the databases differ", k)
+		}
+		if !strings.Contains(asModel(t, next).View(), mismatch) {
+			t.Errorf("%q did not repeat the refusal:\n%s", k, asModel(t, next).View())
+		}
+	}
+	if calls := c.Calls(); len(calls) != 0 {
+		t.Fatalf("the tab called controls while the databases differ: %v", calls)
 	}
 }
 

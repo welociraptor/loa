@@ -64,7 +64,7 @@ func assertRestored(t *testing.T, f *fakeTerminal) {
 
 func TestRunRestoresTheTerminalOnQuit(t *testing.T) {
 	f := &fakeTerminal{width: 80, height: 24, keysCh: quitKey()}
-	if err := run(context.Background(), New(nil, nil, nil), f, nil, nil); err != nil {
+	if err := run(context.Background(), New(nil, nil, nil, ""), f, nil, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	assertRestored(t, f)
@@ -75,7 +75,7 @@ func TestRunRestoresTheTerminalOnPanic(t *testing.T) {
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		_ = run(context.Background(), New(nil, nil, nil), f, nil, nil)
+		_ = run(context.Background(), New(nil, nil, nil, ""), f, nil, nil)
 	}()
 	if recovered == nil {
 		t.Fatal("the size failure did not panic")
@@ -87,7 +87,7 @@ func TestRunRestoresTheTerminalOnSIGTERM(t *testing.T) {
 	f := &fakeTerminal{width: 80, height: 24}
 	signals := make(chan os.Signal, 1)
 	signals <- syscall.SIGTERM
-	if err := run(context.Background(), New(nil, nil, nil), f, signals, nil); err != nil {
+	if err := run(context.Background(), New(nil, nil, nil, ""), f, signals, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	assertRestored(t, f)
@@ -95,7 +95,7 @@ func TestRunRestoresTheTerminalOnSIGTERM(t *testing.T) {
 
 func TestRawModeStartsEveryLineAtColumnOne(t *testing.T) {
 	f := &fakeTerminal{width: 80, height: 24, keysCh: quitKey()}
-	if err := run(context.Background(), New(nil, nil, nil), f, nil, nil); err != nil {
+	if err := run(context.Background(), New(nil, nil, nil, ""), f, nil, nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	_, drawn, ok := strings.Cut(f.out.String(), clearScreen)

@@ -62,7 +62,10 @@ usage:
   loa resume                       # allow automatic starts again
   loa version                      # the release and commit this binary was built from
 
-all commands accept -db PATH (default $LOA_DB, else loa.db)`
+The commands that open SQLite directly take -db PATH (default $LOA_DB, else
+loa.db): add, list, show, cancel, ps, report, import, triage, plan, lease,
+unblock, resolve, done, fail, runs, merge and dash. run, pause, resume and
+daemon -status are clients: the daemon decides which database they work.`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -149,19 +152,39 @@ func open(ctx context.Context, name string, args []string, register func(*flag.F
 // semantics depend on which flags a caller actually set rather than on their
 // zero values.
 func openFlags(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, *flag.FlagSet, error) {
+	s, positional, fs, _, err := openFlagsWithDB(ctx, name, args, register)
+	return s, positional, fs, err
+}
+
+// openFlagsWithDB is openFlags plus the database path, for a command that must
+// compare what it draws with what the daemon works.
+func openFlagsWithDB(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, *flag.FlagSet, string, error) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	db := fs.String("db", defaultDB(), "path to the task database")
 	register(fs)
 
 	positional, err := parseFlags(fs, args)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	s, err := store.Open(ctx, *db)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
-	return s, positional, fs, nil
+	return s, positional, fs, *db, nil
+}
+
+// parseClientFlags parses the flags of a command that talks to the daemon. It
+// accepts no -db: run, pause and resume are clients, and the daemon decides
+// which database they work.
+func parseClientFlags(name string, args []string, register func(*flag.FlagSet)) ([]string, *flag.FlagSet, error) {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	register(fs)
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	return positional, fs, nil
 }
 
 // parseFlags allows flags to appear after positional arguments, which the
@@ -179,6 +202,18 @@ func parseFlags(fs *flag.FlagSet, args []string) ([]string, error) {
 		positional = append(positional, args[0])
 		args = args[1:]
 	}
+}
+
+// flagWasSet reports whether the caller supplied the named flag rather than
+// taking its default.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 type listFlag []string
@@ -1040,14 +1075,13 @@ func newRunnerConfig(s *store.Store, backend *runner.Herdr, f runFlags, logw io.
 func cmdRun(ctx context.Context, args []string) error {
 	var flags runFlags
 	var asJSON bool
-	s, positional, fs, err := openFlags(ctx, "run", args, func(fs *flag.FlagSet) {
+	positional, fs, err := parseClientFlags("run", args, func(fs *flag.FlagSet) {
 		registerRunFlags(fs, &flags)
 		fs.BoolVar(&asJSON, "json", false, "emit the run outcome as JSON")
 	})
 	if err != nil {
 		return err
 	}
-	defer s.Close()
 
 	if len(positional) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", positional)
@@ -1255,7 +1289,7 @@ func cmdDash(ctx context.Context, args []string) error {
 	}
 
 	var flags runFlags
-	s, positional, fs, err := openFlags(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
+	s, positional, fs, dbPath, err := openFlagsWithDB(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
 	if err != nil {
 		return err
 	}
@@ -1263,6 +1297,11 @@ func cmdDash(ctx context.Context, args []string) error {
 
 	if len(positional) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", positional)
+	}
+
+	localDB, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("dash: database path: %w", err)
 	}
 
 	path, err := daemon.SocketPath()
@@ -1273,6 +1312,16 @@ func cmdDash(ctx context.Context, args []string) error {
 	d := &daemon.Client{Path: path}
 	opts := runOptionsFrom(fs, flags)
 
+	// The tab draws one queue; the daemon works another. Ask once which one,
+	// and let the model refuse s/S rather than drive a queue nobody is looking
+	// at. A dead daemon has no answer; the run controls report that on their own.
+	mismatch := ""
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	if status, err := d.Status(statusCtx); err == nil {
+		mismatch = dbMismatch(localDB, status.DB)
+	}
+	cancel()
+
 	c := controls{client: client, store: s}
 	c.runFn = func(ctx context.Context) error {
 		_, err := d.Run(ctx, opts)
@@ -1280,7 +1329,17 @@ func cmdDash(ctx context.Context, args []string) error {
 	}
 	c.stopFn = func(ctx context.Context) error { return d.Stop(ctx) }
 
-	return dash.Run(ctx, dash.New(s, client, c), os.Stdin, os.Stdout)
+	return dash.Run(ctx, dash.New(s, client, c, mismatch), os.Stdin, os.Stdout)
+}
+
+// dbMismatch names both databases when the daemon works a different one than
+// the tab draws. An empty daemon path is a daemon that does not say: a client
+// cannot prove a disagreement, so it does not invent one.
+func dbMismatch(local, remote string) string {
+	if local == "" || remote == "" || filepath.Clean(local) == filepath.Clean(remote) {
+		return ""
+	}
+	return fmt.Sprintf("the daemon works %s but this tab draws %s; run and stop are refused", remote, local)
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {
