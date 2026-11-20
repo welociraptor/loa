@@ -15,11 +15,11 @@ is something to look at rather than a timeout to interpret.
 
 ## Where things stand
 
-    cmd/loa/main.go                 1399   the CLI: add | list | show | cancel | ps | report
+    cmd/loa/main.go                 1390   the CLI: add | list | show | cancel | ps | report
                                            import | triage | plan | lease | unblock | resolve
                                            done | fail | run | runs | merge | daemon
                                            pause | resume
-    cmd/loa/daemon.go                154   the supervisor, its policy flags, and -status
+    cmd/loa/daemon.go                204   the supervisor, its policy flags, and -status
     cmd/loa/merge.go                 232   loa merge: the one deterministic transition
     cmd/loa/version.go                52   what the binary was built from
     internal/store/store.go          878   lease, deps, scopes, retries, cancel
@@ -29,23 +29,23 @@ is something to look at rather than a timeout to interpret.
     internal/store/migrations/       123   0001–0010, up to task_plan
     internal/herdr/client.go         371   typed CLI client; JSON is the contract
     internal/herdr/labels.go          54   the `loa #N` label, parsed in one place
-    internal/runner/runner.go        531   rounds, judgement, reconciliation
+    internal/runner/runner.go        544   rounds, judgement, reconciliation
     internal/runner/backend.go        69   Backend interface (the fake's seam)
     internal/runner/herdr_backend.go  233   resolve, worktree, agent, blocked, close
     internal/runner/roles.go         111   a role's prompt file and tool set
-    internal/runner/verdict.go       217   the reviewer's deliverable, and its check
-    internal/runner/git.go            87   commit count, summary, branch delete
-    internal/runner/prompt.go        148   render the task, then the contract
+    internal/runner/verdict.go       273   the reviewer's deliverable, and its check
+    internal/runner/git.go           101   commit count, summary, branch delete
+    internal/runner/prompt.go        157   render the task, then the contract
     internal/live/live.go            201   queue joined with the session (`ps`)
-    internal/daemon/server.go        643   the socket, the runs, and the scheduler
-    internal/daemon/protocol.go      199   versioned NDJSON; client and server types
+    internal/daemon/server.go        750   the socket, the runs, and the scheduler
+    internal/daemon/protocol.go      218   versioned NDJSON; client and server types
     internal/report/report.go        221   the day: done, blocked, queued, open, gap
     internal/taskspec/taskspec.go    303   a proposal or plan: strict parse, compile
     internal/taskspec/verdict.go     146   verdict.json: strict parse
     internal/triage/triage.go        236   what the triage agent reads and writes back
     workflows/workflow.go            125   prompts, check, merge policy, stages
     contrib/loa.service               26   the flags that are the policy
-    tests                          10595   305 tests, `-race` clean
+    tests                          11058   317 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -839,8 +839,10 @@ the documents say that instead of implying a sandbox.
   the honest limits; the "Starting a run" decision and this phase's no-daemon
   rationale are rewritten, and **Known limitations** moves in both directions:
   a missed day now has a flag that closes it, and a crashed daemon becomes a new
-  one. Test: the documented command line parses, and `nix flake check` is green
-  on the tree that ships the unit.
+  one. Test: `TestDaemonServiceCommandLineParses` reads `contrib/loa.service`,
+  extracts `ExecStart`'s arguments and parses them through the daemon's own flag
+  set, so a renamed flag breaks the gate rather than the unit; `nix flake check`
+  is green on the tree that ships the unit.
 
 The tab was removed when the daemon took over the run: `loa run` and `loa stop`
 are clients now, so there was no state left that only the tab could show.

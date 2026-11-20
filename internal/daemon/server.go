@@ -728,6 +728,9 @@ func (s *Server) status() Status {
 		Uptime:   time.Since(s.started).Round(time.Second).String(),
 		Protocol: Protocol,
 		Paused:   s.paused,
+		Auto:     s.auto,
+		Interval: s.interval,
+		Daily:    s.daily,
 		DB:       s.dbPath,
 		Run:      s.run,
 	}

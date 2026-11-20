@@ -131,7 +131,7 @@ func TestDaemonStatusAnswersWithoutRunOrHerdr(t *testing.T) {
 	if strings.Count(out, "\n") != 1 {
 		t.Errorf("status is not one line: %q", out)
 	}
-	for _, want := range []string{"pid " + strconv.Itoa(p.cmd.Process.Pid), "up ", "protocol 1", "db " + filepath.Join(p.dir, "tasks.db"), "no active run"} {
+	for _, want := range []string{"pid " + strconv.Itoa(p.cmd.Process.Pid), "up ", "protocol 1", "paused false", "auto off", "db " + filepath.Join(p.dir, "tasks.db"), "no active run"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status = %q, missing %q", out, want)
 		}
@@ -166,6 +166,15 @@ func TestRunRefusesADatabaseFlagAndCreatesNoFile(t *testing.T) {
 	}
 	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run created or migrated %s: %v", other, err)
+	}
+}
+
+func TestRunRefusesTheOwnerFlag(t *testing.T) {
+	// The runner computes host/pid itself; a caller-supplied owner would be
+	// accepted and ignored, so the flag is gone rather than misleading.
+	_, errOut, code := runDaemonCLI(t, daemonEnv(t.TempDir()), "run", "-owner", "someone")
+	if code != 2 || !strings.Contains(errOut, "-owner") {
+		t.Errorf("run -owner exited %d with %q, want the flag parse refusal", code, errOut)
 	}
 }
 
@@ -404,6 +413,44 @@ func TestPauseAndResumeCommandsAndHelp(t *testing.T) {
 	}
 }
 
+func TestDaemonServiceCommandLineParses(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("working directory: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(wd, "..", "..", "contrib", "loa.service")) //nolint:gosec // G304: the unit is in this checkout
+	if err != nil {
+		t.Fatalf("read contrib/loa.service: %v", err)
+	}
+
+	var args []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ExecStart=") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "ExecStart="))
+		for i, field := range fields {
+			if field == "daemon" {
+				args = fields[i+1:]
+				break
+			}
+		}
+	}
+	if args == nil {
+		t.Fatal("contrib/loa.service has no ExecStart with a daemon subcommand")
+	}
+
+	o, _, err := parseDaemonFlags(args)
+	if err != nil {
+		t.Fatalf("contrib/loa.service ExecStart does not parse: %v", err)
+	}
+	if !o.auto || o.run.workers != 1 || o.run.maxTasks != 4 || o.idle != 5*time.Minute || o.daily != 12 {
+		t.Errorf("unit parses as auto %t, workers %d, max %d, idle %s, daily %d; want the checked-in policy",
+			o.auto, o.run.workers, o.run.maxTasks, o.idle, o.daily)
+	}
+}
+
 func TestDaemonHelpListsThePolicyFlags(t *testing.T) {
 	// contrib/loa.service documents this command line; a flag that vanishes
 	// from help would make the checked-in policy unparsable.
@@ -470,6 +517,117 @@ func TestStopCommandSendsTheStopVerb(t *testing.T) {
 	}
 }
 
+func TestRunSecondInterruptKillsTheClient(t *testing.T) {
+	dir := t.TempDir()
+	runtime := filepath.Join(dir, "loa")
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(runtime, "sock"), Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	type request struct {
+		V  int    `json:"v"`
+		Do string `json:"do"`
+	}
+	runSeen := make(chan struct{}, 1)
+	stopSeen := make(chan struct{}, 1)
+	fakeErr := make(chan error, 1)
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		runConn, err := ln.AcceptUnix()
+		if err != nil {
+			fakeErr <- fmt.Errorf("accept run: %w", err)
+			return
+		}
+		defer func() { _ = runConn.Close() }()
+		var run request
+		if err := json.NewDecoder(runConn).Decode(&run); err != nil {
+			fakeErr <- fmt.Errorf("read run: %w", err)
+			return
+		}
+		if run.V != 1 || run.Do != "run" {
+			fakeErr <- fmt.Errorf("first request = %+v, want protocol 1 run", run)
+			return
+		}
+		runSeen <- struct{}{}
+
+		stopConn, err := ln.AcceptUnix()
+		if err != nil {
+			fakeErr <- fmt.Errorf("accept stop: %w", err)
+			return
+		}
+		defer func() { _ = stopConn.Close() }()
+		var stop request
+		if err := json.NewDecoder(stopConn).Decode(&stop); err != nil {
+			fakeErr <- fmt.Errorf("read stop: %w", err)
+			return
+		}
+		if stop.V != 1 || stop.Do != "stop" {
+			fakeErr <- fmt.Errorf("second request = %+v, want protocol 1 stop", stop)
+			return
+		}
+		stopSeen <- struct{}{}
+		// Hold both connections open without an answer: the client is wedged in
+		// Stop, which is where the second interrupt has to be able to kill it.
+		<-release
+	}()
+
+	cmd := exec.Command(binary, "run")
+	cmd.Env = daemonEnv(dir)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start loa run: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	select {
+	case <-runSeen:
+	case err := <-fakeErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("loa run did not ask the daemon for a run")
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("first interrupt: %v", err)
+	}
+	select {
+	case <-stopSeen:
+	case err := <-fakeErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first interrupt did not ask the daemon to stop")
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("second interrupt: %v", err)
+	}
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Fatal("loa run exited 0 after the second interrupt, want the signal to kill it")
+		}
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("wait for loa run: %v", err)
+		}
+		status, ok := exit.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
+			t.Fatalf("loa run exited %v, want SIGINT; stderr:\n%s", err, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the second interrupt did not kill a wedged client; stderr:\n%s", stderr.String())
+	}
+}
+
 func TestDaemonAutoStartsARunWithinOneInterval(t *testing.T) {
 	dir := t.TempDir()
 	env := daemonEnv(dir)
@@ -494,6 +652,16 @@ esac
 	}
 
 	startDaemonWithArgs(t, dir, "daemon", "-auto", "-interval", "50ms", "-idle", "0", "-daily", "4", "-workers", "1", "-max", "1")
+
+	status, errOut, code := runDaemonCLI(t, env, "daemon", "-status")
+	if code != 0 {
+		t.Fatalf("daemon -status exited %d: %s", code, errOut)
+	}
+	for _, want := range []string{"auto on", "interval 50ms", "daily 4"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("status = %q, missing %q", status, want)
+		}
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {

@@ -516,7 +516,7 @@ func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 	if !strings.Contains(lines[0], "SESSION") || !strings.Contains(lines[0], "WORKSPACE") {
 		t.Errorf("header = %q", lines[0])
 	}
-	// Rows are located by id, not by position: ps is a separate order from the tab.
+	// Rows are located by id, not by position.
 	rows := psRows(t, out)
 	if !strings.Contains(rows[1], "leased") || !strings.Contains(rows[2], "new") {
 		t.Errorf("rows = %q", lines[1:])

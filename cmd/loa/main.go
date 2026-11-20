@@ -482,8 +482,7 @@ func cmdPs(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// ps is a view of the queue, not the tab: newest first, whatever each task
-	// is doing. The tab keeps live work at the top.
+	// ps is a view of the queue: newest first, whatever each task is doing.
 	sort.SliceStable(snap.Rows, func(i, j int) bool {
 		return snap.Rows[i].Task.ID > snap.Rows[j].Task.ID
 	})
@@ -985,7 +984,6 @@ type runFlags struct {
 	check      string
 	timeout    time.Duration
 	ttl        time.Duration
-	owner      string
 	model      string
 	kind       string
 }
@@ -998,7 +996,6 @@ func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
 	fs.StringVar(&f.check, "check", "", "command run in a review worktree; its exit status gates merge")
 	fs.DurationVar(&f.timeout, "timeout", 45*time.Minute, "limit for one agent run")
 	fs.DurationVar(&f.ttl, "ttl", 2*time.Hour, "lease lifetime; must exceed -timeout")
-	fs.StringVar(&f.owner, "owner", defaultOwner(), "who holds the leases")
 	fs.StringVar(&f.model, "model", "", "model passed to the agent")
 	fs.StringVar(&f.kind, "kind", "pi", "agent kind Herdr starts")
 }
@@ -1099,7 +1096,9 @@ func cmdRun(ctx context.Context, args []string) error {
 	client := &daemon.Client{Path: path}
 
 	// The daemon owns the run and its cleanup. On SIGINT, ask it to stop rather
-	// than letting the signal kill the client and leave the work spending.
+	// than letting the signal kill the client and leave the work spending. Once
+	// that request is on its way, restore the default disposition so a second
+	// Ctrl-C still kills a client stuck in a wedged run.
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 	defer signal.Stop(interrupt)
@@ -1107,6 +1106,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	go func() {
 		select {
 		case <-interrupt:
+			signal.Stop(interrupt)
 			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			if err := client.Stop(stopCtx); err != nil {

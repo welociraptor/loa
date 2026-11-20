@@ -5,8 +5,9 @@ loa gives it to one agent in a fresh git worktree, and records what happened. A
 task is only considered done when its branch contains a commit; the agent's own
 claim of success does not count.
 
-The queue lives in a SQLite file. There is no daemon and no timer: nothing moves
-until you start a run.
+The queue lives in a SQLite file. A daemon owns the runs: `loa run` asks it for
+one, and with `-auto` it starts runs by itself when work is claimable. Nothing
+moves while no daemon is running.
 
 ## The moving parts
 
@@ -14,24 +15,29 @@ until you start a run.
   instructions are called the body.
 - **Workspace**: a Herdr workspace that points at a git repository. A task names
   the workspace *label*, never a filesystem path.
-- **Run**: a person or a trusted coordinator starts it inside a Herdr pane. loa
-  leases runnable tasks, starts agents in worktree workspaces, and cleans the
-  worktrees up afterwards.
+- **Run**: the daemon starts it, either because `loa run` asked or because
+  `-auto` saw claimable work. loa leases runnable tasks, starts agents in
+  worktree workspaces, and cleans the worktrees up afterwards.
 - **Branch**: each attempt works on `loa/<task-id>.<attempt>`. That branch is
   the deliverable. Uncommitted work is discarded.
 
 ## What you need
 
-- A running Herdr session. Everything that starts an agent must itself run
-  inside a Herdr pane.
+- A running Herdr session. The daemon starts every agent through Herdr, so
+  Herdr must be up before a run can succeed.
 - `git`, and a repository with at least one commit to branch from.
 - An agent CLI that Herdr can start. The default is `pi`; use `-kind` to choose
   another.
 - Nix, or an already-built `loa` binary.
+- A running loa daemon. `loa run` asks it to work the queue and does not need a
+  Herdr pane. Start it by hand (`loa daemon` or `loa daemon -auto`) or install
+  `contrib/loa.service` as described under Install.
 
-Commands that only read or change the queue (`add`, `list`, `show`, `ps`,
-`report`, `import`, `lease`, `done`, `fail`) work outside Herdr. Commands that
-need a session (`run`, `triage`) refuse to start outside a Herdr pane.
+Commands that only read or change the queue (`add`, `list`, `show`, `cancel`,
+`ps`, `report`, `import`, `lease`, `done`, `fail`) work whether or not the
+daemon and Herdr are running. The daemon's clients are `run`, `stop`, `pause`,
+`resume` and `daemon -status`. `triage` and `plan` still refuse to start outside
+a Herdr pane, because they open a workspace for a person to watch.
 
 ## Install
 
@@ -52,6 +58,34 @@ nix build
 For the rest of this guide, `loa` means either the installed command or
 `./result/bin/loa`.
 
+### Start the daemon
+
+`loa run` asks a daemon to do the work, so start one. For a supervised user
+service, install `contrib/loa.service`:
+
+```sh
+cp contrib/loa.service ~/.config/systemd/user/loa.service
+# edit ExecStart and WorkingDirectory if the binary or checkout is elsewhere
+systemctl --user daemon-reload
+systemctl --user enable --now loa
+loa daemon -status
+```
+
+The unit runs `-auto`, so the daemon starts runs by itself. For a foreground
+daemon that only works the queue when asked:
+
+```sh
+loa daemon
+loa run
+```
+
+`loa daemon -status` reports the pid, pause and auto state, the interval and
+daily cap, and the database it works. The service log is the journal:
+
+```sh
+journalctl --user -u loa -f
+```
+
 ## Choose the database
 
 By default loa uses `loa.db` in the current directory. For real use, put it in
@@ -62,8 +96,10 @@ mkdir -p ~/.local/state/loa
 export LOA_DB="$HOME/.local/state/loa/tasks.db"
 ```
 
-Every command also accepts `-db PATH`, which is useful for a separate queue.
-The file is created owner-only and is safe to inspect with `sqlite3`.
+Commands that open SQLite directly also accept `-db PATH`, which is useful for
+a separate queue. The daemon's clients (`run`, `stop`, `pause`, `resume`,
+`daemon -status`) do not: the daemon decides which database they work. The file
+is created owner-only and is safe to inspect with `sqlite3`.
 
 loa's own state (triage proposals) lives in `$XDG_STATE_HOME/loa`, usually
 `~/.local/state/loa`.
@@ -126,13 +162,15 @@ loa add -workspace my-project -title "..." -body "..." \
 
 ## 3. Run the queue
 
-In a Herdr pane:
+With the daemon running, ask it for one run:
 
 ```sh
 loa run -max 1
 ```
 
-The first run is deliberately limited to one task. For each task, loa:
+`loa run` is a client of the daemon and does not need a Herdr pane. The daemon
+does the work and owns its cleanup. The first run is deliberately limited to
+one task. For each task, the daemon:
 
 1. leases the highest-priority runnable task;
 2. resolves its workspace label to a Herdr workspace;
@@ -146,17 +184,20 @@ The first run is deliberately limited to one task. For each task, loa:
 Progress and the final `done`/`failed` count go to stderr. A worktree is
 scratch space; it is removed even when the task succeeds.
 
-`loa run` defaults to two concurrent workers, five tasks per run, a 45-minute
-task timeout, and a two-hour lease. The lease must outlive the task timeout. If
-you change them, keep that true:
+With no daemon policy to narrow, `loa run` asks for two concurrent workers,
+five tasks, a 45-minute task timeout and a two-hour lease. The daemon's flags
+are the ceiling, so a request only narrows `-workers` and `-max` and shortens
+`-timeout` and `-ttl`; the lease must outlive the timeout. The daemon's `-check`
+cannot be replaced, while `-base`, `-prompts`, `-model` and `-kind` are yours:
 
 ```sh
 loa run -workers 2 -max 5 -timeout 30m -ttl 1h
 ```
 
 Work is picked up in rounds. If one task finishes and frees another task's
-scope, the next round can lease it. It is safe to interrupt a run; a lease whose
-worker disappears is reclaimed when it expires.
+scope, the next round can lease it. It is safe to interrupt a run: Ctrl-C asks
+the daemon to stop, a lease whose worker disappears is reclaimed when it
+expires, and a second Ctrl-C kills a wedged client.
 
 ## 4. Review the result
 
@@ -184,11 +225,13 @@ an approved review with a green check merge with `loa merge`. loa never pushes.
 
 ## Day-to-day use
 
-With the queue trusted, run it normally:
+With the queue trusted, let the daemon work it. Start the unit (or run `loa
+daemon -auto`); whenever a task is claimable and the last run is older than
+`-idle`, the daemon starts a run until `-daily` or `-max` is spent. Without
+`-auto`, ask for each run with `loa run`.
 
-```sh
-loa run
-```
+`loa pause` stops automatic starts without touching the run in flight; `loa
+resume` allows them again. The pause is memory, so a restart resumes.
 
 ## Watching a queue
 
@@ -325,25 +368,32 @@ to a person. That boundary is policy, not a sandbox.
 
 | Command | Purpose |
 | --- | --- |
-| `loa add -title T -workspace LABEL [-body B] [-priority N] [-max N] [-scope S]... [-dep ID]...` | Add a task and print its id. |
+| `loa add -title T -workspace LABEL [-role R] [-body B] [-priority N] [-max N] [-scope S]... [-dep ID]...` | Add a task and print its id. |
 | `loa list [-status STATUS]...` | List tasks, optionally filtered by `new`, `leased`, `done` or `blocked`. |
 | `loa show ID` | Show one task and why it is or is not runnable. |
+| `loa cancel ID` | Delete a queued task; refuses leased, done, or depended-on work. |
 | `loa ps [-json]` | Show the queue joined with live session state. |
 | `loa report [-since 24h\|YYYY-MM-DD] [-json]` | Show what happened in a window. |
-| `loa run [flags] [-json]` | Work the queue inside Herdr; `-json` emits machine-readable results. |
-| `loa runs` | List the run record, newest first. |
+| `loa run [flags] [-json]` | Ask the daemon for a run; `-json` emits machine-readable results. |
+| `loa stop` | Ask the daemon to stop the run in flight. |
+| `loa runs [-limit N] [-json] [-close ID]` | List the run record, newest first; `-close` settles a dead row. |
 | `loa merge ID [-into BRANCH]` | Merge an approved, green review; refuses a dirty checkout, a wrong branch or a conflict. |
 | `loa unblock ID` | Return a blocked task to the queue. |
 | `loa resolve ID [-fail] [-result TEXT]` | Settle a non-leased task done, or blocked with `-fail`. |
-| `loa triage [-timeout D] [-model M] [-kind K] [-out DIR]` | Ask an agent for a proposal; never applies it. |
+| `loa triage [-timeout D] [-model M] [-kind K] [-out DIR]` | Ask an agent for a proposal; never applies it. Needs a Herdr pane. |
+| `loa plan -workflow FILE GOAL [-timeout D] [-model M] [-kind K] [-out DIR]` | Ask an agent for a plan graph; never applies it. Needs a Herdr pane. |
 | `loa import [FILE\|-] [-dry-run]` | Apply a proposal atomically. |
 | `loa lease [-owner NAME] [-ttl D]` | Lease one task as JSON, or `null`; for a worker you drive yourself. |
 | `loa done ID [-branch B] [-result TEXT]` | Mark a held lease done. |
 | `loa fail ID [-result TEXT]` | Fail a held lease. |
+| `loa daemon [-status] [-auto] [-interval D] [-idle D] [-daily N] [run flags]` | Serve the control socket; `-status` reports the running daemon. |
+| `loa pause` / `loa resume` | Stop or allow automatic starts; the run in flight is untouched. |
+| `loa version` | Print the release and build commit. |
 
-`loa run` accepts `-workers`, `-max`, `-base`, `-check`, `-timeout`, `-ttl`,
-`-owner`, `-model` and `-kind`. All commands accept `-db PATH`. `loa help`
-prints the short reference.
+`loa run` accepts `-workers`, `-max`, `-base`, `-check`, `-prompts`, `-timeout`,
+`-ttl`, `-model` and `-kind`; it takes no `-db` and no `-owner`, because the
+daemon decides the database and the run's owner. Commands that open SQLite
+directly accept `-db PATH`. `loa help` prints the short reference.
 
 ## Limits and safety
 
@@ -374,8 +424,9 @@ workspaces at source repositories, and review branches before merging them.
 
 **`not inside a Herdr pane`**
 
-Start `loa run` or `loa triage` from a Herdr pane. Reading commands do not need
-one.
+`triage` and `plan` open a workspace for you to watch, so start them from a
+Herdr pane. `loa run` does not need one: it asks the daemon. Reading commands
+do not need a session either.
 
 **`no Herdr workspace is labelled "..."`**
 
@@ -389,10 +440,12 @@ the body explicitly require a commit and keep the task small enough to finish.
 
 **A task is not running**
 
-Run `loa show ID`. It prints the retry delay, dependency, scope or lease that is
-holding it. A failed task with attempts left waits 30 minutes; one that has
-spent its attempts is `blocked` until you resolve or unblock it. A run's `-max`
-is a budget, so a failure cannot be retried inside the same run.
+First check the daemon: `loa daemon -status` reports whether it is up, paused
+and running with `-auto`, and `journalctl --user -u loa -f` shows what it tried.
+Then run `loa show ID`. It prints the retry delay, dependency, scope or lease
+that is holding it. A failed task with attempts left waits 30 minutes; one that
+has spent its attempts is `blocked` until you resolve or unblock it. A run's
+`-max` is a budget, so a failure cannot be retried inside the same run.
 
 **An agent is waiting for approval**
 

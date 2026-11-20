@@ -25,21 +25,23 @@ not force it off.
 
 | package | tests | statement coverage | assessment |
 |---|---:|---:|---|
-| `internal/store` | 24 | 76.1% | core queue rules are tested; `Unblock` is untested, error paths and real migration chains are thin |
-| `internal/store` migrations (subset of the 24) | 4 | part of store | only synthetic `fstest.MapFS` migrations; the shipped SQL is never run as a chain |
-| `internal/herdr` | 17 | 77.8% | `RemoveWorktree`, `CloseWorkspace`, `Wait`, `InSession` have no tests; several command shapes are unverified |
-| `internal/runner` | 14 | 64.5% | runner logic is well covered; `herdr_backend.go` is at **0%** — `resolve`, `Open`, blocked mapping and cleanup are untested |
-| `internal/live` | 5 | 82.4% | join is good; `Row.Session` has no package-level test, and agents-unavailable/duplicate-label cases are missing |
-| `internal/report` | 4 | 88.5% | happy path and window are good; no golden output, no boundary/rounding/double-count cases |
-| `internal/taskspec` | 6 | 92.4% | strongest package; parser edge cases and fuzzing are missing |
-| `internal/triage` | 5 | 80.6% | file formats covered; modes, collisions, write failures and the CLI flow are not |
-| `cmd/loa` | 18 CLI tests | **0% instrumented** | the tests build and run the binary, so child-process coverage is not collected; `run`, `triage`, flag precedence and most argument validation are untested |
-| **total** | **93** | **54.3%** | enough to trust the happy path, not enough to trust a week unattended |
+| `internal/store` | 73 | 82.2% | lifecycle and migration chains are covered; remaining gaps are error injection and long-run soak |
+| `internal/store` migrations (subset of the 73) | 10 | part of store | the shipped SQL is run from every version with data; rollback, failure atomicity and the schema golden are covered |
+| `internal/herdr` | 43 | 98.3% | transport commands and recorded fixtures are covered; the live session stays manual |
+| `internal/runner` | 57 | 84.8% | runner logic and `herdr_backend.go` are exercised; remaining gaps are rare cleanup/error combinations |
+| `internal/live` | 5 | 82.4% | join is good; duplicate-label and degraded-session cases are still thin |
+| `internal/report` | 5 | 91.9% | golden and boundary cases landed; the `TotalRun` double count stays pinned by its test |
+| `internal/taskspec` | 14 | 91.0% | strong parser coverage; long-running fuzz smoke is still a nightly job |
+| `internal/triage` | 8 | 84.1% | modes and write failures are covered; the CLI flow is covered in `cmd/loa` |
+| `internal/daemon` | 35 | 79.0% | socket, runs, reconciliation and the scheduler are covered; live Herdr recovery stays manual |
+| `workflows` | 4 | 84.0% | strict parsing and merge policy are covered |
+| `cmd/loa` | 73 CLI tests | 21.1% instrumented | the tests mostly build and run the binary, so child-process coverage is not collected; the direct unit helpers are measured |
+| **total** | **317** | **66.8%** | enough to trust the queue's invariants; the live Herdr transport and soak runs remain manual/nightly |
 
-The 0% for `cmd/loa` is an instrumentation artefact, not absence of tests. The
-CLI has 18 process-level tests in `cmd/loa/main_test.go`. `internal/runner`'s
-missing points are real: `internal/runner/herdr_backend.go` is entirely outside
-the gate because `runner_test.go` sits behind `fakeBackend`.
+The low instrumented number for `cmd/loa` is mostly an instrumentation artefact:
+the CLI has 73 process-level tests, principally in `main_test.go` and
+`daemon_test.go`. Run the child-process coverage collection in §4.11 to see the
+remaining branches; do not read the package figure as those tests being absent.
 
 ## 2. Philosophy and risk-based priorities
 
@@ -76,7 +78,7 @@ the gate because `runner_test.go` sits behind `fakeBackend`.
 | a blocked agent is torn down | the human loses the approval dialog | `TestBlockedAgentIsLeftForTheHuman` (fake backend only) | `Herdr.Prompt` blocked-code test and manual check |
 | success is judged from the agent's summary | false `done`, missing commit | commit-count tests | failure matrix, git edge cases, result truncation |
 | a failed attempt is retried in the same run | burns attempts and starves the queue | store retry-delay test only | runner-level budget/retry test |
-| the CLI parses a flag differently than scripts expect | wrong task changed | 18 CLI tests | full command/flag matrix, env precedence |
+| the CLI parses a flag differently than scripts expect | wrong task changed | 73 CLI tests | full command/flag matrix, env precedence |
 | `report` silently lies about a quiet day | unsupervised week looks normal | 4 report tests | fixed-snapshot golden output and boundary cases |
 | the real Herdr transport drifts on upgrade | run fails or misbehaves | client fixtures + manual checklist | expand fixtures; run backend against scripted Herdr; manual end-to-end |
 
@@ -468,7 +470,7 @@ go tool covdata textfmt -i="$dir" -o=cmd.cov
 ```
 
 Merge with the package profiles using `go tool covdata merge`. This is the only
-way to see which `cmd/loa` branches the 18 process tests actually reach. It uses
+way to see which `cmd/loa` branches the 73 process tests actually reach. It uses
 only the Go toolchain. Keep the normal `go test` fast; run the coverage variant
 in CI or a nightly job, not on every save.
 

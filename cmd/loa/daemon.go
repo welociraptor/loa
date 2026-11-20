@@ -15,58 +15,77 @@ import (
 	"loa/internal/store"
 )
 
+// daemonOptions is the daemon's command line. It is separate from cmdDaemon so
+// the test for the checked-in unit parses the same flag set the process does.
+type daemonOptions struct {
+	status   bool
+	auto     bool
+	idle     time.Duration
+	interval time.Duration
+	daily    int
+	db       string
+	run      runFlags
+}
+
+func newDaemonFlagSet(o *daemonOptions) *flag.FlagSet {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	fs.StringVar(&o.db, "db", defaultDB(), "path to the task database")
+	fs.BoolVar(&o.status, "status", false, "report the running daemon and exit")
+	fs.BoolVar(&o.auto, "auto", false, "start runs when a task is claimable; off by default")
+	fs.DurationVar(&o.idle, "idle", 5*time.Minute, "wait this long after the last settled run before auto-starting another")
+	fs.DurationVar(&o.interval, "interval", time.Minute, "how often auto checks the queue; also the floor for an empty queue")
+	fs.IntVar(&o.daily, "daily", 12, "tasks settled per day, counted from every run; 0 means no daily cap")
+	registerRunFlags(fs, &o.run)
+	return fs
+}
+
+func parseDaemonFlags(args []string) (*daemonOptions, *flag.FlagSet, error) {
+	var o daemonOptions
+	fs := newDaemonFlagSet(&o)
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(positional) > 0 {
+		return nil, nil, fmt.Errorf("daemon: unexpected arguments: %v", positional)
+	}
+	if o.interval <= 0 {
+		return nil, nil, fmt.Errorf("daemon: -interval %s must be positive", o.interval)
+	}
+	if o.idle < 0 {
+		return nil, nil, fmt.Errorf("daemon: -idle %s must not be negative", o.idle)
+	}
+	if o.daily < 0 {
+		return nil, nil, fmt.Errorf("daemon: -daily %d must not be negative", o.daily)
+	}
+	return &o, fs, nil
+}
+
 // cmdDaemon serves the control socket, or asks a running one for its status.
 // The run flags are the daemon's policy: its budget and its check. `loa run`
-// and the tab may narrow that budget for one run, and may choose the base,
-// prompts, model and kind, but a request cannot widen the budget, lengthen a
-// timeout or replace the daemon's check.
+// may narrow that budget for one run, and may choose the base, prompts, model
+// and kind, but a request cannot widen the budget, lengthen a timeout or
+// replace the daemon's check.
 func cmdDaemon(ctx context.Context, args []string) error {
-	var status, auto bool
-	var (
-		idle     time.Duration
-		interval time.Duration
-		daily    int
-	)
-	var flags runFlags
-	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
-	db := fs.String("db", defaultDB(), "path to the task database")
-	fs.BoolVar(&status, "status", false, "report the running daemon and exit")
-	fs.BoolVar(&auto, "auto", false, "start runs when a task is claimable; off by default")
-	fs.DurationVar(&idle, "idle", 5*time.Minute, "wait this long after the last settled run before auto-starting another")
-	fs.DurationVar(&interval, "interval", time.Minute, "how often auto checks the queue; also the floor for an empty queue")
-	fs.IntVar(&daily, "daily", 12, "tasks settled per day, counted from every run; 0 means no daily cap")
-	registerRunFlags(fs, &flags)
-	positional, err := parseFlags(fs, args)
+	o, fs, err := parseDaemonFlags(args)
 	if err != nil {
 		return err
 	}
-	if len(positional) > 0 {
-		return fmt.Errorf("daemon: unexpected arguments: %v", positional)
-	}
-	if interval <= 0 {
-		return fmt.Errorf("daemon: -interval %s must be positive", interval)
-	}
-	if idle < 0 {
-		return fmt.Errorf("daemon: -idle %s must not be negative", idle)
-	}
-	if daily < 0 {
-		return fmt.Errorf("daemon: -daily %d must not be negative", daily)
-	}
 
-	if status {
+	if o.status {
 		if flagWasSet(fs, "db") {
 			return fmt.Errorf("daemon -status: the daemon decides the database; drop -db")
 		}
 		return daemonStatus(ctx)
 	}
 
-	s, err := store.Open(ctx, *db)
+	s, err := store.Open(ctx, o.db)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
 
-	backend, err := newRunnerBackend(flags)
+	backend, err := newRunnerBackend(o.run)
 	if err != nil {
 		return err
 	}
@@ -81,16 +100,16 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		Logger: log.New(os.Stderr, "loa: ", log.LstdFlags),
 		// The daemon is the authority on the queue, so its status names the
 		// database a client would have to agree with.
-		DBPath: *db,
+		DBPath: o.db,
 		Probe: func(ctx context.Context) error {
 			_, err := (&herdr.Client{}).CheckStatus(ctx)
 			return err
 		},
-		Runner:   newRunnerConfig(s, backend, flags, os.Stderr),
-		Auto:     auto,
-		Idle:     idle,
-		Daily:    daily,
-		Interval: interval,
+		Runner:   newRunnerConfig(s, backend, o.run, os.Stderr),
+		Auto:     o.auto,
+		Idle:     o.idle,
+		Daily:    o.daily,
+		Interval: o.interval,
 	})
 }
 
@@ -171,7 +190,15 @@ func daemonStatus(ctx context.Context) error {
 	if db == "" {
 		db = "(not reported)"
 	}
-	fmt.Printf("pid %d, up %s, protocol %d, paused %t, db %s, %s\n",
-		status.PID, status.Uptime, status.Protocol, status.Paused, db, run)
+	auto := "auto off"
+	if status.Auto {
+		daily := fmt.Sprintf("daily %d", status.Daily)
+		if status.Daily <= 0 {
+			daily = "no daily cap"
+		}
+		auto = fmt.Sprintf("auto on (interval %s, %s)", status.Interval, daily)
+	}
+	fmt.Printf("pid %d, up %s, protocol %d, paused %t, %s, db %s, %s\n",
+		status.PID, status.Uptime, status.Protocol, status.Paused, auto, db, run)
 	return nil
 }

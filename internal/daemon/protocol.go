@@ -121,12 +121,15 @@ type Response struct {
 
 // Status is what the daemon knows about itself.
 type Status struct {
-	PID      int        `json:"pid"`
-	Uptime   string     `json:"uptime"`
-	Protocol int        `json:"protocol"`
-	Paused   bool       `json:"paused"`
-	DB       string     `json:"db,omitempty"`
-	Run      *ActiveRun `json:"run,omitempty"`
+	PID      int           `json:"pid"`
+	Uptime   string        `json:"uptime"`
+	Protocol int           `json:"protocol"`
+	Paused   bool          `json:"paused"`
+	Auto     bool          `json:"auto"`
+	Interval time.Duration `json:"interval"`
+	Daily    int           `json:"daily"`
+	DB       string        `json:"db,omitempty"`
+	Run      *ActiveRun    `json:"run,omitempty"`
 }
 
 // ActiveRun is the active run's identity, enough to tell two daemons apart in a

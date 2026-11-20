@@ -148,7 +148,8 @@ narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
 `-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
 timeout or ttl, a wider budget, or a different `-check` when the daemon has one
 is refused before a run starts. `Ctrl-C` on `loa run` sends the same stop request
-as `loa stop`; the daemon owns the run's cleanup either way. The daemon probes
+as `loa stop`; a second Ctrl-C kills the client if the run is wedged, and the
+daemon owns the run's cleanup either way. The daemon probes
 `herdr status` once at start
 and logs the result. Automatic runs are gated on the probe: every `-auto` tick
 probes again, and a failed probe skips that tick and is retried at the next
@@ -206,7 +207,8 @@ set and absolute (the unit supplies `%t`). The control socket is Linux-only: on
 any other platform `loa daemon` refuses to start. `loa run`, `loa stop`, `loa
 pause`, `loa resume` and `loa daemon -status` are clients. One daemon per runtime
 directory holds an exclusive lock; `loa daemon -status` prints its pid, uptime,
-pause state and active run, or exits non-zero.
+pause and auto state (with interval and daily cap), and active run, or exits
+non-zero.
 
 `loa stop` interrupts the run in flight; a stop that arrives before the run
 registers is remembered, and with no run to stop the daemon refuses instead of
