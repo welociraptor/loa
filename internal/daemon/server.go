@@ -367,10 +367,11 @@ func (s *Server) handleLine(ctx context.Context, line []byte) (Response, bool) {
 }
 
 // reconcileStart repairs what a dead daemon left behind before the socket
-// accepts work. The runtime lock proves no other daemon is live, so an open run
-// row belongs to a process that is gone and can be settled without waiting for
-// a person to run `loa runs -close`. Workspaces are then reconciled the same
-// way a run does it: leases, not the run row, decide what is still held.
+// accepts work. The runtime lock only proves that no daemon uses this runtime
+// directory, so an active run is settled only when its recorded owner is
+// provably gone; a live owner keeps the row until a person closes it. Workspaces
+// are then reconciled the same way a run does it: leases, not the run row,
+// decide what is still held.
 func (s *Server) reconcileStart(ctx context.Context) {
 	if s.runner.Store == nil {
 		return
@@ -381,10 +382,14 @@ func (s *Server) reconcileStart(ctx context.Context) {
 		return
 	}
 	if active != nil {
-		if err := s.runner.Store.SettleRun(ctx, active.ID); err != nil {
+		gone, why := runOwnerGone(active.Owner)
+		if !gone {
+			s.logf("daemon: reconcile: leaving run %d (%s): %s; close it with `loa runs -close %d` if it is not working",
+				active.ID, active.Owner, why, active.ID)
+		} else if err := s.runner.Store.SettleRun(ctx, active.ID); err != nil {
 			s.logf("daemon: reconcile: settle run %d: %v", active.ID, err)
 		} else {
-			s.logf("daemon: reconcile: settled dead run %d (%s)", active.ID, active.Owner)
+			s.logf("daemon: reconcile: settled dead run %d (%s): %s", active.ID, active.Owner, why)
 		}
 	}
 	if s.runner.Backend == nil {
