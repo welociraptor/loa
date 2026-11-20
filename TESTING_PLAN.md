@@ -6,9 +6,8 @@ the gaps. It is deliberately specific to the packages and invariants in this
 repository, not a generic Go testing checklist.
 
 The guiding rule is that a test exists to protect a claim. Every sentence in
-`README.md` about leases, scopes, dispatch, judgement, reconciliation, reports
-or the dashboard should either have a test behind it or be listed here as a
-manual check.
+`README.md` about leases, scopes, dispatch, judgement, reconciliation or reports
+should either have a test behind it or be listed here as a manual check.
 
 ## 1. Baseline
 
@@ -34,9 +33,8 @@ not force it off.
 | `internal/report` | 4 | 88.5% | happy path and window are good; no golden output, no boundary/rounding/double-count cases |
 | `internal/taskspec` | 6 | 92.4% | strongest package; parser edge cases and fuzzing are missing |
 | `internal/triage` | 5 | 80.6% | file formats covered; modes, collisions, write failures and the CLI flow are not |
-| `internal/dash` | 8 | 76.2% | keys and selection partly covered; no view golden, no windowing/orphan/degraded-session cases |
-| `cmd/loa` | 18 CLI tests | **0% instrumented** | the tests build and run the binary, so child-process coverage is not collected; `run`, `dash`, `triage`, flag precedence and most argument validation are untested |
-| **total** | **101** | **54.3%** | enough to trust the happy path, not enough to trust a week unattended |
+| `cmd/loa` | 18 CLI tests | **0% instrumented** | the tests build and run the binary, so child-process coverage is not collected; `run`, `triage`, flag precedence and most argument validation are untested |
+| **total** | **93** | **54.3%** | enough to trust the happy path, not enough to trust a week unattended |
 
 The 0% for `cmd/loa` is an instrumentation artefact, not absence of tests. The
 CLI has 18 process-level tests in `cmd/loa/main_test.go`. `internal/runner`'s
@@ -51,8 +49,8 @@ the gate because `runner_test.go` sits behind `fakeBackend`.
    is the contract. Tests should call `Store` methods and assert database state,
    not assume the runner happens to call things in a safe order.
 2. **The fake is a seam, not a simulation of Herdr.** `runner.Backend`,
-   `live.Session`, `dash.Controls` and the recorded `herdr` CLI fixtures already
-   let logic run without a session. Do not build a fake Herdr server.
+   `live.Session` and the recorded `herdr` CLI fixtures already let logic run
+   without a session. Do not build a fake Herdr server.
 3. **Determinism is part of correctness.** Use `t.TempDir()`, fixed timestamps
    where the code accepts them, and no wall-clock sleeps except where the test
    is specifically measuring time. Every test must pass offline, with no
@@ -60,7 +58,7 @@ the gate because `runner_test.go` sits behind `fakeBackend`.
 4. **One dependency is still the rule.** Fuzz tests, golden files, temp
    directories and process execution use the standard library. Do not add
    `testify`, `go-cmp`, `teatest` or a SQLite helper module. The existing
-   `modernc.org/sqlite` and `bubbletea` are the only non-test dependencies.
+   `modernc.org/sqlite` is the only non-test dependency.
 5. **Coverage is a map, not a target.** Do not add assertions that only execute
    lines. Raise coverage where an uncovered branch corresponds to a user-visible
    failure; leave trivial getters alone.
@@ -80,7 +78,6 @@ the gate because `runner_test.go` sits behind `fakeBackend`.
 | a failed attempt is retried in the same run | burns attempts and starves the queue | store retry-delay test only | runner-level budget/retry test |
 | the CLI parses a flag differently than scripts expect | wrong task changed | 18 CLI tests | full command/flag matrix, env precedence |
 | `report` silently lies about a quiet day | unsupervised week looks normal | 4 report tests | fixed-snapshot golden output and boundary cases |
-| a dashboard key acts on the wrong row | destructive close/resolve | model tests | golden view, orphan/windowing cases, manual TUI checklist |
 | the real Herdr transport drifts on upgrade | run fails or misbehaves | client fixtures + manual checklist | expand fixtures; run backend against scripted Herdr; manual end-to-end |
 
 ### Priority order
@@ -90,7 +87,7 @@ the gate because `runner_test.go` sits behind `fakeBackend`.
   cleanup, success judgement.
 - **P1** — contract regressions that make the tool lie or break scripts: CLI
   flags/output, `ps`/`report`/prompt goldens, parser edge cases.
-- **P2** — operability: dashboard view and actions, triage file handling.
+- **P2** — operability: triage file handling.
 - **P3** — confidence and durability: race/shuffle/soak, fuzzing, coverage
   collection, testability seams that P0/P1 tests actually need.
 
@@ -181,10 +178,6 @@ the retry-once path with a fake that succeeds on the second call (about 500 ms),
 or introduce a `retryDelay` field alongside `ReadyTimeout` so the test can set
 10 ms. Prefer the seam if the retry tests become a CI delay.
 
-`dash.tick()` sleeps for one second by design. Model tests must not execute the
-tick command; assert that `Update(tickMsg)` returns non-nil commands, and call
-only the refresh command directly.
-
 ## 4. Per-package strategy
 
 ### 4.1 `internal/store` (P0)
@@ -244,7 +237,7 @@ Do not edit shipped migration files. A new migration adds a case to
 ### 4.3 `internal/herdr` (P0 for transport, P1 for completeness)
 
 `labels.go` is fully covered; leave it. The client needs the commands that the
-runner and dashboard actually call:
+runner actually calls:
 
 | test | case |
 |---|---|
@@ -418,32 +411,7 @@ behaviour. The test is the place to make that decision.
 | `TestSaveMkdirFailure` | a file where the directory should be → error |
 | `TestPromptGolden` | fixed queue path → `testdata/triage-prompt.golden`; the prompt names `proposal.json`, forbids `bash`, and forbids rewriting existing tasks |
 
-### 4.10 `internal/dash` (P2)
-
-The model is already testable without a terminal through `Update` and
-`SnapshotMsg`. Add output goldens and the untested key guards:
-
-| test | case |
-|---|---|
-| `TestViewGolden80x24` / `TestViewGolden200x50` | fixed literal rows (leased with agent, blocked, new, orphan), fixed cursor; no styling beyond padding; compare with `testdata/dash-80x24.golden` and `dash-200x50.golden` |
-| `TestViewWindowsAroundCursor` | 30 rows, height 10, cursor 0/20/29: `first` is 0 or `cursor-visible+1`; header and footer survive |
-| `TestViewPromptAndMessages` | done prompt, fail prompt, action error, run error, unavailable session |
-| `TestTickAndRefreshCommands` | `Update(tickMsg)` returns non-nil batch; `refresh()` returns a `SnapshotMsg` with `Err == nil` for a readable store. Do not execute the tick command |
-| `TestSnapshotErrorKeepsRows` | `SnapshotMsg{Err: ...}` sets the message and leaves the last rows |
-| `TestActionSuccessRefreshes` | `actionMsg` success/error sets the message and returns a refresh command |
-| `TestRunDoneClearsRunning` | `runDoneMsg` resets `running` and `cancel`, shows error or "run finished" |
-| `TestKeyGuards` | `x` with no agent, `c` with no workspace, `d/f` on leased, `u` on non-blocked, `enter` with no rows → no command and no mutation |
-| `TestPromptBackspaceAndMultiRune` | backspace on empty stays empty; a multi-rune key appends the whole rune slice; `esc` cancels; `enter` without a selection does nothing |
-| `TestQuitCancelsARun` | running with a cancel function → cancel called and `tea.Quit` returned; `S` cancels; `s` when `cancel == nil` does not panic |
-| `TestSelectedIDWithoutRows` | returns 0 |
-| `TestPadAndTruncate` | short, exact, long; width `<45` still yields a sensible title; unicode ellipsis not split |
-| `TestControlsCalls` | existing key tests extend to `c`, `d` success, `u` refusal, `s`/`S`; fake controls records exact row IDs/workspace/agent |
-
-The golden view is plain text. Do not add `lipgloss` or a snapshot library. A
-helper should read the file, trim only the final newline, and on failure show a
-line-by-line diff.
-
-### 4.11 `cmd/loa` (P0/P1)
+### 4.10 `cmd/loa` (P0/P1)
 
 The existing subprocess harness is the right shape. Improve it before adding
 cases:
@@ -452,9 +420,9 @@ cases:
   the repository;
 - keep the environment scrub (`HERDR_`, `LOA_DB`, `PATH`), but add a `runEnv`
   variant that prepends a temp fake-Herdr directory to a `PATH` containing
-  `git`, for `run`/`triage`/`dash` session tests;
+  `git`, for `run`/`triage` session tests;
 - set `XDG_STATE_HOME` to a temp directory for every test, so
-  `defaultProposalDir`, `dash.log` and triage never touch `$HOME`;
+  `defaultProposalDir` and triage never touch `$HOME`;
 - build once in `TestMain` as today; do not add a second binary.
 
 Command matrix (each row is a test or a table case):
@@ -471,7 +439,6 @@ Command matrix (each row is a test or a table case):
 | `report` | `-since 0h`, negative, `24h`, `2026-01-01`, `tuesday`; `-json` shape; unavailable session line; empty queue gap |
 | `import` | stdin `-`; empty stdin; missing file; `-dry-run` with notes; unknown field; cycle; missing `after`; reprioritise nonexistent → nothing created; two positional files → exit 1 |
 | `run` | outside a Herdr pane → exit 1 and the exact message; fake Herdr with empty queue → exit 0, reconcile ran, no tasks; incompatible status fixture → exit 1 before any lease; `-ttl` <= `-timeout` → exit 1 |
-| `dash` | outside a Herdr pane → exit 1 before entering the TUI; if `dash.log` is created first, that is a side effect worth pinning; a real TUI is manual |
 | `triage` | outside a Herdr pane → exit 1; with a scripted fake Herdr, a proposal file is written, saved under the temp state dir, and the queue is unchanged; blocked-prompt path names the workspace/pane |
 | root | `-h`, `--help`, `help`, unknown command → exit 2 for unknown, 0 for help, no args → 2 |
 
@@ -482,17 +449,14 @@ subprocess cannot cover them: `parseSince` (table), `taskID` (table),
 defaults, and the `allowlist` contents (a change to the tool allowlist is a
 security change).
 
-For `controls` and `buildRunner`, use the fake Herdr script and test:
+For `buildRunner`, use the fake Herdr script and test:
 
 - `buildRunner` rejects no session **before** `CheckStatus`;
 - `buildRunner` rejects a stopped/incompatible server;
 - the agent args contain `--no-session --tools read,edit,write,bash,grep,find,ls`
   and only add `--model` when set;
-- `Focus` with no agent falls back to workspace, and with neither returns
-  "never been dispatched";
-- `RemoveWorkspace` calls `worktree remove`, not `workspace close`.
 
-### 4.12 Coverage collection for the CLI
+### 4.11 Coverage collection for the CLI
 
 The existing `TestMain` builds with `go build`. To collect child-process
 coverage, add a **separate** test mode (do not complicate normal runs):
@@ -534,8 +498,7 @@ Use golden files for stable, human-facing contracts:
 - `internal/store/testdata/schema.golden` — `sqlite_master`;
 - `internal/runner/testdata/prompt.golden` — worker contract;
 - `internal/triage/testdata/queue.json.golden`, `triage-prompt.golden`;
-- `internal/report/testdata/report.golden`, `report.json.golden`;
-- `internal/dash/testdata/dash-80x24.golden`, `dash-200x50.golden`.
+- `internal/report/testdata/report.golden`, `report.json.golden`.
 
 Convention: a single `golden(t, name, got)` helper in each package (or a small
 test-only helper package if duplication becomes real) that reads the file and
@@ -570,7 +533,6 @@ protocol note in `testdata/README.md`.
 | migration races | concurrent `store.Open` on a fresh file (see §4.2); assert one schema, no error |
 | wall clock in store | `Lease` already accepts `now`; add the `now` seam for `Complete`/`Fail`/`Resolve`/`Unblock` when a test needs exact `not_before`/`run_ms`. Until then, measure from `time.Now()` as `TestFailRequeuesUntilAttemptsAreSpent` does, and comment why |
 | one-second timestamp resolution | `run_ms` tests sleep >1 s and assert a lower bound, not an exact value; never assert exact milliseconds |
-| dashboard tick | never execute `tick()` in tests; call `refresh()` directly and inspect the returned message |
 | runner retries | prefer a configurable retry delay over waiting 500 ms; otherwise assert calls, not elapsed time |
 | git worktree operations | `t.TempDir()`, one repo per case; configure `user.name`, `user.email`, `commit.gpgsign=false`; serialise worktree creation in a fake with a mutex (already done) |
 | environment | CLI tests scrub `HERDR_*`, `LOA_DB`, `PATH`; session tests opt in explicitly via `runEnv`; `t.Setenv` never in parallel |
@@ -582,7 +544,7 @@ Soak commands (nightly or pre-release, not every save):
 
 ```sh
 go test -race -shuffle=on -count=20 ./internal/store ./internal/runner
-go test -race -shuffle=on -count=5 ./internal/herdr ./internal/live ./internal/dash
+go test -race -shuffle=on -count=5 ./internal/herdr ./internal/live
 ```
 
 ## 7. CLI integration harness
@@ -612,14 +574,14 @@ Extend it carefully:
 - **No network and no real Herdr.** The fake handles `status`, `workspace list`,
   `worktree create`, `agent start`, `agent prompt`, `agent read`,
   `worktree remove`, `workspace close`, `agent focus` and `send-keys`.
-- **Test the child process's coverage separately** (§4.12), not in normal runs.
+- **Test the child process's coverage separately** (§4.11), not in normal runs.
 - **Run each CLI command from a temp working directory** so default `./loa.db`
   and relative proposal paths are tested without polluting the repo.
 
-Concrete new CLI tests are listed in §4.11. The highest-value ones are
-`TestRunRefusesOutsideHerdr`, `TestRunWithEmptyQueueReconcilesAndExits`,
-`TestRunRejectsIncompatibleHerdr`, and `TestDashRefusesOutsideHerdr`, because
-those commands currently have no process-level coverage at all.
+Concrete new CLI tests are listed in §4.10. The highest-value ones are
+`TestRunRefusesOutsideHerdr`, `TestRunWithEmptyQueueReconcilesAndExits` and
+`TestRunRejectsIncompatibleHerdr`, because that command currently has no
+process-level coverage at all.
 
 ## 8. Migration tests (expanded)
 
@@ -659,33 +621,10 @@ Prompt injection, network access and reads outside the worktree are design
 limits documented in `README.md`; do not write tests that pretend to prevent
 them.
 
-## 10. Manual and exploratory checks for the TUI and live Herdr
+## 10. Manual and exploratory checks for the live Herdr transport
 
-The sandbox cannot run a terminal or a Herdr session. These checks are required
-after a Herdr upgrade, a bubbletea upgrade, or a change to `dash.go`/`live.go`/
-`runner/herdr_backend.go`.
-
-### Dashboard (in a real Herdr pane)
-
-1. Seed a DB with one leased task with a blocked agent, one blocked task, one
-   new task, and one task whose workspace is closed. Start `loa dash` in the
-   `loa` control workspace.
-2. Verify the header counts, live-first order (leased, blocked, new, done), the
-   `SESSION` column, the orphan row and the key footer.
-3. Press every key and verify the effect in Herdr, not just the message line:
-   `enter` focuses the agent or workspace; `x` interrupts only a working agent;
-   `u` unblocks only a blocked task; `d`/`f` prompt for a one-line result and
-   settle the task; `c` closes the workspace; `s` starts a run and shows
-   `[running]`; `S` stops it; `q` quits and restores the terminal.
-4. Resize the pane to 80x24 and 200x50. Check the row window, title truncation,
-   and that the header/footer never scroll away.
-5. Quit the tab while a run is in flight. The run must finish/stop cleanly and
-   `dash.log` must contain the outcome, with no log text drawn over the tab.
-6. Start a second `loa dash` on the same database in another pane. The queue
-   survives; note that one run per tab is not enforced across processes. Do not
-   report this as a test failure unless the design changes.
-7. Check that no terminal styling is required: the view must be readable with
-   no colour and with a monochrome terminal.
+The sandbox cannot run a Herdr session. These checks are required after a Herdr
+upgrade or a change to `live.go`/`runner/herdr_backend.go`.
 
 ### Live Herdr transport (after every Herdr upgrade)
 
@@ -724,7 +663,7 @@ add checks in this order:
    formatters. `GOLANGCI_LINT_CACHE` must stay in `$TMPDIR` inside the sandbox.
 5. **Coverage:** collect per-package profiles with `-coverpkg=./...`, and merge
    child-process coverage from `cmd/loa` via `GOCOVERDIR`/`go tool covdata`
-   (§4.12). Publish the profile; do not fail the build on a global percentage.
+   (§4.11). Publish the profile; do not fail the build on a global percentage.
    Add a threshold only for a package after its P0 tests land, and only to catch
    a regression, not to chase a number.
 6. **Fuzz smoke:** `go test -run=XXX -fuzz=FuzzParse -fuzztime=10s
@@ -784,9 +723,9 @@ Exit: `internal/runner/herdr_backend.go` is no longer at 0%; a missing label, a
 bad base, a failed agent start and a failed remove each have a test.
 
 **A5. CLI session gate (1 day)**
-Add `run`/`dash`/`triage` refusal tests and the empty-queue `run` flow with a
-fake Herdr, plus the `buildRunner`/`controls` unit tests from §4.11.
-Exit: `loa run` and `loa dash` cannot start without a compatible session, and
+Add `run`/`triage` refusal tests and the empty-queue `run` flow with a fake
+Herdr, plus the `buildRunner` unit tests from §4.10.
+Exit: `loa run` and `loa triage` cannot start without a compatible session, and
 `run` with an empty queue returns 0 after reconciliation.
 
 ### Phase B — P1: stop the tool from lying
@@ -815,26 +754,20 @@ Add `FuzzParse`, `FuzzValidate` and the shape/precedence/cycle tables from §4.8
 Exit: 10-second fuzz runs are clean; every rejection has a named reason.
 
 **B5. CLI breadth (1–2 days)**
-Fill the command matrix in §4.11, including stdin import, env precedence,
+Fill the command matrix in §4.10, including stdin import, env precedence,
 `parseSince`, `taskID`, `Xdg` state dirs and exit codes.
 Exit: every command has success, usage and operational-failure tests; the
 harness runs from a temp cwd with a scrubbed environment.
 
 ### Phase C — P2: operability
 
-**C1. Dashboard model and goldens (1–2 days)**
-Add the 80x24/200x50 view goldens, windowing, prompt/backspace, key guards,
-quit/cancel, tick/refresh and empty-selection cases from §4.10.
-Exit: every key in the footer has a test for its guard and its action; the
-rendered view is stable at two sizes.
-
-**C2. Triage file handling (1 day)**
+**C1. Triage file handling (1 day)**
 Add modes, write failures, same-second collision, JSON/prompt goldens and the
 `Read` valid/invalid table from §4.9.
 Exit: triage cannot silently lose a proposal without a test pinning the
 behaviour, and every file it writes has an asserted mode.
 
-**C3. Manual scripts (half day)**
+**C2. Manual scripts (half day)**
 Turn §10 into a short checklist in `QUICKSTART.md` or keep it here; record the
 Herdr version/protocol and the commands used. Do not automate a live session.
 Exit: a Herdr upgrade has a repeatable manual checklist and captured fixtures.

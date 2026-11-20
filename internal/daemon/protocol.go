@@ -150,7 +150,7 @@ type RunRecord struct {
 }
 
 // TaskRecord is one task's outcome as it crossed the socket. The ids and branch
-// come from the row, which is what the dashboard and the next run will see.
+// come from the row, which is what `ps` and the next run will see.
 type TaskRecord struct {
 	ID          int64  `json:"id"`
 	Done        bool   `json:"done"`

@@ -33,6 +33,7 @@ func seedActiveRun(t *testing.T, s *store.Store, owner string) store.Run {
 
 func deadPID(t *testing.T) int {
 	t.Helper()
+	//nolint:gosec // G702: the test binary's own path, with no caller input.
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start a process to leave dead: %v", err)

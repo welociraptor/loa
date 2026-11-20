@@ -43,7 +43,6 @@ loa cancel ID                      # delete a queued task; refuses leased, done,
 loa unblock ID                     # a blocked task back to the queue, one more attempt
 loa resolve ID [-fail] [-result TEXT] # settle a blocked task by hand, no lease needed
 loa ps     [-json]                 # the queue joined with the live session
-loa dash   [-workers N] [-max N]   # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
 loa runs   [-limit N] [-json] [-close ID] # every run, newest first; -close settles a dead one
 loa triage [-timeout 10m]          # ask an agent to propose work; never applies it
@@ -68,10 +67,10 @@ hole into the queue.
 `LOA_DB` selects the database (default `./loa.db`). Commands that open SQLite
 directly accept `-db PATH`: `add`, `list`, `show`, `cancel`, `ps`, `report`,
 `import`, `triage`, `plan`, `lease`, `unblock`, `resolve`, `done`, `fail`,
-`runs`, `merge`, and `dash` for the queue it draws. `run`, `stop`, `pause`,
-`resume` and `daemon -status` are clients of the daemon and take no `-db`: the
-daemon decides which database they work. `daemon` itself takes `-db` because it
-opens the queue for the whole process.
+`runs` and `merge`. `run`, `stop`, `pause`, `resume` and `daemon -status` are
+clients of the daemon and take no `-db`: the daemon decides which database they
+work. `daemon` itself takes `-db` because it opens the queue for the whole
+process.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses
@@ -84,10 +83,8 @@ show the role, and `show` shows the recorded prompt once a task has run.
 `loa run -prompts DIR` overrides the directory; otherwise it is found by
 walking up from the working directory to the repository root.
 
-Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
-`golang.org/x/term` for raw mode and the tab's window size. Everything else the
-tab draws is plain strings and escapes, so the loop stays testable and the
-dependency list stays at two.
+Dependencies: `modernc.org/sqlite` (pure Go, no cgo). It is the only
+dependency.
 
 ## The runner
 
@@ -167,12 +164,9 @@ The daemon owns the leases and the runs that take them, and every Herdr call a
 run makes: start, prompt, read, interrupt and close. The queue is not behind it:
 `add`, `list`, `show`, `ps`, `report`, `import`, `cancel`, `lease`, `unblock`,
 `resolve`, `done`, `fail`, `runs`, `merge`, `triage` and `plan` open SQLite
-directly and work whether the daemon is up or dead. `ps` and `dash` still read
-the session directly for display, but they start nothing and own nothing.
-`loa daemon -status` reports the database the daemon works. `dash` opens its own
-database to draw, compares the daemon's reported path with it, and when the two
-differ it says so in the message line and refuses `s`/`S` rather than driving a
-queue nobody is looking at.
+directly and work whether the daemon is up or dead. `ps` still reads the
+session directly for display, but it starts nothing and owns nothing. The
+`loa daemon -status` command reports the database the daemon works.
 
 Install the unit and start it:
 
@@ -210,13 +204,15 @@ queue.
 The socket is `$XDG_RUNTIME_DIR/loa/sock`, protocol 1; `XDG_RUNTIME_DIR` must be
 set and absolute (the unit supplies `%t`). The control socket is Linux-only: on
 any other platform `loa daemon` refuses to start. `loa run`, `loa stop`, `loa
-pause`, `loa resume`, `loa daemon -status` and the tab's `s`/`S` are clients. One
-daemon per runtime directory holds an exclusive lock; `loa daemon -status` prints
-its pid, uptime, pause state and active run, or exits non-zero.
+pause`, `loa resume` and `loa daemon -status` are clients. One daemon per runtime
+directory holds an exclusive lock; `loa daemon -status` prints its pid, uptime,
+pause state and active run, or exits non-zero.
 
-`loa stop` interrupts the run in flight; the daemon keeps the run's cleanup and
-settles its row. `loa pause` stops automatic starts without touching a run in
-flight. It is memory, not a file, so restarting the daemon resumes. That is
+`loa stop` interrupts the run in flight; a stop that arrives before the run
+registers is remembered, and with no run to stop the daemon refuses instead of
+reporting a false success. The daemon keeps the run's cleanup and settles its
+row. `loa pause` stops automatic starts without touching a run in flight. It is
+memory, not a file, so restarting the daemon resumes. That is
 deliberate: a brake that survives a restart is a second policy file beside the
 unit.
 
@@ -232,45 +228,6 @@ settled and orphaned workspaces are reconciled before the socket accepts work.
 The attempt's lease lapses on its own. In the meantime, `loa runs -close ID`
 settles the stale row by hand. `Restart=on-failure` is what turns a crash into a
 new daemon rather than a machine quietly doing nothing.
-
-## The tab
-
-`loa dash` is a full-screen view of the queue joined with the session, and
-the place a person starts a run from:
-
-```
-loa  1 running  0 blocked  2 queued
-
-  ID   STATUS   WORKSPACE    SESSION            TITLE
-> 1    leased   nixos        w3 working loa-1-1 wire the report command
-  2    new      nixos        -                  needs a decision on the timer
-  3    new      nixos        -                  bump the flake
-
-enter focus  x interrupt  d/f resolve  u unblock  c close  s/S run  q quit
-```
-
-`enter` jumps to the task's pane (`agent focus`, or `workspace focus` when the
-agent has already exited), `x` interrupts, `u` returns a blocked task to the
-queue, `c` removes its workspace, `d`/`f` resolve it with a one-line result,
-`s`/`S` ask the daemon to start and stop a run, `q` quits. Closing the tab does
-not cancel a run; the run belongs to the daemon. Outside the tab, `loa unblock
-ID` and `loa resolve ID [-fail]` settle a blocked task the same way. It shows
-state and never announces it: Herdr already marks an agent that needs input.
-
-One tab, set up once:
-
-```
-herdr workspace create --cwd "$XDG_STATE_HOME/loa" --label loa
-# then, in that workspace's root pane:
-LOA_DB="$XDG_STATE_HOME/loa/tasks.db" loa dash
-```
-
-Task worktrees are separate linked workspaces under the repository's own
-workspace, so the tab is an index rather than a container.
-
-Runs started from the tab belong to the daemon, so closing the tab does not
-cancel one. The daemon logs to the journal (`journalctl --user -u loa`); the tab
-itself only shows the outcome.
 
 ## Proposals
 

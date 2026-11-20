@@ -58,8 +58,9 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) (runner.Stats, error)
 	return stats, nil
 }
 
-// Stop asks the daemon to interrupt the run in flight. It is a no-op when no
-// run is active, so a tab can always send it.
+// Stop asks the daemon to interrupt the run in flight. A stop that arrives
+// before the run has registered is remembered for that start; with neither, the
+// daemon refuses rather than pretend something stopped.
 func (c *Client) Stop(ctx context.Context) error {
 	return c.control(ctx, "stop")
 }

@@ -31,7 +31,7 @@ until you start a run.
 
 Commands that only read or change the queue (`add`, `list`, `show`, `ps`,
 `report`, `import`, `lease`, `done`, `fail`) work outside Herdr. Commands that
-need a session (`run`, `dash`, `triage`) refuse to start outside a Herdr pane.
+need a session (`run`, `triage`) refuse to start outside a Herdr pane.
 
 ## Install
 
@@ -65,8 +65,8 @@ export LOA_DB="$HOME/.local/state/loa/tasks.db"
 Every command also accepts `-db PATH`, which is useful for a separate queue.
 The file is created owner-only and is safe to inspect with `sqlite3`.
 
-loa's own state (dashboard log, triage proposals) lives in
-`$XDG_STATE_HOME/loa`, usually `~/.local/state/loa`.
+loa's own state (triage proposals) lives in `$XDG_STATE_HOME/loa`, usually
+`~/.local/state/loa`.
 
 ## 1. Give a repository a Herdr workspace
 
@@ -189,30 +189,6 @@ With the queue trusted, run it normally:
 ```sh
 loa run
 ```
-
-Or open the dashboard in a Herdr pane:
-
-```sh
-loa dash
-```
-
-The dashboard shows the queue joined with live session state. It starts nothing
-by itself. Runs started from it write their log to `dash.log` in loa's state
-directory, so they do not draw over the view.
-
-| Key | Action |
-| --- | --- |
-| `j` / `k`, arrows | move |
-| `enter` | focus the task's agent or workspace |
-| `x` | interrupt the agent |
-| `u` | unblock a blocked task |
-| `c` | remove the task's workspace |
-| `d` / `f` | resolve the selected task done / failed |
-| `s` / `S` | start / stop a run |
-| `q` | quit |
-
-`d` and `f` ask for a one-line result. They settle a task a human had to
-answer; they do not require the runner to hold the lease.
 
 ## Watching a queue
 
@@ -357,7 +333,6 @@ to a person. That boundary is policy, not a sandbox.
 | `loa run [flags] [-json]` | Work the queue inside Herdr; `-json` emits machine-readable results. |
 | `loa runs` | List the run record, newest first. |
 | `loa merge ID [-into BRANCH]` | Merge an approved, green review; refuses a dirty checkout, a wrong branch or a conflict. |
-| `loa dash [flags]` | Open the dashboard inside Herdr. |
 | `loa unblock ID` | Return a blocked task to the queue. |
 | `loa resolve ID [-fail] [-result TEXT]` | Settle a non-leased task done, or blocked with `-fail`. |
 | `loa triage [-timeout D] [-model M] [-kind K] [-out DIR]` | Ask an agent for a proposal; never applies it. |
@@ -366,8 +341,8 @@ to a person. That boundary is policy, not a sandbox.
 | `loa done ID [-branch B] [-result TEXT]` | Mark a held lease done. |
 | `loa fail ID [-result TEXT]` | Fail a held lease. |
 
-`loa run` and `loa dash` accept `-workers`, `-max`, `-base`, `-check`, `-timeout`,
-`-ttl`, `-owner`, `-model` and `-kind`. All commands accept `-db PATH`. `loa help`
+`loa run` accepts `-workers`, `-max`, `-base`, `-check`, `-timeout`, `-ttl`,
+`-owner`, `-model` and `-kind`. All commands accept `-db PATH`. `loa help`
 prints the short reference.
 
 ## Limits and safety
@@ -399,8 +374,8 @@ workspaces at source repositories, and review branches before merging them.
 
 **`not inside a Herdr pane`**
 
-Start `loa run`, `loa dash` or `loa triage` from a Herdr pane. Reading commands
-do not need one.
+Start `loa run` or `loa triage` from a Herdr pane. Reading commands do not need
+one.
 
 **`no Herdr workspace is labelled "..."`**
 
@@ -423,11 +398,6 @@ is a budget, so a failure cannot be retried inside the same run.
 
 Find it with `loa ps`, answer it in its pane, then `loa resolve` or `loa unblock`.
 The workspace stays open on purpose.
-
-**The dashboard cannot start a run**
-
-It needs a Herdr pane, like `loa run`. Its run log is `dash.log` in loa's state
-directory.
 
 **Herdr version or protocol mismatch**
 

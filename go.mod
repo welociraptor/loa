@@ -2,10 +2,7 @@ module loa
 
 go 1.27.3
 
-require (
-	golang.org/x/term v0.48.0
-	modernc.org/sqlite v1.62.0
-)
+require modernc.org/sqlite v1.62.0
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect

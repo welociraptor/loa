@@ -70,8 +70,10 @@ type Server struct {
 	mu           sync.Mutex
 	paused       bool
 	run          *ActiveRun
+	starting     bool
 	running      bool
 	runCancel    context.CancelFunc
+	pendingStop  bool
 	shuttingDown bool
 	runWG        sync.WaitGroup
 
@@ -347,7 +349,9 @@ func (s *Server) handleLine(ctx context.Context, line []byte) (Response, bool) {
 		status := s.status()
 		return Response{V: Protocol, OK: true, Status: &status}, false
 	case "stop":
-		s.stop()
+		if !s.stop() {
+			return Response{V: Protocol, OK: false, Error: "no active run"}, false
+		}
 		return Response{V: Protocol, OK: true}, false
 	case "run":
 		return s.runRequest(ctx, req.Run), false
@@ -412,6 +416,9 @@ func (s *Server) shutdown() {
 	s.mu.Lock()
 	s.shuttingDown = true
 	cancel := s.runCancel
+	if cancel == nil && s.starting {
+		s.pendingStop = true
+	}
 	s.mu.Unlock()
 
 	if cancel != nil {
@@ -429,13 +436,21 @@ func (s *Server) shutdown() {
 	}
 }
 
-func (s *Server) stop() {
+// stop asks the run in flight to stop. A start that has been accepted but has
+// not installed its cancel function yet cannot be cancelled directly, so the
+// stop is recorded for it; without either, there is nothing to stop.
+func (s *Server) stop() bool {
 	s.mu.Lock()
-	cancel := s.runCancel
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer s.mu.Unlock()
+	if s.runCancel != nil {
+		s.runCancel()
+		return true
 	}
+	if s.starting {
+		s.pendingStop = true
+		return true
+	}
+	return false
 }
 
 // runRequest starts one run with the daemon's policy, clamped to what the
@@ -462,7 +477,7 @@ func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Respons
 		s.mu.Unlock()
 		return Response{V: Protocol, OK: false, Error: "automatic runs are paused"}
 	}
-	if s.running {
+	if s.running || s.starting {
 		active := s.run
 		s.mu.Unlock()
 		if active != nil {
@@ -471,20 +486,56 @@ func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Respons
 		return Response{V: Protocol, OK: false, Error: "a run is already active"}
 	}
 
+	// From here the start is in flight. A stop that lands before runCancel is
+	// installed is recorded rather than lost; shutdown does the same.
+	s.starting = true
+	s.runWG.Add(1)
+	s.mu.Unlock()
+
+	abandon := func() {
+		s.mu.Lock()
+		s.starting = false
+		s.pendingStop = false
+		s.mu.Unlock()
+		s.runWG.Done()
+	}
+
 	cfg, err := opts.Apply(s.runner)
 	if err != nil {
-		s.mu.Unlock()
+		abandon()
 		return Response{V: Protocol, OK: false, Error: err.Error()}
 	}
 	if cfg.Store == nil || cfg.Backend == nil {
-		s.mu.Unlock()
+		abandon()
 		return Response{V: Protocol, OK: false, Error: "runs are not configured"}
 	}
+	cfg.OnStart = func(run store.Run) {
+		s.mu.Lock()
+		s.run = &ActiveRun{ID: run.ID, Owner: run.Owner, StartedAt: run.StartedAt}
+		s.mu.Unlock()
+	}
+	r, err := runner.New(cfg)
+	if err != nil {
+		abandon()
+		return Response{V: Protocol, OK: false, Error: err.Error()}
+	}
+
 	runCtx, cancel := context.WithCancel(ctx)
-	s.running = true
-	s.runCancel = cancel
-	s.runWG.Add(1)
+	s.mu.Lock()
+	stopped := s.pendingStop
+	s.pendingStop = false
+	s.starting = false
+	if !stopped {
+		s.running = true
+		s.runCancel = cancel
+	}
 	s.mu.Unlock()
+
+	if stopped {
+		cancel()
+		s.runWG.Done()
+		return Response{V: Protocol, OK: false, Error: "run stopped"}
+	}
 
 	defer func() {
 		cancel()
@@ -495,16 +546,6 @@ func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Respons
 		s.mu.Unlock()
 		s.runWG.Done()
 	}()
-
-	cfg.OnStart = func(run store.Run) {
-		s.mu.Lock()
-		s.run = &ActiveRun{ID: run.ID, Owner: run.Owner, StartedAt: run.StartedAt}
-		s.mu.Unlock()
-	}
-	r, err := runner.New(cfg)
-	if err != nil {
-		return Response{V: Protocol, OK: false, Error: err.Error()}
-	}
 
 	stats, runErr := r.Run(runCtx)
 	resp := Response{V: Protocol, OK: runErr == nil, Run: resultOf(stats)}

@@ -17,7 +17,7 @@ is something to look at rather than a timeout to interpret.
 
     cmd/loa/main.go                 1399   the CLI: add | list | show | cancel | ps | report
                                            import | triage | plan | lease | unblock | resolve
-                                           done | fail | run | runs | merge | dash | daemon
+                                           done | fail | run | runs | merge | daemon
                                            pause | resume
     cmd/loa/daemon.go                154   the supervisor, its policy flags, and -status
     cmd/loa/merge.go                 232   loa merge: the one deterministic transition
@@ -37,8 +37,6 @@ is something to look at rather than a timeout to interpret.
     internal/runner/git.go            87   commit count, summary, branch delete
     internal/runner/prompt.go        148   render the task, then the contract
     internal/live/live.go            201   queue joined with the session (`ps`)
-    internal/dash/dash.go            437   the tab: model, keys, view (plain strings)
-    internal/dash/run.go             259   raw mode, key decoding, one select loop
     internal/daemon/server.go        643   the socket, the runs, and the scheduler
     internal/daemon/protocol.go      199   versioned NDJSON; client and server types
     internal/report/report.go        221   the day: done, blocked, queued, open, gap
@@ -128,19 +126,13 @@ What it costs, and why the trade still holds:
 
 ## Constraints
 
-- **Two dependencies:** `modernc.org/sqlite` (pure Go, no cgo, static binary)
-  and `golang.org/x/term` for raw mode and the window size. The tab used to
-  carry the TUI framework `bubbletea` and, measured with `go list -deps`,
-  eighteen packages of renderer behind it; step 34 removes them, because what
-  the framework bought here was async commands and a select loop is the same
-  thing with fewer moving parts. The view stays a plain string built by a pure
-  function, so it is testable without a terminal either way.
-- **One binary:** the runner and the dashboard are `loa` subcommands, not
-  separate services, and the dashboard *is* where a run starts.
+- **One dependency:** `modernc.org/sqlite` (pure Go, no cgo, static binary).
+  The tab's terminal dependency went with the tab itself in phase 9.
+- **One binary:** the runner, the daemon and the CLI are `loa` subcommands, not
+  separate services. `loa run` is where a run starts.
 - **One run at a time, enforced by SQL.** A partial unique index on `runs`
-  allows only one active run, so two dashboards, two panes or two processes
-  cannot both spend the budget. The run itself is a row; `loa runs` is the
-  record.
+  allows only one active run, so two clients, two panes or two processes cannot
+  both spend the budget. The run itself is a row; `loa runs` is the record.
 - **The queue is the contract:** every rule above is enforced in SQL, not in Go
   call ordering, so a second process cannot bypass it.
 - **Herdr is the execution substrate.** The runner does not exec agents and
@@ -364,7 +356,12 @@ settled tasks per day. The policy is the unit's `ExecStart`, so turning it on is
 an edit someone reviews. A forgotten day is still possible when the daemon is
 not running; that is what `report`'s gap line and `loa daemon -status` are for.
 
-## Phase 3 — the dashboard (done)
+## Phase 3 — the dashboard (done, later removed)
+
+> **Removed in phase 9.** The tab was deleted rather than maintained: `loa ps`
+> is the read a person needs, its actions are already commands (`run`/`stop`,
+> `unblock`, `resolve`), and the next dashboard will be browser-based. The steps
+> below record what was built and why.
 
 The tab answers one question — what is running, and where is it — and every key
 on it is a call that already exists. Nothing here adds policy to the queue, and
@@ -427,7 +424,7 @@ reconciliation decides what it may close. A task's live state is joined as:
   recorded id whose workspace is gone reads "closed", which is why storing ids
   was worth doing: the alternative was claiming the attempt never ran.
 
-- [x] **20. `loa dash`.** Full screen in one pane. Raw mode and the window
+- [x] **20. The tab.** Full screen in one pane. Raw mode and the window
   size come from `golang.org/x/term`; everything else is plain ANSI. Rows sort
   by what is live first: leased, then blocked, then new by priority, then the
   day's finished work collapsed to a count. Redraw on a one-second tick and
@@ -475,7 +472,7 @@ reconciliation decides what it may close. A task's live state is joined as:
 
 - [x] **23. The tab.** Documented, not coded: create the control workspace once
   (`herdr workspace create --cwd $XDG_STATE_HOME/loa --label loa`),
-  run `loa dash` in its root pane, and leave it open. Task worktrees are
+  run the tab in its root pane, and leave it open. Task worktrees are
   linked worktree workspaces under the repository's own workspace, so the
   dashboard is an index rather than a container — closing a task's workspace
   never touches the tab. `README.md` carries the sequence, and a live check
@@ -845,8 +842,8 @@ the documents say that instead of implying a sandbox.
   one. Test: the documented command line parses, and `nix flake check` is green
   on the tree that ships the unit.
 
-The tab is a client of the daemon, so steps 38–40 assume step 34's plain loop,
-which is now on `main`.
+The tab was removed when the daemon took over the run: `loa run` and `loa stop`
+are clients now, so there was no state left that only the tab could show.
 
 What it costs:
 
@@ -877,11 +874,11 @@ decisions define that mode; each widens the old design deliberately.
   queue is the only coordination channel, and every change is a recorded
   transition rather than a conversation.
 - **The run record is a table, and one active run is SQL.** A run is not a log
-  line or a flag in the dashboard: `runs` stores who started it, its budget,
-  when it ended and what it settled. `loa runs` reads it, and `loa run -json`
-  emits machine-readable results for a coordinator. The single-active-run
-  invariant is the partial unique index `runs_one_active`, so a second process
-  racing to start a run loses in SQLite, not in Go or in the tab.
+  line or a flag in the CLI: `runs` stores who started it, its budget, when it
+  ended and what it settled. `loa runs` reads it, and `loa run -json` emits
+  machine-readable results for a coordinator. The single-active-run invariant is
+  the partial unique index `runs_one_active`, so a second process racing to
+  start a run loses in SQLite, not in Go or in a terminal view.
 - **There is no check command for a coordinator run.** Done still means a
   commit on the task's branch, and `loa run` judges that itself. A coordinator
   may read the result and decide what to queue next, but it cannot mark work
@@ -897,18 +894,16 @@ decisions define that mode; each widens the old design deliberately.
   while it is dead.
 - **No second execution backend.** Herdr is the only way a task runs. A headless
   path would double every failure mode to save one attach.
-- **No web UI.** The dashboard is a pane because the workers are panes; a
-  browser tab would be further from the work than the terminal already is.
-- **No TUI framework, and no styling.** No `bubbletea`, no `bubbles`, no
-  `lipgloss`: the tab is padded strings drawn by our own loop (step 34), which
-  is what keeps it testable and the dependency list at two.
+- **No TUI.** The terminal tab was removed in phase 9; `loa ps` is the read a
+  person needs, and the next dashboard will be browser-based. A TUI is not worth
+  the keys, tests or dependencies beside those commands.
 - **No worktrees created by the runner.** Anything that touches `git worktree`
   belongs in Herdr, where the stale-registration bug is already someone else's.
 - **No agent-to-agent messaging.** Coordination goes through the queue; two
   agents talking is a plan living in a context window, which is what this
   design exists to avoid.
-- **No answering approval dialogs.** A blocked agent is the human's decision,
-  and the dashboard makes it a two-second one.
+- **No answering approval dialogs.** A blocked agent is the human's decision;
+  `loa ps` names it, and `loa unblock` or `loa resolve` settles it.
 - **No LLM scheduler.** Priority, dependency and scope rules are SQL.
 - **No push, and no merge by an agent.** Loa merges an approved branch with one
   deterministic command (step 32); anything without an `approve` verdict and a
@@ -934,20 +929,18 @@ decisions define that mode; each widens the old design deliberately.
   workspaces and lets the lease lapse. `add`, `list`, `show`, `ps`, `report`,
   `import` and `cancel` keep working while it is dead, so the queue is readable
   before it is repaired.
-- **The dashboard is one terminal and one user.** `report-metadata` is
-  display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
   and again before every automatic start (`herdr status`, protocol 22 today) but
   not pinned: an upgrade that changes
   `agent prompt` flags will fail a run before it damages one.
-- **Focus actions need a live session.** `ps` and `dash` still show the queue
-  without Herdr; only the actions that address a pane are disabled.
+- **Focus actions need a live session.** `ps` still shows the queue without
+  Herdr; only the actions that address a pane are disabled.
 - **A stored workspace id can outlive its workspace.** Then the row says
   "closed" rather than pretending it is live — the honest answer, and the reason
   ids are worth storing at all.
 - **Leftover state is possible.** A runner that dies between `worktree create`
   and cleanup leaves a workspace open. Step 15 reconciles that at the next
-  start, so the residue is one tab, not a stuck queue.
+  start, so the residue is one workspace, not a stuck queue.
 - **A blocked task waits for a human indefinitely.** That is the design: the
   run does not answer dialogs, and the lease keeps the task claimed until it
   expires.
@@ -956,8 +949,8 @@ decisions define that mode; each widens the old design deliberately.
 - **Cost is visible only as wall time**, to the second, and not as tokens. It is
   also the attempt's duration, not the model's thinking time — a worker that
   spent three minutes running tests reports three minutes.
-- **One active run, across sessions and dashboards.** The `runs` index refuses
-  a second run sharing the database, so two sessions cannot split the queue.
+- **One active run, across clients and processes.** The `runs` index refuses a
+  second run sharing the database, so two clients cannot split the queue.
   Two separate databases can still be driven independently; nothing joins
   them.
 - **Dependencies order execution, not content.** A task branches from its
@@ -967,6 +960,6 @@ decisions define that mode; each widens the old design deliberately.
   so a chained plan still needs the dependency's branch to survive or a merge
   between runs.
 - **The queue blocks a task after `max_attempts` without notifying anyone.** It
-  is found by `report` (step 24) or by the dashboard's blocked row — both of
-  which require someone to look.
+  is found by `report` (step 24) or by `loa ps` — both of which require someone
+  to look.
 

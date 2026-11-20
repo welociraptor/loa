@@ -476,3 +476,56 @@ func TestRunResponseCarriesTheRunRecord(t *testing.T) {
 		t.Error("status was refused")
 	}
 }
+
+func TestStopWithoutARunIsRefused(t *testing.T) {
+	r := start(t, Config{})
+	defer r.stop(t)
+
+	err := (&Client{Path: r.sock}).Stop(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no active run") {
+		t.Fatalf("stop = %v, want a refusal naming no active run", err)
+	}
+}
+
+func TestStopBeforeTheRunRegistersStopsIt(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	b := newBlockingBackend()
+	addRunTask(t, s)
+	srv := newServer(Config{Runner: runConfig(s, b)})
+
+	// A start has been accepted but has not installed its cancel function.
+	srv.mu.Lock()
+	srv.starting = true
+	srv.mu.Unlock()
+	if !srv.stop() {
+		t.Fatal("stop was refused while a start was in flight")
+	}
+	srv.mu.Lock()
+	pending := srv.pendingStop
+	srv.starting = false
+	srv.mu.Unlock()
+	if !pending {
+		t.Fatal("the stop was not recorded for the in-flight start")
+	}
+
+	resp := srv.runRequest(ctx, &RunOptions{MaxTasks: 1})
+	if resp.OK {
+		t.Fatal("a run started with a stop pending")
+	}
+	if !strings.Contains(resp.Error, "stopped") {
+		t.Errorf("error = %q, want the run reported as stopped", resp.Error)
+	}
+	select {
+	case <-b.started:
+		t.Fatal("the stopped start opened a workspace")
+	default:
+	}
+	runs, err := s.Runs(ctx, 10)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %+v, want none for a stopped start", runs)
+	}
+}

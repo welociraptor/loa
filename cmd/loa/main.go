@@ -19,10 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"golang.org/x/term"
-
 	"loa/internal/daemon"
-	"loa/internal/dash"
 	"loa/internal/herdr"
 	"loa/internal/live"
 	"loa/internal/report"
@@ -56,7 +53,6 @@ usage:
   loa stop                         # stop the run in flight; the daemon settles it
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
-  loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
   loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] [-workers N] [-max N] [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR]
                                    # the control socket; its flags are the run budget and check
                                    # -auto works the queue; pause is in memory, so a restart resumes
@@ -66,7 +62,7 @@ usage:
 
 The commands that open SQLite directly take -db PATH (default $LOA_DB, else
 loa.db): add, list, show, cancel, ps, report, import, triage, plan, lease,
-unblock, resolve, done, fail, runs, merge and dash. run, stop, pause, resume and
+unblock, resolve, done, fail, runs and merge. run, stop, pause, resume and
 daemon -status are clients: the daemon decides which database they work.`
 
 func main() {
@@ -114,8 +110,6 @@ func main() {
 		err = cmdRuns(ctx, os.Args[2:])
 	case "merge":
 		err = cmdMerge(ctx, os.Args[2:])
-	case "dash":
-		err = cmdDash(ctx, os.Args[2:])
 	case "daemon":
 		err = cmdDaemon(ctx, os.Args[2:])
 	case "pause":
@@ -156,26 +150,19 @@ func open(ctx context.Context, name string, args []string, register func(*flag.F
 // semantics depend on which flags a caller actually set rather than on their
 // zero values.
 func openFlags(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, *flag.FlagSet, error) {
-	s, positional, fs, _, err := openFlagsWithDB(ctx, name, args, register)
-	return s, positional, fs, err
-}
-
-// openFlagsWithDB is openFlags plus the database path, for a command that must
-// compare what it draws with what the daemon works.
-func openFlagsWithDB(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, *flag.FlagSet, string, error) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	db := fs.String("db", defaultDB(), "path to the task database")
 	register(fs)
 
 	positional, err := parseFlags(fs, args)
 	if err != nil {
-		return nil, nil, nil, "", err
+		return nil, nil, nil, err
 	}
 	s, err := store.Open(ctx, *db)
 	if err != nil {
-		return nil, nil, nil, "", err
+		return nil, nil, nil, err
 	}
-	return s, positional, fs, *db, nil
+	return s, positional, fs, nil
 }
 
 // parseClientFlags parses the flags of a command that talks to the daemon. It
@@ -472,8 +459,8 @@ type psOrphan struct {
 	Label       string `json:"label"`
 }
 
-// cmdPs is the read the dashboard will sit on: the queue, joined with what the
-// session says is happening to each task right now.
+// cmdPs is the read a person needs: the queue, joined with what the session says
+// is happening to each task right now.
 func cmdPs(ctx context.Context, args []string) error {
 	var asJSON bool
 	s, positional, err := open(ctx, "ps", args, func(fs *flag.FlagSet) {
@@ -989,7 +976,7 @@ func workspaceOf(task *store.Task) string {
 	return task.Workspace
 }
 
-// runFlags is what both `run` and `dash` need to start a run of the queue.
+// runFlags is what `run` and the daemon need to start a run of the queue.
 type runFlags struct {
 	workers    int
 	maxTasks   int
@@ -1284,109 +1271,6 @@ func printRuns(runs []store.Run, asJSON bool) error {
 		}
 	}
 	return w.Flush()
-}
-
-// controls is what the dashboard tab may do. Each method is a call that exists
-// elsewhere; the tab adds no policy of its own.
-type controls struct {
-	client *herdr.Client
-	store  *store.Store
-	runFn  func(ctx context.Context) error
-	stopFn func(ctx context.Context) error
-}
-
-func (c controls) Focus(ctx context.Context, row live.Row) error {
-	if row.AgentName != "" {
-		return c.client.FocusAgent(ctx, row.AgentName)
-	}
-	if row.WorkspaceID != "" {
-		return c.client.FocusWorkspace(ctx, row.WorkspaceID)
-	}
-	return errors.New("nothing to focus: this task has never been dispatched")
-}
-
-func (c controls) Interrupt(ctx context.Context, row live.Row) error {
-	return c.client.SendKeys(ctx, row.AgentName, "ctrl+c")
-}
-
-func (c controls) RemoveWorkspace(ctx context.Context, row live.Row) error {
-	return c.client.RemoveWorktree(ctx, row.WorkspaceID)
-}
-
-func (c controls) Unblock(ctx context.Context, taskID int64) error {
-	return c.store.Unblock(ctx, taskID)
-}
-
-func (c controls) Resolve(ctx context.Context, taskID int64, done bool, result string) error {
-	return c.store.Resolve(ctx, taskID, done, result)
-}
-
-func (c controls) Run(ctx context.Context) error { return c.runFn(ctx) }
-
-func (c controls) Stop(ctx context.Context) error { return c.stopFn(ctx) }
-
-func cmdDash(ctx context.Context, args []string) error {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
-		return errors.New("dash needs a terminal")
-	}
-
-	var flags runFlags
-	s, positional, fs, dbPath, err := openFlagsWithDB(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	if len(positional) > 0 {
-		return fmt.Errorf("unexpected arguments: %v", positional)
-	}
-
-	localDB, err := filepath.Abs(dbPath)
-	if err != nil {
-		return fmt.Errorf("dash: database path: %w", err)
-	}
-
-	path, err := daemon.SocketPath()
-	if err != nil {
-		return err
-	}
-	client := &herdr.Client{}
-	d := &daemon.Client{Path: path}
-	opts := runOptionsFrom(fs, flags)
-
-	// The tab draws one queue; the daemon works another. Ask once which one,
-	// and let the model refuse s/S rather than drive a queue nobody is looking
-	// at. The same answer names the daemon's active run, so the tab can tell its
-	// own row from one a dead process left. A dead daemon has no answer; the run
-	// controls report that on their own.
-	mismatch, daemonOwner := "", ""
-	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	if status, err := d.Status(statusCtx); err == nil {
-		mismatch = dbMismatch(localDB, status.DB)
-		if status.Run != nil {
-			daemonOwner = status.Run.Owner
-		}
-	}
-	cancel()
-
-	c := controls{client: client, store: s}
-	c.runFn = func(ctx context.Context) error {
-		_, err := d.Run(ctx, opts)
-		return err
-	}
-	c.stopFn = func(ctx context.Context) error { return d.Stop(ctx) }
-
-	return dash.Run(ctx, dash.New(s, client, c, mismatch, daemonOwner), os.Stdin, os.Stdout)
-}
-
-// dbMismatch names both databases when the daemon works a different one than
-// the tab draws. An empty daemon path is a daemon that does not say: a client
-// cannot prove a disagreement, so it does not invent one.
-func dbMismatch(local, remote string) string {
-	if local == "" || remote == "" || filepath.Clean(local) == filepath.Clean(remote) {
-		return ""
-	}
-	return fmt.Sprintf("the daemon works %s but this tab draws %s; run and stop are refused", remote, local)
 }
 
 func cmdFinish(ctx context.Context, args []string, done bool) error {
