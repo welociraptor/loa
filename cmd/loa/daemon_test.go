@@ -1,0 +1,274 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+type daemonProc struct {
+	dir    string
+	sock   string
+	cmd    *exec.Cmd
+	stdout bytes.Buffer
+	stderr bytes.Buffer
+	waited bool
+}
+
+// startDaemonIn starts the built binary as a real supervisor would: its own
+// process, its own runtime directory, and no Herdr on PATH.
+func startDaemonIn(t *testing.T, dir string) *daemonProc {
+	t.Helper()
+	p := &daemonProc{
+		dir:  dir,
+		sock: filepath.Join(dir, "loa", "sock"),
+		cmd:  exec.Command(binary, "daemon"),
+	}
+	p.cmd.Env = daemonEnv(dir)
+	p.cmd.Stdout = &p.stdout
+	p.cmd.Stderr = &p.stderr
+	if err := p.cmd.Start(); err != nil {
+		t.Fatalf("start daemon: %v", err)
+	}
+	t.Cleanup(func() {
+		if !p.waited {
+			_ = p.cmd.Process.Kill()
+			_ = p.cmd.Wait()
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		// A stale path is not enough: after SIGKILL the file is still there. Only
+		// a connection proves the new daemon owns the socket.
+		conn, err := net.DialTimeout("unix", p.sock, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon did not accept on %s: %v; stderr:\n%s", p.sock, err, p.stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return p
+}
+
+func daemonEnv(dir string) []string {
+	env := []string{
+		"XDG_RUNTIME_DIR=" + dir,
+		// A directory that exists but has no herdr: the daemon must serve anyway.
+		"PATH=" + filepath.Join(dir, "empty-bin"),
+	}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") || strings.HasPrefix(kv, "PATH=") ||
+			strings.HasPrefix(kv, "HERDR_") || strings.HasPrefix(kv, "LOA_DB=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env
+}
+
+func (p *daemonProc) wait(t *testing.T) int {
+	t.Helper()
+	if p.waited {
+		t.Fatal("daemon waited twice")
+	}
+	err := p.cmd.Wait()
+	p.waited = true
+	if err == nil {
+		return 0
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return exit.ExitCode()
+	}
+	t.Fatalf("wait for daemon: %v", err)
+	return 0
+}
+
+func runDaemonCLI(t *testing.T, env []string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Env = env
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("run %v: %v", args, err)
+		}
+		return out.String(), errOut.String(), exit.ExitCode()
+	}
+	return out.String(), errOut.String(), 0
+}
+
+func TestDaemonStatusAnswersWithoutRunOrHerdr(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+
+	out, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), "daemon", "-status")
+	if code != 0 {
+		t.Fatalf("daemon -status exited %d: %s", code, errOut)
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Errorf("status is not one line: %q", out)
+	}
+	for _, want := range []string{"pid " + strconv.Itoa(p.cmd.Process.Pid), "up ", "protocol 1", "no active run"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status = %q, missing %q", out, want)
+		}
+	}
+
+	dirInfo, err := os.Stat(filepath.Join(p.dir, "loa"))
+	if err != nil {
+		t.Fatalf("runtime dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Errorf("runtime directory mode = %o, want 700", got)
+	}
+	sockInfo, err := os.Stat(p.sock)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	if got := sockInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("socket mode = %o, want 600", got)
+	}
+}
+
+func TestDaemonSecondInstanceRefuses(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+
+	_, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), "daemon")
+	if code != 1 {
+		t.Fatalf("second daemon exited %d, want 1; stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "already running") || !strings.Contains(errOut, strconv.Itoa(p.cmd.Process.Pid)) {
+		t.Errorf("second daemon stderr = %q, want the holder's pid", errOut)
+	}
+	if _, err := (&daemonClient{path: p.sock}).status(); err != nil {
+		t.Errorf("the first daemon stopped answering: %v", err)
+	}
+}
+
+func TestDaemonReclaimsAStaleSocketAfterSigkill(t *testing.T) {
+	dir := t.TempDir()
+	first := startDaemonIn(t, dir)
+	firstPID := first.cmd.Process.Pid
+
+	if err := first.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	_ = first.wait(t)
+
+	// SIGKILL leaves the path behind; the lock does not survive it.
+	if _, err := os.Stat(first.sock); err != nil {
+		t.Fatalf("the killed daemon's socket is gone, so there is nothing to reclaim: %v", err)
+	}
+
+	second := startDaemonIn(t, dir)
+	out, errOut, code := runDaemonCLI(t, daemonEnv(dir), "daemon", "-status")
+	if code != 0 {
+		t.Fatalf("status after reclaim exited %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "pid "+strconv.Itoa(second.cmd.Process.Pid)) {
+		t.Errorf("status = %q, want the new daemon's pid %d (old %d)", out, second.cmd.Process.Pid, firstPID)
+	}
+}
+
+func TestDaemonSigtermRemovesTheSocket(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+
+	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	if code := p.wait(t); code != 0 {
+		t.Fatalf("daemon exited %d after SIGTERM, want 0; stderr:\n%s", code, p.stderr.String())
+	}
+	if _, err := os.Stat(p.sock); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("socket still exists after SIGTERM: %v", err)
+	}
+}
+
+func TestDaemonRefusesAWrongVersionClient(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+
+	conn, err := net.Dial("unix", p.sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte(`{"v":2,"do":"ping"}` + "\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+
+	var resp struct {
+		V     int    `json:"v"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		t.Fatalf("decode refusal: %v", err)
+	}
+	if resp.OK || resp.V != 1 || resp.Error != "protocol 2 is newer than this daemon (1)" {
+		t.Errorf("refusal = %+v", resp)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("the connection stayed open after the version refusal")
+	}
+}
+
+// daemonClient is the small part of the protocol this test needs; the CLI's own
+// client is exercised through `daemon -status`.
+type daemonClient struct {
+	path string
+}
+
+func (c *daemonClient) status() (struct{}, error) {
+	conn, err := net.Dial("unix", c.path)
+	if err != nil {
+		return struct{}{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte(`{"v":1,"do":"status"}` + "\n")); err != nil {
+		return struct{}{}, err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return struct{}{}, err
+	}
+	var resp struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return struct{}{}, err
+	}
+	if !resp.OK {
+		return struct{}{}, fmt.Errorf("status refused")
+	}
+	return struct{}{}, nil
+}
+
+func TestDaemonStatusFailsWithTheReasonWhenNoDaemonRuns(t *testing.T) {
+	dir := t.TempDir()
+	_, errOut, code := runDaemonCLI(t, daemonEnv(dir), "daemon", "-status")
+	if code != 1 {
+		t.Fatalf("daemon -status exited %d, want 1; stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "connect") || !strings.Contains(errOut, "sock") {
+		t.Errorf("stderr = %q, want the connection reason", errOut)
+	}
+}

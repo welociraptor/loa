@@ -52,9 +52,10 @@ usage:
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
+  loa daemon [-status]             # the control socket; -status asks the running one
   loa version                      # the release and commit this binary was built from
 
-all commands except version accept -db PATH (default $LOA_DB, else loa.db)`
+all commands except version and daemon accept -db PATH (default $LOA_DB, else loa.db)`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -101,6 +102,8 @@ func main() {
 		err = cmdMerge(ctx, os.Args[2:])
 	case "dash":
 		err = cmdDash(ctx, os.Args[2:])
+	case "daemon":
+		err = cmdDaemon(ctx, os.Args[2:])
 	case "version":
 		fmt.Println(versionLine())
 	case "-h", "--help", "help":
