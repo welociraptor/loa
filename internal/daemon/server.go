@@ -35,9 +35,10 @@ const (
 
 // Config is what the process supplies to the daemon. PeerCheck is injectable so
 // the refusal of a foreign uid can be tested without a second user. Runner is
-// the daemon's default budget and its backend; a run request may narrow that
-// budget but not replace its store or backend. Auto, Idle, Daily and Interval
-// are the scheduler's policy: they are checked once per interval, not persisted.
+// the daemon's policy: its store, backend, budget and check. A run request may
+// narrow that budget but not replace its store, backend or check. Auto, Idle,
+// Daily and Interval are the scheduler's policy: they are checked once per
+// interval, not persisted.
 type Config struct {
 	Logger    *log.Logger
 	PeerCheck func(*net.UnixConn) error
@@ -405,9 +406,9 @@ func (s *Server) stop() {
 	}
 }
 
-// runRequest starts one run with the daemon's defaults, narrowed by the
-// request. The context is the daemon's, not the connection's: a client that
-// hangs up does not stop the work.
+// runRequest starts one run with the daemon's policy, clamped to what the
+// request may narrow. The context is the daemon's, not the connection's: a
+// client that hangs up does not stop the work.
 func (s *Server) runRequest(ctx context.Context, opts *RunOptions) Response {
 	return s.start(ctx, opts, false)
 }
@@ -438,7 +439,11 @@ func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Respons
 		return Response{V: Protocol, OK: false, Error: "a run is already active"}
 	}
 
-	cfg := opts.Apply(s.runner)
+	cfg, err := opts.Apply(s.runner)
+	if err != nil {
+		s.mu.Unlock()
+		return Response{V: Protocol, OK: false, Error: err.Error()}
+	}
 	if cfg.Store == nil || cfg.Backend == nil {
 		s.mu.Unlock()
 		return Response{V: Protocol, OK: false, Error: "runs are not configured"}

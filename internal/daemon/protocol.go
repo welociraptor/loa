@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"fmt"
 	"time"
 
 	"loa/internal/runner"
@@ -19,14 +20,16 @@ type Request struct {
 	V  int    `json:"v"`
 	Do string `json:"do"`
 	// Run carries this request's overrides. Zero values take the daemon's
-	// configured default; a request can narrow a budget, never the policy that
-	// decides whether a run may start.
+	// configured values; a request may narrow a budget or choose the inputs a
+	// run works from, never widen or replace the daemon's policy.
 	Run *RunOptions `json:"run,omitempty"`
 }
 
-// RunOptions is one run's budget, as a client may override it. The daemon's
-// flags are the defaults, so a client that sets nothing runs the configured
-// policy. Durations are nanoseconds on the wire, like flag.Duration values.
+// RunOptions is the part of one run a client may set. Workers and MaxTasks are
+// clamped to the daemon's; TaskTimeout and LeaseTTL may only lower it; Check
+// may be supplied only when the daemon has none. Base, PromptsDir, Model and
+// Kind are the client's choice. Durations are nanoseconds on the wire, like
+// flag.Duration values.
 type RunOptions struct {
 	Workers     int           `json:"workers,omitempty"`
 	MaxTasks    int           `json:"max_tasks,omitempty"`
@@ -39,18 +42,19 @@ type RunOptions struct {
 	Kind        string        `json:"kind,omitempty"`
 }
 
-// Apply overlays the request's non-zero values on a daemon default. A request
-// may change the budget for its run; it cannot change where the runner stores
-// its work or which store it uses.
-func (o *RunOptions) Apply(cfg runner.Config) runner.Config {
+// Apply clamps the request to the daemon's policy. A request may narrow the
+// budget; it cannot widen it or replace the daemon's check. Zero values keep
+// the daemon's configured value. A refusal names the daemon's value so the
+// client can see the cap it hit.
+func (o *RunOptions) Apply(cfg runner.Config) (runner.Config, error) {
 	if o == nil {
-		return cfg
+		return cfg, nil
 	}
 	if o.Workers > 0 {
-		cfg.Workers = o.Workers
+		cfg.Workers = min(o.Workers, cfg.Workers)
 	}
 	if o.MaxTasks > 0 {
-		cfg.MaxTasks = o.MaxTasks
+		cfg.MaxTasks = min(o.MaxTasks, cfg.MaxTasks)
 	}
 	if o.Base != "" {
 		cfg.Base = o.Base
@@ -59,12 +63,23 @@ func (o *RunOptions) Apply(cfg runner.Config) runner.Config {
 		cfg.PromptsDir = o.PromptsDir
 	}
 	if o.Check != "" {
-		cfg.Check = o.Check
+		if cfg.Check != "" && o.Check != cfg.Check {
+			return cfg, fmt.Errorf("requested -check %q differs from the daemon's -check %q", o.Check, cfg.Check)
+		}
+		if cfg.Check == "" {
+			cfg.Check = o.Check
+		}
 	}
 	if o.TaskTimeout > 0 {
+		if o.TaskTimeout > cfg.TaskTimeout {
+			return cfg, fmt.Errorf("requested -timeout %s exceeds the daemon's -timeout %s", o.TaskTimeout, cfg.TaskTimeout)
+		}
 		cfg.TaskTimeout = o.TaskTimeout
 	}
 	if o.LeaseTTL > 0 {
+		if o.LeaseTTL > cfg.LeaseTTL {
+			return cfg, fmt.Errorf("requested -ttl %s exceeds the daemon's -ttl %s", o.LeaseTTL, cfg.LeaseTTL)
+		}
 		cfg.LeaseTTL = o.LeaseTTL
 	}
 	if h, ok := cfg.Backend.(*runner.Herdr); ok && (o.Model != "" || o.Kind != "") {
@@ -77,7 +92,7 @@ func (o *RunOptions) Apply(cfg runner.Config) runner.Config {
 		}
 		cfg.Backend = &clone
 	}
-	return cfg
+	return cfg, nil
 }
 
 // withModel replaces the agent's --model argument, or adds it. It mirrors the

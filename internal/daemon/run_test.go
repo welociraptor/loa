@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -343,6 +344,94 @@ func TestRunUsesTheDaemonsBudgetUnlessTheRequestNarrowsIt(t *testing.T) {
 	}
 	if len(runs) != 1 || runs[0].Workers != 1 || runs[0].MaxTasks != 1 {
 		t.Fatalf("override run = %+v, want the request's 1/1", runs)
+	}
+}
+
+func TestRunRequestCannotWidenTheDaemonsBudget(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	r := start(t, Config{Runner: runConfig(s, newBlockingBackend())})
+	defer r.stop(t)
+
+	if _, err := (&Client{Path: r.sock}).Run(ctx, RunOptions{Workers: 9, MaxTasks: 9}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	runs, err := s.Runs(ctx, 1)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Workers != 2 || runs[0].MaxTasks != 2 {
+		t.Fatalf("run = %+v, want the daemon's 2/2", runs)
+	}
+}
+
+func TestRunRequestCannotLengthenTimeoutOrTTL(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	cfg := runConfig(s, newBlockingBackend())
+	r := start(t, Config{Runner: cfg})
+	defer r.stop(t)
+	client := &Client{Path: r.sock}
+
+	for _, tc := range []struct {
+		name string
+		opts RunOptions
+		want time.Duration
+	}{
+		{"timeout", RunOptions{TaskTimeout: cfg.TaskTimeout + time.Minute}, cfg.TaskTimeout},
+		{"ttl", RunOptions{LeaseTTL: cfg.LeaseTTL + time.Minute}, cfg.LeaseTTL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.Run(ctx, tc.opts)
+			if err == nil {
+				t.Fatal("an oversized request started a run")
+			}
+			if !strings.Contains(err.Error(), tc.want.String()) {
+				t.Errorf("error = %q, want the daemon's %s", err, tc.want)
+			}
+		})
+	}
+
+	runs, err := s.Runs(ctx, 10)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %+v, want none for refused requests", runs)
+	}
+}
+
+func TestRunRequestCannotReplaceTheDaemonsCheck(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	cfg := runConfig(s, newBlockingBackend())
+	cfg.Check = "make test"
+	r := start(t, Config{Runner: cfg})
+	defer r.stop(t)
+	client := &Client{Path: r.sock}
+
+	_, err := client.Run(ctx, RunOptions{Check: "true"})
+	if err == nil {
+		t.Fatal("a different check was accepted")
+	}
+	if !strings.Contains(err.Error(), cfg.Check) {
+		t.Errorf("error = %q, want the daemon's check %q", err, cfg.Check)
+	}
+
+	// The same check is not a replacement, so it is not refused.
+	if _, err := client.Run(ctx, RunOptions{Check: cfg.Check}); err != nil {
+		t.Fatalf("run with the daemon's check: %v", err)
+	}
+}
+
+func TestRunRequestMaySupplyACheckWhenTheDaemonHasNone(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	r := start(t, Config{Runner: runConfig(s, newBlockingBackend())})
+	defer r.stop(t)
+
+	if _, err := (&Client{Path: r.sock}).Run(ctx, RunOptions{Check: "true"}); err != nil {
+		t.Fatalf("run with a client check: %v", err)
 	}
 }
 

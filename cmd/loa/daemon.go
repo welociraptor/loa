@@ -16,8 +16,10 @@ import (
 )
 
 // cmdDaemon serves the control socket, or asks a running one for its status.
-// The run flags are the one place the daemon's default budget lives; `loa run`
-// and the tab may narrow it for one run, but a run request cannot change it.
+// The run flags are the daemon's policy: its budget and its check. `loa run`
+// and the tab may narrow that budget for one run, and may choose the base,
+// prompts, model and kind, but a request cannot widen the budget, lengthen a
+// timeout or replace the daemon's check.
 func cmdDaemon(ctx context.Context, args []string) error {
 	var status, auto bool
 	var (

@@ -53,8 +53,8 @@ loa merge ID [-into BRANCH]        # merge an approved, green review; never push
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # ask the daemon for a run; flags narrow its policy
-loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] # the supervisor; its flags are the policy
+loa run    -workers 2 -max 5 [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR] [-json] # ask the daemon for a run; budgets only narrow, the daemon's -check wins
+loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] # the supervisor; its flags are the run budget and check
 loa pause                          # stop automatic starts; memory only
 loa resume                         # allow them again
 loa version                        # the release and commit this binary was built from
@@ -140,11 +140,14 @@ Defaults: `HEAD` as the base, and Herdr's own configuration decides where the
 checkout lives — the runner passes no `--path`, and reads the created path back
 from the result.
 
-`loa run` asks the daemon for a run and fails if it cannot reach it. The daemon
-probes `herdr status` at start and logs the result; a protocol or version
-mismatch then shows up as failed attempts rather than as a run that cannot
-start. `triage` and `plan` still require a Herdr pane, because they open a
-workspace for a person to watch.
+`loa run` asks the daemon for a run and fails if it cannot reach it. It may
+narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
+`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
+timeout or ttl, a wider budget, or a different `-check` when the daemon has one
+is refused before a run starts. The daemon probes `herdr status` at start and
+logs the result; a protocol or version mismatch then shows up as failed attempts
+rather than as a run that cannot start. `triage` and `plan` still require a
+Herdr pane, because they open a workspace for a person to watch.
 
 ## The daemon
 
@@ -176,7 +179,11 @@ loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12
 one run's concurrency and budget; `-idle` is the quiet period after the last
 settled run; `-daily` is the number of tasks settled today (done and failed both
 count, and manual runs count too, because the budget is counted from the run
-record). Change the unit, not a config file: a checked-in flag is a reviewed
+record). These flags are the cap, not a default: a client may narrow them but
+cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client may only
+lower; `-check` is the daemon's check, and a client may supply one only when the
+daemon has none. A client may still choose `-base`, `-prompts`, `-model` and
+`-kind`. Change the unit, not a config file: a checked-in flag is a reviewed
 decision, while a file in a hidden directory drifts. `-interval` (default `1m`) is
 how often the queue is checked and the floor for an empty queue.
 

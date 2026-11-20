@@ -49,13 +49,14 @@ usage:
   loa resolve ID [-fail] [-result TEXT]
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
-  loa run    [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR] [-json]
-                                   # ask the daemon for a run; flags narrow its defaults
+  loa run    [-workers N] [-max N] [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR] [-json]
+                                   # ask the daemon for a run; -workers/-max clamp, -timeout/-ttl only shrink
+                                   # -check cannot replace the daemon's; -base/-prompts/-model/-kind are yours
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
-  loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR]
-                                   # the control socket; its flags are the default run budget
+  loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] [-workers N] [-max N] [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR]
+                                   # the control socket; its flags are the run budget and check
                                    # -auto works the queue; pause is in memory, so a restart resumes
   loa pause                        # stop automatic starts; the run in flight is untouched
   loa resume                       # allow automatic starts again
