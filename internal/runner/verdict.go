@@ -28,16 +28,28 @@ func defaultProposalsDir() string {
 	return filepath.Join(home, ".local", "state", "loa", "proposals")
 }
 
-// reviewDiffs returns the change each dependency carries against the base it
-// branched from. The dependency set is the review subject; no separate column
-// is needed to name it.
+// reviewDiff is one dependency's change as it is written to the review file.
+// Diff is the whole change; the prompt gets only Stat.
+type reviewDiff struct {
+	ID     int64
+	Title  string
+	Branch string
+	Base   string
+	Diff   string
+	Stat   string
+}
+
+// reviewDiffs returns a summary of the change each dependency carries against
+// the base it branched from, and writes the full diffs to the review worktree.
+// The dependency set is the review subject; no separate column is needed to
+// name it.
 func (r *Runner) reviewDiffs(ctx context.Context, task *store.Task, handle Handle, logf func(string, ...any)) ([]promptDiff, error) {
 	deps, err := r.cfg.Store.Deps(ctx, task.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	diffs := make([]promptDiff, 0, len(deps))
+	diffs := make([]reviewDiff, 0, len(deps))
 	for _, dep := range deps {
 		got, err := r.cfg.Store.Get(ctx, dep.ID)
 		if err != nil {
@@ -70,11 +82,46 @@ func (r *Runner) reviewDiffs(ctx context.Context, task *store.Task, handle Handl
 		if strings.TrimSpace(diff) == "" {
 			continue
 		}
-		diffs = append(diffs, promptDiff{
-			ID: got.ID, Title: got.Title, Branch: got.Branch, Base: base, Diff: diff,
+		stat, err := diffStat(ctx, handle.Repo, base, got.Branch)
+		if err != nil {
+			return nil, fmt.Errorf("diff stat #%d %s against %s: %w", got.ID, got.Branch, base, err)
+		}
+		diffs = append(diffs, reviewDiff{
+			ID: got.ID, Title: got.Title, Branch: got.Branch, Base: base, Diff: diff, Stat: stat,
 		})
 	}
-	return diffs, nil
+	if len(diffs) == 0 {
+		return nil, nil
+	}
+	if err := writeReviewDiff(handle.Worktree, diffs); err != nil {
+		return nil, err
+	}
+
+	summaries := make([]promptDiff, len(diffs))
+	for i, d := range diffs {
+		summaries[i] = promptDiff{ID: d.ID, Title: d.Title, Branch: d.Branch, Base: d.Base, Stat: d.Stat}
+	}
+	return summaries, nil
+}
+
+// writeReviewDiff puts the whole review subject in the worktree, so the prompt
+// can name the file instead of carrying it. The reviewer's read tool has no
+// argument limit.
+func writeReviewDiff(worktree string, diffs []reviewDiff) error {
+	var b strings.Builder
+	for _, d := range diffs {
+		fmt.Fprintf(&b, "### Task #%d: %s\n\nBranch `%s` from `%s`:\n\n%s\n\n",
+			d.ID, d.Title, d.Branch, d.Base, d.Diff)
+	}
+
+	path := filepath.Join(worktree, reviewDiffFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("write %s: %w", reviewDiffFile, err)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", reviewDiffFile, err)
+	}
+	return nil
 }
 
 // finishReview is the reviewer's judgement: a verdict document, not a commit.

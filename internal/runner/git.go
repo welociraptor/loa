@@ -40,6 +40,12 @@ func diffBetween(ctx context.Context, repoPath, base, branch string) (string, er
 	return gitOutput(ctx, repoPath, "diff", "--no-color", base+"..."+branch)
 }
 
+// diffStat is the per-dependency summary the prompt carries. The full change
+// goes to the review file instead.
+func diffStat(ctx context.Context, repoPath, base, branch string) (string, error) {
+	return gitOutput(ctx, repoPath, "diff", "--no-color", "--stat", base+"..."+branch)
+}
+
 // refResolves reports whether ref names a commit. Any failure reads as "no":
 // a branch tidied away after its merge and a repository that cannot answer are
 // the same cue to fall back to a base that will be diffed next.

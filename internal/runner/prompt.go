@@ -23,13 +23,20 @@ type promptFields struct {
 	Diffs    []promptDiff
 }
 
-// promptDiff is one dependency's change, the subject of a review.
+// reviewDiffFile is where the review subject is kept. It is a file in the
+// review worktree rather than prompt text, so the prompt stays small however
+// large the change is; the backend hands the prompt to the agent as one
+// argument, and an argument has a platform limit.
+const reviewDiffFile = ".loa/review.diff"
+
+// promptDiff is one dependency's change as the prompt describes it. The diff
+// itself is in reviewDiffFile; the prompt carries only the summary.
 type promptDiff struct {
 	ID     int64
 	Title  string
 	Branch string
 	Base   string
-	Diff   string
+	Stat   string
 }
 
 // fieldsFor is the one place task and attempt state become template data.
@@ -87,9 +94,10 @@ func taskPromptFor(task *store.Task, spec roleSpec, name string, source []byte, 
 	return rendered + "\n\n" + contractFor(task, spec), nil
 }
 
-// diffSection is the change the reviewer is asked about, not a summary it has
-// to reconstruct. An empty section is omitted; the caller has already refused a
-// review with nothing to look at.
+// diffSection names the change the reviewer is asked about and summarises
+// each dependency. The full diff is in the worktree file, not here: a prompt
+// carrying a large change would exceed the argument limit before the backend
+// ever saw it.
 func diffSection(diffs []promptDiff) string {
 	if len(diffs) == 0 {
 		return ""
@@ -97,9 +105,10 @@ func diffSection(diffs []promptDiff) string {
 
 	var b strings.Builder
 	b.WriteString("## The change under review\n\n")
+	fmt.Fprintf(&b, "The full diff is in `%s` in this worktree. Read it before deciding.\n\n", reviewDiffFile)
 	for _, d := range diffs {
-		fmt.Fprintf(&b, "### Task #%d: %s\n\nBranch `%s` from `%s`:\n\n```diff\n%s\n```\n\n",
-			d.ID, d.Title, d.Branch, d.Base, d.Diff)
+		fmt.Fprintf(&b, "### Task #%d: %s\n\nBranch `%s` from `%s`:\n\n```\n%s\n```\n\n",
+			d.ID, d.Title, d.Branch, d.Base, d.Stat)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

@@ -330,8 +330,11 @@ policy.
 ## Reviews
 
 A task whose role is `review` has a verdict as its deliverable, not a commit.
-The runner hands it the diffs of the tasks it depends on — that dependency set
-is the review subject — and reads `.loa/verdict.json` from its worktree:
+The runner writes the full diff of each task it depends on — that dependency
+set is the review subject — to `.loa/review.diff` in the review worktree, and
+names that file in the prompt with a per-dependency `git diff --stat` summary.
+The prompt therefore stays small however large the change is. It reads
+`.loa/verdict.json` from its worktree:
 
 ```json
 {"verdict": "approve|changes|blocked",

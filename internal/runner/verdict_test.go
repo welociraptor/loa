@@ -44,6 +44,36 @@ func verdictAgent(document string) func(context.Context, string) (string, error)
 	}
 }
 
+// captureReviewDiff saves the review subject while the worktree still exists:
+// the runner removes the worktree when the review finishes.
+func captureReviewDiff(agent func(context.Context, string) (string, error), sink *string) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, dir string) (string, error) {
+		raw, err := os.ReadFile(filepath.Join(dir, ".loa", "review.diff")) //nolint:gosec // G304: dir is the test's own worktree
+		if err != nil {
+			return "", err
+		}
+		*sink = string(raw)
+		return agent(ctx, dir)
+	}
+}
+
+// largeCommitter writes a change bigger than one argv entry may be.
+func largeCommitter(size int) func(context.Context, string) (string, error) {
+	return func(_ context.Context, dir string) (string, error) {
+		name := "work-" + filepath.Base(dir) + ".txt"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Repeat("x", size)+"\n"), 0o600); err != nil {
+			return "", err
+		}
+		if _, err := gitE(dir, "add", "-A"); err != nil {
+			return "", err
+		}
+		if _, err := gitE(dir, "commit", "-q", "-m", "work"); err != nil {
+			return "", err
+		}
+		return "wrote a large change", nil
+	}
+}
+
 func addReview(t *testing.T, s *store.Store, dep *store.Task) *store.Task {
 	t.Helper()
 	return addTask(t, s, store.NewTask{
@@ -62,7 +92,8 @@ func TestReviewApproveFinishesWithoutACommit(t *testing.T) {
 	dep := committedDependency(ctx, t, s, b)
 	review := addReview(t, s, dep)
 
-	b.agent = verdictAgent(`{"verdict":"approve","notes":[{"file":"work-1.1.txt","issue":"nothing missing","suggestion":""}]}`)
+	var diff string
+	b.agent = captureReviewDiff(verdictAgent(`{"verdict":"approve","notes":[{"file":"work-1.1.txt","issue":"nothing missing","suggestion":""}]}`), &diff)
 	stats, err := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 }).Run(ctx)
 	if err != nil {
 		t.Fatalf("run review: %v", err)
@@ -89,11 +120,17 @@ func TestReviewApproveFinishesWithoutACommit(t *testing.T) {
 		t.Errorf("review branch left behind: %s", out)
 	}
 
-	// The dependency's change, not just its branch name, reached the reviewer.
+	// The dependency's change reaches the reviewer through the worktree file,
+	// named by the prompt, rather than being embedded in the argument.
 	prompt := b.promptText("w2")
-	for _, want := range []string{"## The change under review", "work-1.1.txt", dep.Branch} {
+	for _, want := range []string{"## The change under review", ".loa/review.diff", dep.Branch} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+	for _, want := range []string{"work-1.1.txt", dep.Branch} {
+		if !strings.Contains(diff, want) {
+			t.Errorf("review.diff does not contain %q:\n%s", want, diff)
 		}
 	}
 }
@@ -388,7 +425,8 @@ func TestReviewFallsBackWhenDependencyBaseIsGone(t *testing.T) {
 	gitRun(t, repo, "branch", "--delete", "--force", firstDone.Branch)
 
 	review := addReview(t, s, secondDone)
-	b.agent = verdictAgent(`{"verdict":"approve","notes":[]}`)
+	var diff string
+	b.agent = captureReviewDiff(verdictAgent(`{"verdict":"approve","notes":[]}`), &diff)
 	stats, err := newRunner(t, s, b, func(c *runner.Config) {
 		c.MaxTasks = 1
 		c.Base = "main"
@@ -414,8 +452,8 @@ func TestReviewFallsBackWhenDependencyBaseIsGone(t *testing.T) {
 		t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
 	}
 	for _, want := range []string{"work-1.1.txt", "work-2.1.txt"} {
-		if !strings.Contains(prompt, want) {
-			t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
+		if !strings.Contains(diff, want) {
+			t.Errorf("review.diff does not contain %q:\n%s", want, diff)
 		}
 	}
 }
@@ -476,5 +514,77 @@ func TestReviewWithNoCommittedDependencyFails(t *testing.T) {
 	}
 	if got.Status == store.Done || !strings.Contains(got.Result, "nothing to review") {
 		t.Errorf("review = %+v, want a failure naming the empty subject", got)
+	}
+}
+
+// A review's subject can be larger than one argv entry may be, so it is written
+// into the review worktree and the prompt only names it. This is the regression
+// that failed a 135 KiB review before the backend saw the prompt.
+func TestReviewKeepsALargeChangeOutOfThePrompt(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+
+	big := addTask(t, s, store.NewTask{Title: "large implementation"})
+	b.agent = largeCommitter(140 * 1024)
+	if _, err := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 }).Run(ctx); err != nil {
+		t.Fatalf("run large dependency: %v", err)
+	}
+	bigDone, err := s.Get(ctx, big.ID)
+	if err != nil {
+		t.Fatalf("get large dependency: %v", err)
+	}
+
+	small := addTask(t, s, store.NewTask{Title: "small implementation"})
+	b.agent = committer(t)
+	if _, err := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 }).Run(ctx); err != nil {
+		t.Fatalf("run small dependency: %v", err)
+	}
+	smallDone, err := s.Get(ctx, small.ID)
+	if err != nil {
+		t.Fatalf("get small dependency: %v", err)
+	}
+	if bigDone.Branch == "" || smallDone.Branch == "" {
+		t.Fatalf("dependencies = (%+v, %+v), want both with branches", bigDone, smallDone)
+	}
+
+	review := addTask(t, s, store.NewTask{
+		Title: "review both",
+		Role:  "review",
+		Deps:  []int64{big.ID, small.ID},
+	})
+
+	var diff string
+	b.agent = captureReviewDiff(verdictAgent(`{"verdict":"approve","notes":[]}`), &diff)
+	stats, err := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 }).Run(ctx)
+	if err != nil {
+		t.Fatalf("run review: %v", err)
+	}
+	if stats.Completed != 1 {
+		t.Fatalf("stats = %+v, want the review done", stats)
+	}
+	if got, err := s.Get(ctx, review.ID); err != nil || got.Status != store.Done {
+		t.Fatalf("review = %+v, err = %v, want it done", got, err)
+	}
+
+	const argMax = 128 * 1024
+	prompt := b.promptText("w3")
+	if len(prompt) >= argMax/4 {
+		t.Errorf("review prompt = %d bytes, want far below the %d-byte argument limit", len(prompt), argMax)
+	}
+	for _, want := range []string{"## The change under review", ".loa/review.diff", bigDone.Branch, smallDone.Branch} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+
+	if len(diff) <= argMax {
+		t.Fatalf("review.diff = %d bytes, want more than the argument limit", len(diff))
+	}
+	for _, want := range []string{bigDone.Branch, smallDone.Branch, "work-1.1.txt", "work-2.1.txt"} {
+		if !strings.Contains(diff, want) {
+			t.Errorf("review.diff does not contain %q:\n%s", want, diff)
+		}
 	}
 }
