@@ -152,14 +152,21 @@ type Model struct {
 	// daemon works. While it is set, s and S refuse rather than drive a queue
 	// nobody is looking at.
 	queueMismatch string
+
+	// daemonOwner is the owner string of the run this tab's daemon is running,
+	// empty when it has none. A row with another owner may be a dead process's,
+	// so it gets the close hint; this daemon settles its own rows at start.
+	daemonOwner string
 }
 
 // New builds the tab. queueMismatch is the composition root's explanation of a
 // database disagreement, empty when the two agree or no daemon answered.
-func New(s *store.Store, session Session, controls Controls, queueMismatch string) Model {
+// daemonOwner is the active run's owner as the daemon reported it, empty when
+// the daemon reports no run.
+func New(s *store.Store, session Session, controls Controls, queueMismatch, daemonOwner string) Model {
 	return Model{
 		store: s, session: session, controls: controls, queueMismatch: queueMismatch,
-		message: queueMismatch, width: 80, height: 24,
+		daemonOwner: daemonOwner, message: queueMismatch, width: 80, height: 24,
 	}
 }
 
@@ -330,6 +337,9 @@ func (m Model) updateKeys(msg Key) (Model, Cmd) {
 		// caught the run this tab just started.
 		if m.active != nil {
 			m.message = fmt.Sprintf("run %d is active (owner %s)", m.active.ID, m.active.Owner)
+			if m.active.Owner != m.daemonOwner {
+				m.message += fmt.Sprintf("; if it is dead, close it with `loa runs -close %d`", m.active.ID)
+			}
 			return m, nil
 		}
 		if m.runPending {

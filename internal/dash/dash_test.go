@@ -158,7 +158,7 @@ func readMsg(t *testing.T, s *store.Store, session fakeSession) dash.SnapshotMsg
 // loaded returns a model that has already read the queue.
 func loaded(t *testing.T, s *store.Store, session fakeSession, c dash.Controls) dash.Model {
 	t.Helper()
-	m := dash.New(s, session, c, "")
+	m := dash.New(s, session, c, "", "")
 	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
 	m = asModel(t, next)
 
@@ -341,8 +341,35 @@ func TestActiveRunFromAnotherOwnerIsShownAndRefusesRun(t *testing.T) {
 	if !strings.Contains(view, "run 12 is active (owner coordinator)") {
 		t.Errorf("the refusal does not name the run:\n%s", view)
 	}
+	if !strings.Contains(view, "loa runs -close 12") {
+		t.Errorf("the refusal does not say how to settle another owner's run:\n%s", view)
+	}
 	if len(c.Calls()) != 0 {
 		t.Errorf("the tab called controls while a run was active: %v", c.calls)
+	}
+}
+
+func TestOwnDaemonRunGetsNoCloseHint(t *testing.T) {
+	s, session, _, _ := seed(t)
+	c := &fakeControls{}
+	m := dash.New(s, session, c, "", "coordinator")
+	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
+	m = asModel(t, next)
+
+	msg := readMsg(t, s, session)
+	msg.Active = &store.Run{ID: 12, Owner: "coordinator"}
+	m = step(t, m, msg)
+
+	next, cmd := m.Update(key("s"))
+	if cmd != nil {
+		t.Fatal("s started a run while this daemon's run is active")
+	}
+	view := asModel(t, next).View()
+	if !strings.Contains(view, "run 12 is active (owner coordinator)") {
+		t.Errorf("the refusal does not name the run:\n%s", view)
+	}
+	if strings.Contains(view, "loa runs -close") {
+		t.Errorf("the refusal hints at closing a row this daemon will settle:\n%s", view)
 	}
 }
 
@@ -422,7 +449,7 @@ func TestDatabaseMismatchRefusesRunAndStop(t *testing.T) {
 	c := &fakeControls{}
 	mismatch := "the daemon works /daemon/tasks.db but this tab draws /tab/tasks.db; run and stop are refused"
 
-	m := dash.New(s, session, c, mismatch)
+	m := dash.New(s, session, c, mismatch, "")
 	next, _ := m.Update(dash.WindowSizeMsg{Width: 120, Height: 30})
 	m = asModel(t, next)
 	next, _ = m.Update(readMsg(t, s, session))

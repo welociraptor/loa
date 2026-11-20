@@ -34,7 +34,7 @@ func cmdDaemon(ctx context.Context, args []string) error {
 	fs.BoolVar(&auto, "auto", false, "start runs when a task is claimable; off by default")
 	fs.DurationVar(&idle, "idle", 5*time.Minute, "wait this long after the last settled run before auto-starting another")
 	fs.DurationVar(&interval, "interval", time.Minute, "how often auto checks the queue; also the floor for an empty queue")
-	fs.IntVar(&daily, "daily", 12, "tasks auto-started runs may settle per day; 0 means no daily cap")
+	fs.IntVar(&daily, "daily", 12, "tasks settled per day, counted from every run; 0 means no daily cap")
 	registerRunFlags(fs, &flags)
 	positional, err := parseFlags(fs, args)
 	if err != nil {
@@ -94,8 +94,8 @@ func cmdDaemon(ctx context.Context, args []string) error {
 	})
 }
 
-// cmdPause and cmdResume are the brake. They act on this daemon only: the
-// pause is memory, not a file, so a restart resumes.
+// cmdPause, cmdResume and cmdStop are control calls. They act on this daemon
+// only: the pause is memory, not a file, so a restart resumes.
 func cmdPause(ctx context.Context, args []string) error {
 	return cmdDaemonControl(ctx, "pause", args)
 }
@@ -104,8 +104,12 @@ func cmdResume(ctx context.Context, args []string) error {
 	return cmdDaemonControl(ctx, "resume", args)
 }
 
+func cmdStop(ctx context.Context, args []string) error {
+	return cmdDaemonControl(ctx, "stop", args)
+}
+
 func cmdDaemonControl(ctx context.Context, verb string, args []string) error {
-	// No -db: pause and resume are client calls, and the daemon owns the queue.
+	// No -db: these are client calls, and the daemon owns the queue.
 	positional, _, err := parseClientFlags(verb, args, func(*flag.FlagSet) {})
 	if err != nil {
 		return err
@@ -119,18 +123,26 @@ func cmdDaemonControl(ctx context.Context, verb string, args []string) error {
 		return err
 	}
 	client := &daemon.Client{Path: path}
-	if verb == "pause" {
+	switch verb {
+	case "pause":
 		err = client.Pause(ctx)
-	} else {
+	case "resume":
 		err = client.Resume(ctx)
+	case "stop":
+		err = client.Stop(ctx)
+	default:
+		return fmt.Errorf("daemon control: unknown verb %q", verb)
 	}
 	if err != nil {
 		return err
 	}
-	if verb == "pause" {
+	switch verb {
+	case "pause":
 		fmt.Println("auto runs paused in this daemon; a restart resumes")
-	} else {
+	case "resume":
 		fmt.Println("auto runs resumed")
+	case "stop":
+		fmt.Println("stop requested; the daemon will settle the run")
 	}
 	return nil
 }

@@ -189,7 +189,7 @@ there is one command that says "this is green".
 - [x] **4. The untested failure paths.** The four cases that decide whether
   this is trustworthy overnight now each have a test:
   `TestTimeoutKillsTheAgentAndItsChildren` (a hung worker is killed and its
-  child with it; the task is retryable), `TestCancelledRunCleansUpAndLeavesTheLease`,
+  child with it; the task is retryable), `TestCancelledRunClosesTheWorkspaceAndLeavesTheLease`,
   `TestLostLeaseDoesNotClobberTheNewOwner` (a lost lease is logged, not fatal,
   and never overwrites the new owner's result),
   `TestStaleWorktreeRegistrationIsRecovered`.
@@ -817,7 +817,7 @@ the documents say that instead of implying a sandbox.
   competing with the daemon through SQL is legal and pointless rather than
   unsafe. Test: a client that disconnects leaves the run going; SIGTERM to the
   daemon leaves the attempt's lease to lapse, which is the existing
-  `TestCancelledRunCleansUpAndLeavesTheLease`; a run started by one client is
+  `TestCancelledRunClosesTheWorkspaceAndLeavesTheLease`; a run started by one client is
   visible to another; a dead daemon's row is settled on the next start.
 
 - [x] **39. The scheduler, behind a flag and a brake.** `-auto`, off by default.

@@ -87,6 +87,9 @@ type Server struct {
 // taken before the stale socket is touched, so a socket left by a dead process
 // is reclaimed only by the process that now owns the instance.
 func Run(ctx context.Context, cfg Config) error {
+	if err := checkControlSocketPlatform(); err != nil {
+		return err
+	}
 	dir, err := runtimeDir()
 	if err != nil {
 		return err
@@ -301,9 +304,15 @@ func (s *Server) checkPeer(conn *net.UnixConn) error {
 func (s *Server) serveConn(ctx context.Context, conn *net.UnixConn) {
 	defer func() { _ = conn.Close() }()
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, maxRequest)
 	for {
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := reader.ReadSlice('\n')
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			// The line crossed the limit before a delimiter. Refuse it now
+			// rather than buffering the rest of a request that cannot be valid.
+			_ = json.NewEncoder(conn).Encode(Response{V: Protocol, OK: false, Error: "request is too large"})
+			return
+		}
 		if len(bytes.TrimSpace(line)) > 0 {
 			resp, closeAfter := s.handleLine(ctx, line)
 			if err := json.NewEncoder(conn).Encode(resp); err != nil {

@@ -136,6 +136,33 @@ func TestAutoStartsARunWithinOneInterval(t *testing.T) {
 	}
 }
 
+func TestAutoIsOffByDefault(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	b := newBlockingBackend()
+	addRunTask(t, s)
+
+	r := start(t, Config{
+		Runner: autoRunConfig(s, b), Interval: 20 * time.Millisecond,
+	})
+	defer r.stop(t)
+
+	// Several intervals pass with a claimable task; without -auto nothing runs.
+	time.Sleep(100 * time.Millisecond)
+	runs, err := s.Runs(ctx, 10)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %+v, want none without -auto", runs)
+	}
+	select {
+	case <-b.started:
+		t.Fatal("a run started without -auto")
+	default:
+	}
+}
+
 func TestPausePreventsAutoUntilResume(t *testing.T) {
 	ctx := context.Background()
 	s := daemonStore(t)
@@ -325,7 +352,11 @@ func TestAutoReapsAnExpiredLease(t *testing.T) {
 
 	waitFor(t, "the scheduler to reap the lease in a run", func() bool {
 		runs, err := s.Runs(ctx, 10)
-		return err == nil && len(runs) == 1
+		if err != nil || len(runs) != 1 {
+			return false
+		}
+		got, err := s.Get(ctx, task.ID)
+		return err == nil && got.Status == store.New && !got.NotBefore.IsZero()
 	})
 	got, err := s.Get(ctx, task.ID)
 	if err != nil {

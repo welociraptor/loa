@@ -168,6 +168,46 @@ func TestWrongVersionIsRefusedAndCloses(t *testing.T) {
 	}
 }
 
+func TestOversizedRequestIsRefusedAndTheDaemonKeepsServing(t *testing.T) {
+	r := start(t, Config{})
+	defer r.stop(t)
+
+	conn := dial(t, r.sock)
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := conn.Write([]byte(strings.Repeat("x", maxRequest+1) + "\n")); err != nil {
+		t.Fatalf("write oversized request: %v", err)
+	}
+
+	var refusal Response
+	if err := json.NewDecoder(conn).Decode(&refusal); err != nil {
+		t.Fatalf("decode refusal: %v", err)
+	}
+	if refusal.OK || refusal.V != Protocol || refusal.Error != "request is too large" {
+		t.Errorf("refusal = %+v, want an oversized-request refusal", refusal)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("the connection stayed open after the oversized request")
+	}
+
+	// The refusal is per connection: another client still gets an answer.
+	other := dial(t, r.sock)
+	if err := other.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if _, err := other.Write([]byte(`{"v":1,"do":"ping"}` + "\n")); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	var pong Response
+	if err := json.NewDecoder(other).Decode(&pong); err != nil {
+		t.Fatalf("decode ping: %v", err)
+	}
+	if !pong.OK || !pong.Pong {
+		t.Errorf("ping = %+v, want the daemon still serving", pong)
+	}
+}
+
 func TestStatusShowsNoRunAndPauseSurvives(t *testing.T) {
 	r := start(t, Config{})
 	defer r.stop(t)

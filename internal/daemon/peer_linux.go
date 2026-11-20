@@ -9,6 +9,11 @@ import (
 	"syscall"
 )
 
+// checkControlSocketPlatform is the startup gate for the Linux-only control
+// socket. The ownership check below cannot be implemented portably, so the
+// daemon refuses to start rather than accepting connections it cannot verify.
+func checkControlSocketPlatform() error { return nil }
+
 // checkPeerUID reads SO_PEERCRED from the accepted connection and refuses
 // anyone but this process's owner. The socket is not a privilege boundary, but
 // it is still not a place for another user's requests.

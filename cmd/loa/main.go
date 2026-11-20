@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -52,6 +53,7 @@ usage:
   loa run    [-workers N] [-max N] [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR] [-json]
                                    # ask the daemon for a run; -workers/-max clamp, -timeout/-ttl only shrink
                                    # -check cannot replace the daemon's; -base/-prompts/-model/-kind are yours
+  loa stop                         # stop the run in flight; the daemon settles it
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
@@ -64,7 +66,7 @@ usage:
 
 The commands that open SQLite directly take -db PATH (default $LOA_DB, else
 loa.db): add, list, show, cancel, ps, report, import, triage, plan, lease,
-unblock, resolve, done, fail, runs, merge and dash. run, pause, resume and
+unblock, resolve, done, fail, runs, merge and dash. run, stop, pause, resume and
 daemon -status are clients: the daemon decides which database they work.`
 
 func main() {
@@ -106,6 +108,8 @@ func main() {
 		err = cmdFinish(ctx, os.Args[2:], false)
 	case "run":
 		err = cmdRun(ctx, os.Args[2:])
+	case "stop":
+		err = cmdStop(ctx, os.Args[2:])
 	case "runs":
 		err = cmdRuns(ctx, os.Args[2:])
 	case "merge":
@@ -1091,7 +1095,27 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	stats, runErr := (&daemon.Client{Path: path}).Run(ctx, runOptionsFrom(fs, flags))
+	client := &daemon.Client{Path: path}
+
+	// The daemon owns the run and its cleanup. On SIGINT, ask it to stop rather
+	// than letting the signal kill the client and leave the work spending.
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
+	runDone := make(chan struct{})
+	go func() {
+		select {
+		case <-interrupt:
+			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := client.Stop(stopCtx); err != nil {
+				fmt.Fprintf(os.Stderr, "loa: stop: %v\n", err)
+			}
+		case <-runDone:
+		}
+	}()
+	stats, runErr := client.Run(ctx, runOptionsFrom(fs, flags))
+	close(runDone)
 
 	// A run that never started has no row to report; the error says why.
 	if asJSON && stats.Run.ID != 0 {
@@ -1314,11 +1338,16 @@ func cmdDash(ctx context.Context, args []string) error {
 
 	// The tab draws one queue; the daemon works another. Ask once which one,
 	// and let the model refuse s/S rather than drive a queue nobody is looking
-	// at. A dead daemon has no answer; the run controls report that on their own.
-	mismatch := ""
+	// at. The same answer names the daemon's active run, so the tab can tell its
+	// own row from one a dead process left. A dead daemon has no answer; the run
+	// controls report that on their own.
+	mismatch, daemonOwner := "", ""
 	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	if status, err := d.Status(statusCtx); err == nil {
 		mismatch = dbMismatch(localDB, status.DB)
+		if status.Run != nil {
+			daemonOwner = status.Run.Owner
+		}
 	}
 	cancel()
 
@@ -1329,7 +1358,7 @@ func cmdDash(ctx context.Context, args []string) error {
 	}
 	c.stopFn = func(ctx context.Context) error { return d.Stop(ctx) }
 
-	return dash.Run(ctx, dash.New(s, client, c, mismatch), os.Stdin, os.Stdout)
+	return dash.Run(ctx, dash.New(s, client, c, mismatch, daemonOwner), os.Stdin, os.Stdout)
 }
 
 // dbMismatch names both databases when the daemon works a different one than

@@ -173,7 +173,7 @@ func TestClientCommandsRefuseTheDatabaseFlag(t *testing.T) {
 	p := startDaemonIn(t, t.TempDir())
 	other := filepath.Join(p.dir, "other.db")
 
-	for _, command := range []string{"pause", "resume"} {
+	for _, command := range []string{"pause", "resume", "stop"} {
 		_, errOut, code := runDaemonCLI(t, daemonEnv(p.dir), command, "-db", other)
 		if code != 2 || !strings.Contains(errOut, "-db") {
 			t.Errorf("%s -db exited %d with %q, want the flag parse refusal", command, code, errOut)
@@ -397,7 +397,7 @@ func TestPauseAndResumeCommandsAndHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("help exited %d", code)
 	}
-	for _, want := range []string{"loa pause", "loa resume", "-auto", "restart resumes"} {
+	for _, want := range []string{"loa pause", "loa resume", "loa stop", "-auto", "restart resumes"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help is missing %q", want)
 		}
@@ -411,10 +411,62 @@ func TestDaemonHelpListsThePolicyFlags(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("daemon -h exited %d: %s", code, errOut)
 	}
-	for _, want := range []string{"-auto", "-workers", "-max", "-idle", "-daily"} {
+	for _, want := range []string{"-auto", "-workers", "-max", "-idle", "-daily", "tasks settled per day, counted from every run"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("daemon -h is missing %q:\n%s", want, errOut)
 		}
+	}
+}
+
+func TestStopCommandSendsTheStopVerb(t *testing.T) {
+	dir := t.TempDir()
+	runtime := filepath.Join(dir, "loa")
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	sock := filepath.Join(runtime, "sock")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	type request struct {
+		V  int    `json:"v"`
+		Do string `json:"do"`
+	}
+	got := make(chan request, 1)
+	go func() {
+		conn, err := ln.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var req request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+		got <- req
+		_ = json.NewEncoder(conn).Encode(struct {
+			V  int  `json:"v"`
+			OK bool `json:"ok"`
+		}{V: 1, OK: true})
+	}()
+
+	out, errOut, code := runDaemonCLI(t, daemonEnv(dir), "stop")
+	if code != 0 {
+		t.Fatalf("stop exited %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "stop requested") {
+		t.Errorf("stop = %q, want the daemon's settlement named", out)
+	}
+	select {
+	case req := <-got:
+		if req.V != 1 || req.Do != "stop" {
+			t.Errorf("request = %+v, want protocol 1 stop", req)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop command did not connect to the daemon")
 	}
 }
 
@@ -424,6 +476,23 @@ func TestDaemonAutoStartsARunWithinOneInterval(t *testing.T) {
 	if _, errOut, code := runDaemonCLI(t, env, "add", "-workspace", "loa", "-title", "auto work"); code != 0 {
 		t.Fatalf("add exited %d: %s", code, errOut)
 	}
+
+	// Auto is gated on a fresh probe. Answer it so the scheduler ticks; any
+	// other Herdr call may fail, because the run row is what this test needs.
+	bin := filepath.Join(dir, "empty-bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	script := `#!/bin/sh
+case "$1 $2" in
+  "status --json") printf '%s\n' '{"client":{"version":"test"},"server":{"running":true,"compatible":true,"protocol":22}}' ;;
+  *) echo "fake herdr: unsupported: $*" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "herdr"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the fake must be executable
+		t.Fatalf("write fake herdr: %v", err)
+	}
+
 	startDaemonWithArgs(t, dir, "daemon", "-auto", "-interval", "50ms", "-idle", "0", "-daily", "4", "-workers", "1", "-max", "1")
 
 	deadline := time.Now().Add(2 * time.Second)

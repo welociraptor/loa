@@ -54,6 +54,7 @@ loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
 loa run    -workers 2 -max 5 [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR] [-json] # ask the daemon for a run; budgets only narrow, the daemon's -check wins
+loa stop                           # stop the run in flight; the daemon settles it and cleans up
 loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] # the supervisor; its flags are the run budget and check
 loa pause                          # stop automatic starts; memory only
 loa resume                         # allow them again
@@ -67,10 +68,10 @@ hole into the queue.
 `LOA_DB` selects the database (default `./loa.db`). Commands that open SQLite
 directly accept `-db PATH`: `add`, `list`, `show`, `cancel`, `ps`, `report`,
 `import`, `triage`, `plan`, `lease`, `unblock`, `resolve`, `done`, `fail`,
-`runs`, `merge`, and `dash` for the queue it draws. `run`, `pause`, `resume` and
-`daemon -status` are clients of the daemon and take no `-db`: the daemon decides
-which database they work. `daemon` itself takes `-db` because it opens the queue
-for the whole process.
+`runs`, `merge`, and `dash` for the queue it draws. `run`, `stop`, `pause`,
+`resume` and `daemon -status` are clients of the daemon and take no `-db`: the
+daemon decides which database they work. `daemon` itself takes `-db` because it
+opens the queue for the whole process.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses
@@ -149,7 +150,9 @@ from the result.
 narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
 `-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
 timeout or ttl, a wider budget, or a different `-check` when the daemon has one
-is refused before a run starts. The daemon probes `herdr status` once at start
+is refused before a run starts. `Ctrl-C` on `loa run` sends the same stop request
+as `loa stop`; the daemon owns the run's cleanup either way. The daemon probes
+`herdr status` once at start
 and logs the result. Automatic runs are gated on the probe: every `-auto` tick
 probes again, and a failed probe skips that tick and is retried at the next
 interval, so a daemon started before Herdr is up spends neither a lease nor
@@ -201,14 +204,17 @@ decision, while a file in a hidden directory drifts. `-interval` (default `1m`) 
 how often the queue is checked and the floor for an empty queue.
 
 The socket is `$XDG_RUNTIME_DIR/loa/sock`, protocol 1; `XDG_RUNTIME_DIR` must be
-set and absolute (the unit supplies `%t`). `loa run`, `loa pause`, `loa resume`,
-`loa daemon -status` and the tab's `s`/`S` are clients. One daemon per runtime
-directory holds an exclusive lock; `loa daemon -status` prints its pid, uptime,
-pause state and active run, or exits non-zero.
+set and absolute (the unit supplies `%t`). The control socket is Linux-only: on
+any other platform `loa daemon` refuses to start. `loa run`, `loa stop`, `loa
+pause`, `loa resume`, `loa daemon -status` and the tab's `s`/`S` are clients. One
+daemon per runtime directory holds an exclusive lock; `loa daemon -status` prints
+its pid, uptime, pause state and active run, or exits non-zero.
 
-`loa pause` stops automatic starts without touching a run in flight. It is
-memory, not a file, so restarting the daemon resumes. That is deliberate: a
-brake that survives a restart is a second policy file beside the unit.
+`loa stop` interrupts the run in flight; the daemon keeps the run's cleanup and
+settles its row. `loa pause` stops automatic starts without touching a run in
+flight. It is memory, not a file, so restarting the daemon resumes. That is
+deliberate: a brake that survives a restart is a second policy file beside the
+unit.
 
 The socket is not a privilege boundary. The runtime directory is 0700 and the
 socket 0600, the daemon checks the connecting peer's uid with `SO_PEERCRED`, and
