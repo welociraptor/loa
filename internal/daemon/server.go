@@ -27,12 +27,17 @@ const (
 	socketName   = "sock"
 	maxRequest   = 64 << 10
 	probeTimeout = 10 * time.Second
+
+	// runHistory is enough of a day's runs to decide the daily budget. A day
+	// with more runs than this has spent any practical -daily long ago.
+	runHistory = 1000
 )
 
 // Config is what the process supplies to the daemon. PeerCheck is injectable so
 // the refusal of a foreign uid can be tested without a second user. Runner is
 // the daemon's default budget and its backend; a run request may narrow that
-// budget but not replace its store or backend.
+// budget but not replace its store or backend. Auto, Idle, Daily and Interval
+// are the scheduler's policy: they are checked once per interval, not persisted.
 type Config struct {
 	Logger    *log.Logger
 	PeerCheck func(*net.UnixConn) error
@@ -40,6 +45,11 @@ type Config struct {
 	Store     *store.Store
 	Backend   runner.Backend
 	Runner    runner.Config
+
+	Auto     bool
+	Idle     time.Duration
+	Daily    int
+	Interval time.Duration
 }
 
 // Server answers requests. It owns the runs and the leases they take; every
@@ -58,6 +68,13 @@ type Server struct {
 	runCancel    context.CancelFunc
 	shuttingDown bool
 	runWG        sync.WaitGroup
+
+	// The scheduler is one loop, not a timer per budget. Its policy is fixed
+	// for the life of the daemon; pause is the only part a client can change.
+	auto     bool
+	idle     time.Duration
+	daily    int
+	interval time.Duration
 }
 
 // Run starts the daemon and serves until ctx is cancelled. The runtime lock is
@@ -189,12 +206,20 @@ func newServer(cfg Config) *Server {
 	if runCfg.Backend == nil {
 		runCfg.Backend = cfg.Backend
 	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = time.Minute
+	}
 	return &Server{
 		logger:    logger,
 		peerCheck: cfg.PeerCheck,
 		probeFn:   cfg.Probe,
 		started:   time.Now(),
 		runner:    runCfg,
+		auto:      cfg.Auto,
+		idle:      cfg.Idle,
+		daily:     cfg.Daily,
+		interval:  interval,
 	}
 }
 
@@ -215,6 +240,9 @@ func (s *Server) probe(ctx context.Context) {
 func (s *Server) serve(ctx context.Context, ln *net.UnixListener) error {
 	if s.probeFn != nil {
 		go s.probe(ctx)
+	}
+	if s.auto {
+		go s.schedule(ctx)
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -381,10 +409,25 @@ func (s *Server) stop() {
 // request. The context is the daemon's, not the connection's: a client that
 // hangs up does not stop the work.
 func (s *Server) runRequest(ctx context.Context, opts *RunOptions) Response {
+	return s.start(ctx, opts, false)
+}
+
+// startAuto is the scheduler's door into the same run start. The auto flag is
+// checked under the lock that pause uses, so a pause that lands during a tick
+// wins over the tick's decision.
+func (s *Server) startAuto(ctx context.Context) Response {
+	return s.start(ctx, nil, true)
+}
+
+func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Response {
 	s.mu.Lock()
 	if s.shuttingDown {
 		s.mu.Unlock()
 		return Response{V: Protocol, OK: false, Error: "daemon is shutting down"}
+	}
+	if auto && (s.paused || !s.auto) {
+		s.mu.Unlock()
+		return Response{V: Protocol, OK: false, Error: "automatic runs are paused"}
 	}
 	if s.running {
 		active := s.run
@@ -432,6 +475,151 @@ func (s *Server) runRequest(ctx context.Context, opts *RunOptions) Response {
 		resp.Error = runErr.Error()
 	}
 	return resp
+}
+
+// schedule is the one timer automatic runs need. Each tick asks one question:
+// should the queue be worked now? The interval is the floor for an idle queue,
+// so a tick that finds no work is one pass over the queue, not a spin.
+func (s *Server) schedule(ctx context.Context) {
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.tick(ctx)
+		}
+	}
+}
+
+func (s *Server) tick(ctx context.Context) {
+	s.mu.Lock()
+	paused, running := s.paused, s.running
+	s.mu.Unlock()
+	if paused || running || s.runner.Store == nil {
+		return
+	}
+
+	now := time.Now()
+	spent, err := s.dailySpent(ctx, now)
+	if err != nil {
+		s.logf("daemon: scheduler: %v", err)
+		return
+	}
+	if spent {
+		return
+	}
+	settled, err := s.idleElapsed(ctx, now)
+	if err != nil {
+		s.logf("daemon: scheduler: %v", err)
+		return
+	}
+	if !settled {
+		return
+	}
+	claimable, err := s.claimable(ctx, now)
+	if err != nil {
+		s.logf("daemon: scheduler: %v", err)
+		return
+	}
+	if !claimable {
+		return
+	}
+
+	resp := s.startAuto(ctx)
+	if !resp.OK {
+		if ctx.Err() == nil {
+			s.logf("daemon: auto run: %s", resp.Error)
+		}
+		return
+	}
+	if resp.Run != nil {
+		s.logf("daemon: auto run %d settled %d task(s)", resp.Run.Run.ID, resp.Run.Run.Done+resp.Run.Run.Failed)
+	}
+}
+
+// dailySpent counts the tasks today's settled runs recorded. Both done and
+// failed attempts spend the budget: both leased a task and cost an agent.
+func (s *Server) dailySpent(ctx context.Context, now time.Time) (bool, error) {
+	if s.daily <= 0 {
+		return false, nil
+	}
+	runs, err := s.runner.Store.Runs(ctx, runHistory)
+	if err != nil {
+		return false, fmt.Errorf("daily budget: %w", err)
+	}
+
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	spent := 0
+	for _, run := range runs {
+		if run.Active() {
+			continue
+		}
+		ended, err := time.Parse(time.RFC3339, run.EndedAt)
+		if err != nil {
+			return false, fmt.Errorf("run %d ended_at %q: %w", run.ID, run.EndedAt, err)
+		}
+		if ended.In(now.Location()).Before(start) {
+			continue
+		}
+		spent += run.Done + run.Failed
+		if spent >= s.daily {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// idleElapsed reports whether the last settled run is old enough. No run at all
+// means yes: a fresh queue should not wait for an idle that has never started.
+func (s *Server) idleElapsed(ctx context.Context, now time.Time) (bool, error) {
+	runs, err := s.runner.Store.Runs(ctx, 1)
+	if err != nil {
+		return false, fmt.Errorf("idle: %w", err)
+	}
+	if len(runs) == 0 {
+		return true, nil
+	}
+	last := runs[0]
+	if last.Active() {
+		return false, nil
+	}
+	ended, err := time.Parse(time.RFC3339, last.EndedAt)
+	if err != nil {
+		return false, fmt.Errorf("run %d ended_at %q: %w", last.ID, last.EndedAt, err)
+	}
+	return !ended.Add(s.idle).After(now), nil
+}
+
+// claimable asks the same question Lease asks: is there a task whose deps and
+// scopes allow it now? Blockers is the store's own explanation of that
+// predicate, so the scheduler cannot disagree with the claim it is scheduling.
+//
+// An expired lease counts as work even though the reaper delays its retry: only
+// a run calls Lease, and until one does, the dead attempt's scope can hide a
+// task that would otherwise be claimable forever.
+func (s *Server) claimable(ctx context.Context, now time.Time) (bool, error) {
+	tasks, err := s.runner.Store.List(ctx, store.New, store.Leased)
+	if err != nil {
+		return false, fmt.Errorf("claimable: %w", err)
+	}
+	for _, task := range tasks {
+		if task.Status == store.Leased {
+			if !task.LeaseExpiry.IsZero() && !task.LeaseExpiry.After(now) {
+				return true, nil
+			}
+			continue
+		}
+		blockers, err := s.runner.Store.Blockers(ctx, task.ID, now)
+		if err != nil {
+			return false, fmt.Errorf("claimable #%d: %w", task.ID, err)
+		}
+		if len(blockers) == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func versionRefusal(version int) Response {

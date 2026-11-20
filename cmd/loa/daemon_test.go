@@ -29,10 +29,15 @@ type daemonProc struct {
 // process, its own runtime directory, and no Herdr on PATH.
 func startDaemonIn(t *testing.T, dir string) *daemonProc {
 	t.Helper()
+	return startDaemonWithArgs(t, dir, "daemon")
+}
+
+func startDaemonWithArgs(t *testing.T, dir string, args ...string) *daemonProc {
+	t.Helper()
 	p := &daemonProc{
 		dir:  dir,
 		sock: filepath.Join(dir, "loa", "sock"),
-		cmd:  exec.Command(binary, "daemon"),
+		cmd:  exec.Command(binary, args...),
 	}
 	p.cmd.Env = daemonEnv(dir)
 	p.cmd.Stdout = &p.stdout
@@ -316,5 +321,75 @@ func TestDaemonStatusFailsWithTheReasonWhenNoDaemonRuns(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "connect") || !strings.Contains(errOut, "sock") {
 		t.Errorf("stderr = %q, want the connection reason", errOut)
+	}
+}
+
+func TestPauseAndResumeCommandsAndHelp(t *testing.T) {
+	p := startDaemonIn(t, t.TempDir())
+	env := daemonEnv(p.dir)
+
+	out, errOut, code := runDaemonCLI(t, env, "pause")
+	if code != 0 {
+		t.Fatalf("pause exited %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "restart resumes") {
+		t.Errorf("pause = %q, want the memory warning", out)
+	}
+	status, _, code := runDaemonCLI(t, env, "daemon", "-status")
+	if code != 0 || !strings.Contains(status, "paused true") {
+		t.Fatalf("status after pause = %q (exit %d), want paused true", status, code)
+	}
+
+	out, errOut, code = runDaemonCLI(t, env, "resume")
+	if code != 0 {
+		t.Fatalf("resume exited %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "resumed") {
+		t.Errorf("resume = %q", out)
+	}
+	status, _, code = runDaemonCLI(t, env, "daemon", "-status")
+	if code != 0 || !strings.Contains(status, "paused false") {
+		t.Fatalf("status after resume = %q (exit %d), want paused false", status, code)
+	}
+
+	help, _, code := runDaemonCLI(t, env, "help")
+	if code != 0 {
+		t.Fatalf("help exited %d", code)
+	}
+	for _, want := range []string{"loa pause", "loa resume", "-auto", "restart resumes"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help is missing %q", want)
+		}
+	}
+}
+
+func TestDaemonAutoStartsARunWithinOneInterval(t *testing.T) {
+	dir := t.TempDir()
+	env := daemonEnv(dir)
+	if _, errOut, code := runDaemonCLI(t, env, "add", "-workspace", "loa", "-title", "auto work"); code != 0 {
+		t.Fatalf("add exited %d: %s", code, errOut)
+	}
+	startDaemonWithArgs(t, dir, "daemon", "-auto", "-interval", "50ms", "-idle", "0", "-daily", "4", "-workers", "1", "-max", "1")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		out, _, code := runDaemonCLI(t, env, "runs", "-json")
+		if code == 0 {
+			var got struct {
+				Runs []struct {
+					ID int64 `json:"id"`
+				} `json:"runs"`
+			}
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("runs -json: %v: %q", err, out)
+			}
+			if len(got.Runs) > 0 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("auto did not start a run within one interval")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

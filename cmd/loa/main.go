@@ -54,8 +54,11 @@ usage:
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
-  loa daemon [-status] [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR]
+  loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR]
                                    # the control socket; its flags are the default run budget
+                                   # -auto works the queue; pause is in memory, so a restart resumes
+  loa pause                        # stop automatic starts; the run in flight is untouched
+  loa resume                       # allow automatic starts again
   loa version                      # the release and commit this binary was built from
 
 all commands accept -db PATH (default $LOA_DB, else loa.db)`
@@ -107,6 +110,10 @@ func main() {
 		err = cmdDash(ctx, os.Args[2:])
 	case "daemon":
 		err = cmdDaemon(ctx, os.Args[2:])
+	case "pause":
+		err = cmdPause(ctx, os.Args[2:])
+	case "resume":
+		err = cmdResume(ctx, os.Args[2:])
 	case "version":
 		fmt.Println(versionLine())
 	case "-h", "--help", "help":

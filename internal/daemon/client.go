@@ -61,7 +61,22 @@ func (c *Client) Run(ctx context.Context, opts RunOptions) (runner.Stats, error)
 // Stop asks the daemon to interrupt the run in flight. It is a no-op when no
 // run is active, so a tab can always send it.
 func (c *Client) Stop(ctx context.Context) error {
-	resp, err := c.Do(ctx, "stop")
+	return c.control(ctx, "stop")
+}
+
+// Pause stops automatic starts without touching the run in flight. It lives in
+// the daemon's memory, so a restart starts with a clean, unpaused daemon.
+func (c *Client) Pause(ctx context.Context) error {
+	return c.control(ctx, "pause")
+}
+
+// Resume allows automatic starts again.
+func (c *Client) Resume(ctx context.Context) error {
+	return c.control(ctx, "resume")
+}
+
+func (c *Client) control(ctx context.Context, verb string) error {
+	resp, err := c.Do(ctx, verb)
 	if err != nil {
 		return err
 	}
