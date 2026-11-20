@@ -349,7 +349,7 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	// sent, so everything this attempt produces is attributable to those bytes.
 	fields := fieldsFor(task, handle.Worktree, handle.Repo, handle.Branch)
 	if review {
-		diffs, err := r.reviewDiffs(ctx, task, handle)
+		diffs, err := r.reviewDiffs(ctx, task, handle, logf)
 		if err != nil {
 			r.stopAndClose(handle, logf)
 			if commits, _ := commitsAhead(ctx, handle.Worktree, handle.Base); commits == 0 {

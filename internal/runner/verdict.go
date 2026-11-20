@@ -31,7 +31,7 @@ func defaultProposalsDir() string {
 // reviewDiffs returns the change each dependency carries against the base it
 // branched from. The dependency set is the review subject; no separate column
 // is needed to name it.
-func (r *Runner) reviewDiffs(ctx context.Context, task *store.Task, handle Handle) ([]promptDiff, error) {
+func (r *Runner) reviewDiffs(ctx context.Context, task *store.Task, handle Handle, logf func(string, ...any)) ([]promptDiff, error) {
 	deps, err := r.cfg.Store.Deps(ctx, task.ID)
 	if err != nil {
 		return nil, err
@@ -50,6 +50,15 @@ func (r *Runner) reviewDiffs(ctx context.Context, task *store.Task, handle Handl
 		base, err := r.cfg.Store.DependencyBase(ctx, dep.ID)
 		if err != nil {
 			return nil, err
+		}
+		// The recorded base is another task's branch, and a merged
+		// dependency's branch is tidied away by a person. A base that no
+		// longer resolves falls back to the configured base, as the worktree
+		// does; the branch under review must still resolve, so a missing
+		// subject still fails.
+		if base != "" && !refResolves(ctx, handle.Repo, base) {
+			logf("cannot diff dependency #%d against %s; diffing against %s", got.ID, base, r.cfg.Base)
+			base = ""
 		}
 		if base == "" {
 			base = r.cfg.Base

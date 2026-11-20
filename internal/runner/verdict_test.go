@@ -352,6 +352,105 @@ func TestReviewWithNothingToReviewFailsBeforeOpening(t *testing.T) {
 	}
 }
 
+// A chain's second task records its dependency's branch as the base it
+// branched from. When that branch is tidied away after a merge, the review
+// still diffs the dependency against the configured base, as the worktree did.
+func TestReviewFallsBackWhenDependencyBaseIsGone(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	b.agent = committer(t)
+
+	first := addTask(t, s, store.NewTask{Title: "first"})
+	second := addTask(t, s, store.NewTask{Title: "second", Deps: []int64{first.ID}})
+	if _, err := newRunner(t, s, b, func(c *runner.Config) {
+		c.MaxTasks = 2
+		c.Workers = 1
+	}).Run(ctx); err != nil {
+		t.Fatalf("run chain: %v", err)
+	}
+
+	firstDone, err := s.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("get first: %v", err)
+	}
+	secondDone, err := s.Get(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("get second: %v", err)
+	}
+	if firstDone.Status != store.Done || firstDone.Branch == "" || secondDone.Status != store.Done {
+		t.Fatalf("chain = (%+v, %+v), want both done with branches", firstDone, secondDone)
+	}
+
+	// The first dependency was merged and its branch tidied away, so the second
+	// task's recorded base no longer resolves.
+	gitRun(t, repo, "branch", "--delete", "--force", firstDone.Branch)
+
+	review := addReview(t, s, secondDone)
+	b.agent = verdictAgent(`{"verdict":"approve","notes":[]}`)
+	stats, err := newRunner(t, s, b, func(c *runner.Config) {
+		c.MaxTasks = 1
+		c.Base = "main"
+	}).Run(ctx)
+	if err != nil {
+		t.Fatalf("run review: %v", err)
+	}
+	if stats.Completed != 1 {
+		t.Fatalf("stats = %+v, want the review done", stats)
+	}
+	got, err := s.Get(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("get review: %v", err)
+	}
+	if got.Status != store.Done {
+		t.Errorf("review = %+v, want it done", got)
+	}
+
+	// The dependency is diffed against the configured base it was opened from,
+	// and its own change is still there to review.
+	prompt := b.promptText("w3")
+	if want := "Branch `" + secondDone.Branch + "` from `main`"; !strings.Contains(prompt, want) {
+		t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
+	}
+	for _, want := range []string{"work-1.1.txt", "work-2.1.txt"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("review prompt does not contain %q:\n%s", want, prompt)
+		}
+	}
+}
+
+// The subject itself missing is not a cue to fall back: a review with no branch
+// to read still fails.
+func TestReviewWithAMissingDependencyBranchFails(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t, "demo")
+	s := newStore(t)
+	b := newFakeBackend(t, repo)
+	dep := committedDependency(ctx, t, s, b)
+	gitRun(t, repo, "branch", "--delete", "--force", dep.Branch)
+
+	review := addReview(t, s, dep)
+	b.agent = verdictAgent(`{"verdict":"approve","notes":[]}`)
+	stats, err := newRunner(t, s, b, func(c *runner.Config) { c.MaxTasks = 1 }).Run(ctx)
+	if err != nil {
+		t.Fatalf("run review: %v", err)
+	}
+	if stats.Failed != 1 {
+		t.Fatalf("stats = %+v, want one failure", stats)
+	}
+	got, err := s.Get(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("get review: %v", err)
+	}
+	if got.Status == store.Done || !strings.Contains(got.Result, dep.Branch) {
+		t.Errorf("review = %+v, want a failure naming the missing branch %q", got, dep.Branch)
+	}
+	if prompt := b.promptText("w2"); prompt != "" {
+		t.Errorf("a review with no branch to read was still prompted:\n%s", prompt)
+	}
+}
+
 // A dependency that is done without a branch has no change to read, so the
 // review fails rather than approving an empty diff.
 func TestReviewWithNoCommittedDependencyFails(t *testing.T) {
