@@ -69,6 +69,9 @@ func (k Key) String() string {
 
 // Controls is everything the tab can do. The composition root supplies it, so
 // the dashboard has no opinion about sessions or runners beyond these calls.
+// Stop is optional so a caller that only reads and acts through the store still
+// satisfies the interface; the tab reports a missing stopper rather than
+// pretending it stopped anything.
 type Controls interface {
 	Focus(ctx context.Context, row live.Row) error
 	Interrupt(ctx context.Context, row live.Row) error
@@ -76,6 +79,10 @@ type Controls interface {
 	Unblock(ctx context.Context, taskID int64) error
 	Resolve(ctx context.Context, taskID int64, done bool, result string) error
 	Run(ctx context.Context) error
+}
+
+type stopper interface {
+	Stop(ctx context.Context) error
 }
 
 // Session is the read half of Herdr, as `live` needs it.
@@ -135,10 +142,11 @@ type Model struct {
 	prompt      prompt
 
 	// active is the run the store reports, whoever started it. The tab's own
-	// run is a separate fact: cancel is set only by this tab, so S can never
-	// stop a coordinator's run.
-	active *store.Run
-	cancel context.CancelFunc
+	// run is a separate fact: runPending is set while this tab's request is in
+	// flight, so a second s does not ask for another run before a refresh sees
+	// the first.
+	active     *store.Run
+	runPending bool
 }
 
 // New builds the tab.
@@ -205,7 +213,7 @@ func (m Model) Update(msg Msg) (Model, Cmd) {
 		return m, m.refresh()
 
 	case runDoneMsg:
-		m.cancel = nil
+		m.runPending = false
 		if msg.err != nil {
 			m.message = "run: " + msg.err.Error()
 		} else {
@@ -260,9 +268,7 @@ func (m Model) updateKeys(msg Key) (Model, Cmd) {
 
 	switch msg.String() {
 	case "q", "ctrl+c":
-		if m.cancel != nil {
-			m.cancel()
-		}
+		// The run belongs to the daemon. Closing the tab does not stop it.
 		return m, func() Msg { return quitMsg{} }
 	case "j", "down":
 		if m.cursor < len(m.rows)-1 {
@@ -307,32 +313,36 @@ func (m Model) updateKeys(msg Key) (Model, Cmd) {
 		}
 	case "s":
 		// The store's StartRun is the guard; this is the explanation. The
-		// local cancel also counts, since the next snapshot may not have
+		// pending request also counts, since the next snapshot may not have
 		// caught the run this tab just started.
 		if m.active != nil {
-			m.message = fmt.Sprintf("run %d is active (owner %s); if it is dead, close it with `loa runs -close %d`",
-				m.active.ID, m.active.Owner, m.active.ID)
+			m.message = fmt.Sprintf("run %d is active (owner %s)", m.active.ID, m.active.Owner)
 			return m, nil
 		}
-		if m.cancel != nil {
+		if m.runPending {
 			m.message = "a run is already in flight"
 			return m, nil
 		}
-		// Its own context, so quitting the tab does not leave a run half-done.
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancel = cancel
+		m.runPending = true
 		m.message = "run started"
+		// The daemon owns the run, so the request gets its own context: quitting
+		// the tab must not cancel work the daemon is supervising.
 		return m, func() Msg {
-			err := m.controls.Run(ctx)
-			cancel()
+			err := m.controls.Run(context.Background())
 			return runDoneMsg{err: err}
 		}
 	case "S":
-		// Only this tab can stop its own run.
-		if m.cancel != nil {
-			m.cancel()
-			m.message = "stopping the run"
+		if m.active == nil && !m.runPending {
+			m.message = "no run to stop"
+			return m, nil
 		}
+		stop, ok := m.controls.(stopper)
+		if !ok {
+			m.message = "stop is not available"
+			return m, nil
+		}
+		m.message = "stopping the run"
+		return m, m.act("stop", func(ctx context.Context) error { return stop.Stop(ctx) })
 	}
 	return m, nil
 }

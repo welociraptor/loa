@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+
+	"loa/internal/runner"
 )
 
 // SocketPath is where the daemon listens. XDG_RUNTIME_DIR is required: falling
@@ -32,6 +34,44 @@ type Client struct {
 // Do sends one request and reads one response. A refusal is a response, not a
 // transport error; the caller decides what to do with it.
 func (c *Client) Do(ctx context.Context, verb string) (*Response, error) {
+	return c.send(ctx, Request{V: Protocol, Do: verb})
+}
+
+// Run asks the daemon to start a run and waits for its outcome. The wait is on
+// the daemon's run, not on this connection: closing the client does not stop
+// the work.
+func (c *Client) Run(ctx context.Context, opts RunOptions) (runner.Stats, error) {
+	resp, err := c.send(ctx, Request{V: Protocol, Do: "run", Run: &opts})
+	if err != nil {
+		return runner.Stats{}, err
+	}
+	var stats runner.Stats
+	if resp.Run != nil {
+		stats = resp.Run.Stats()
+	}
+	if !resp.OK {
+		return stats, errors.New("daemon: " + resp.Error)
+	}
+	if resp.Run == nil {
+		return stats, errors.New("daemon: run response carried no result")
+	}
+	return stats, nil
+}
+
+// Stop asks the daemon to interrupt the run in flight. It is a no-op when no
+// run is active, so a tab can always send it.
+func (c *Client) Stop(ctx context.Context) error {
+	resp, err := c.Do(ctx, "stop")
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New("daemon: " + resp.Error)
+	}
+	return nil
+}
+
+func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", c.Path)
 	if err != nil {
@@ -45,13 +85,13 @@ func (c *Client) Do(ctx context.Context, verb string) (*Response, error) {
 		}
 	}
 
-	if err := json.NewEncoder(conn).Encode(Request{V: Protocol, Do: verb}); err != nil {
-		return nil, fmt.Errorf("daemon: send %q: %w", verb, err)
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, fmt.Errorf("daemon: send %q: %w", req.Do, err)
 	}
 
 	var resp Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("daemon: read %q response: %w", verb, err)
+		return nil, fmt.Errorf("daemon: read %q response: %w", req.Do, err)
 	}
 	if resp.V != Protocol {
 		return nil, fmt.Errorf("daemon: speaks protocol %d; this client speaks %d", resp.V, Protocol)

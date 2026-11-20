@@ -888,17 +888,17 @@ func TestRunJSONShape(t *testing.T) {
 	}
 }
 
-func TestRunJSONWithoutASessionExitsOneAndPrintsNothing(t *testing.T) {
+func TestRunJSONWithoutADaemonExitsOneAndPrintsNothing(t *testing.T) {
 	c := newCLI(t)
 	stdout, stderr, code := c.run("run", "-json")
 	if code != 1 {
 		t.Fatalf("exit %d, want 1", code)
 	}
 	if stdout != "" {
-		t.Errorf("stdout = %q, want no document when the runner never started", stdout)
+		t.Errorf("stdout = %q, want no document when the run never started", stdout)
 	}
-	if !strings.Contains(stderr, "Herdr") {
-		t.Errorf("stderr = %q", stderr)
+	if !strings.Contains(stderr, "daemon") && !strings.Contains(stderr, "XDG_RUNTIME_DIR") {
+		t.Errorf("stderr = %q, want the daemon connection reason", stderr)
 	}
 }
 

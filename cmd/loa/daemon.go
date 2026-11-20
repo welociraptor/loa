@@ -12,15 +12,19 @@ import (
 
 	"loa/internal/daemon"
 	"loa/internal/herdr"
+	"loa/internal/store"
 )
 
 // cmdDaemon serves the control socket, or asks a running one for its status.
-// It does no work of its own yet: landing the supervisor before it moves a task
-// is what makes it watchable.
+// The run flags are the one place the daemon's default budget lives; `loa run`
+// and the tab may narrow it for one run, but a run request cannot change it.
 func cmdDaemon(ctx context.Context, args []string) error {
 	var status bool
+	var flags runFlags
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	db := fs.String("db", defaultDB(), "path to the task database")
 	fs.BoolVar(&status, "status", false, "report the running daemon and exit")
+	registerRunFlags(fs, &flags)
 	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -33,8 +37,20 @@ func cmdDaemon(ctx context.Context, args []string) error {
 		return daemonStatus(ctx)
 	}
 
+	s, err := store.Open(ctx, *db)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	backend, err := newRunnerBackend(flags)
+	if err != nil {
+		return err
+	}
+
 	// The daemon outlives the shell but not a supervisor's SIGTERM. Catching both
-	// signals here is what makes the socket cleanup below run on the way out.
+	// signals here is what makes the socket cleanup and the run's cleanup below
+	// happen on the way out.
 	sigctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -44,6 +60,7 @@ func cmdDaemon(ctx context.Context, args []string) error {
 			_, err := (&herdr.Client{}).CheckStatus(ctx)
 			return err
 		},
+		Runner: newRunnerConfig(s, backend, flags, os.Stderr),
 	})
 }
 

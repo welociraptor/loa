@@ -112,9 +112,6 @@ func run(ctx context.Context, m Model, t terminal, signals <-chan os.Signal, pri
 		var cmd Cmd
 		select {
 		case <-ctx.Done():
-			if m.cancel != nil {
-				m.cancel()
-			}
 			return ctx.Err()
 		case k, ok := <-keys:
 			if !ok {

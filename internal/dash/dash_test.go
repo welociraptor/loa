@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,12 +28,23 @@ func (f fakeSession) Agents(context.Context) ([]herdr.Agent, error) { return f.a
 
 // fakeControls records what the tab asked for.
 type fakeControls struct {
+	mu      sync.Mutex
 	calls   []string
 	err     error
 	runHook func(ctx context.Context) error
 }
 
-func (f *fakeControls) record(call string) { f.calls = append(f.calls, call) }
+func (f *fakeControls) record(call string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, call)
+}
+
+func (f *fakeControls) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
 
 func (f *fakeControls) Focus(_ context.Context, row live.Row) error {
 	f.record("focus " + row.WorkspaceID)
@@ -68,6 +80,11 @@ func (f *fakeControls) Run(ctx context.Context) error {
 	if f.runHook != nil {
 		return f.runHook(ctx)
 	}
+	return f.err
+}
+
+func (f *fakeControls) Stop(context.Context) error {
+	f.record("stop")
 	return f.err
 }
 
@@ -321,17 +338,15 @@ func TestActiveRunFromAnotherOwnerIsShownAndRefusesRun(t *testing.T) {
 		t.Fatal("s started a run while another owner's run is active")
 	}
 	view := asModel(t, next).View()
-	for _, want := range []string{"run 12 is active (owner coordinator)", "loa runs -close 12"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("the refusal does not name %q:\n%s", want, view)
-		}
+	if !strings.Contains(view, "run 12 is active (owner coordinator)") {
+		t.Errorf("the refusal does not name the run:\n%s", view)
 	}
-	if len(c.calls) != 0 {
+	if len(c.Calls()) != 0 {
 		t.Errorf("the tab called controls while a run was active: %v", c.calls)
 	}
 }
 
-func TestStopIsANoOpWithoutALocalRun(t *testing.T) {
+func TestStopStopsTheActiveRunWhoeverStartedIt(t *testing.T) {
 	s, session, _, _ := seed(t)
 	c := &fakeControls{}
 	m := loaded(t, s, session, c)
@@ -341,12 +356,16 @@ func TestStopIsANoOpWithoutALocalRun(t *testing.T) {
 	m = step(t, m, msg)
 
 	next, cmd := m.Update(key("S"))
-	if cmd != nil {
-		t.Fatal("S produced a command for a run this tab did not start")
+	if cmd == nil {
+		t.Fatal("S produced no stop request")
 	}
-	view := asModel(t, next).View()
-	if strings.Contains(view, "stopping") {
-		t.Errorf("S claimed to stop another owner's run:\n%s", view)
+	m = asModel(t, next)
+	if !strings.Contains(m.View(), "stopping the run") {
+		t.Errorf("S did not say it was stopping the run:\n%s", m.View())
+	}
+	run(t, cmd)
+	if calls := c.Calls(); len(calls) != 1 || calls[0] != "stop" {
+		t.Fatalf("calls = %v, want the stop request", calls)
 	}
 }
 
@@ -369,7 +388,7 @@ func TestLocalRunStartsAndStops(t *testing.T) {
 		t.Errorf("the tab does not say the run started:\n%s", m.View())
 	}
 
-	// Before the next snapshot, the local cancel keeps a second run out.
+	// Before the next snapshot, the pending request keeps a second run out.
 	next, second := m.Update(key("s"))
 	if second != nil {
 		t.Fatal("a second run was started")
@@ -378,10 +397,14 @@ func TestLocalRunStartsAndStops(t *testing.T) {
 		t.Errorf("no explanation for the refusal")
 	}
 
-	next, _ = m.Update(key("S"))
+	next, stopCmd := m.Update(key("S"))
+	if stopCmd == nil {
+		t.Fatal("S produced no stop request")
+	}
 	if !strings.Contains(asModel(t, next).View(), "stopping the run") {
 		t.Errorf("S did not stop this tab's run")
 	}
+	run(t, stopCmd)
 
 	close(block)
 	next, _ = m.Update(run(t, cmd))

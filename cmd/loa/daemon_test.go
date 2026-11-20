@@ -67,6 +67,7 @@ func startDaemonIn(t *testing.T, dir string) *daemonProc {
 func daemonEnv(dir string) []string {
 	env := []string{
 		"XDG_RUNTIME_DIR=" + dir,
+		"LOA_DB=" + filepath.Join(dir, "tasks.db"),
 		// A directory that exists but has no herdr: the daemon must serve anyway.
 		"PATH=" + filepath.Join(dir, "empty-bin"),
 	}
@@ -229,6 +230,51 @@ func TestDaemonRefusesAWrongVersionClient(t *testing.T) {
 	}
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Error("the connection stayed open after the version refusal")
+	}
+}
+
+func TestRunJSONThroughTheDaemonKeepsItsShape(t *testing.T) {
+	dir := t.TempDir()
+	env := daemonEnv(dir)
+	if _, errOut, code := runDaemonCLI(t, env, "add", "-workspace", "loa", "-title", "runs in the daemon"); code != 0 {
+		t.Fatalf("add exited %d: %s", code, errOut)
+	}
+	startDaemonIn(t, dir)
+
+	stdout, stderr, code := runDaemonCLI(t, env, "run", "-json", "-workers", "1", "-max", "1")
+	if code != 0 {
+		t.Fatalf("run -json exited %d: %s", code, stderr)
+	}
+	var got struct {
+		Run struct {
+			ID        int64  `json:"id"`
+			StartedAt string `json:"started_at"`
+			EndedAt   string `json:"ended_at"`
+			Workers   int    `json:"workers"`
+			MaxTasks  int    `json:"max_tasks"`
+			Done      int    `json:"done"`
+			Failed    int    `json:"failed"`
+		} `json:"run"`
+		Tasks []struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+			Branch string `json:"branch"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("run -json is not one JSON document: %v: %q", err, stdout)
+	}
+	if got.Run.ID == 0 || got.Run.StartedAt == "" || got.Run.EndedAt == "" {
+		t.Errorf("run = %+v, want the recorded row", got.Run)
+	}
+	if got.Run.Workers != 1 || got.Run.MaxTasks != 1 {
+		t.Errorf("budget = %d/%d, want the request's 1/1", got.Run.Workers, got.Run.MaxTasks)
+	}
+	if len(got.Tasks) != 1 || got.Tasks[0].ID != 1 || got.Tasks[0].Status != "failed" {
+		t.Errorf("tasks = %+v, want the one failed attempt without a session", got.Tasks)
+	}
+	if got.Run.Done != 0 || got.Run.Failed != 1 {
+		t.Errorf("counts = (%d, %d), want (0, 1)", got.Run.Done, got.Run.Failed)
 	}
 }
 

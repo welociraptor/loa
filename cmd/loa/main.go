@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/term"
 
+	"loa/internal/daemon"
 	"loa/internal/dash"
 	"loa/internal/herdr"
 	"loa/internal/live"
@@ -49,13 +50,15 @@ usage:
   loa done   ID [-branch BRANCH] [-result TEXT]
   loa fail   ID [-result TEXT]
   loa run    [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR] [-json]
+                                   # ask the daemon for a run; flags narrow its defaults
   loa runs   [-limit N] [-json] [-close ID]   # every run, newest first; -close settles a dead one
   loa merge  ID [-into BRANCH]     # merge an approved, green review; never pushes
   loa dash   [-workers N] [-max N] # the tab: state, and the keys to act
-  loa daemon [-status]             # the control socket; -status asks the running one
+  loa daemon [-status] [-workers N] [-max N] [-timeout 45m] [-check CMD] [-prompts DIR]
+                                   # the control socket; its flags are the default run budget
   loa version                      # the release and commit this binary was built from
 
-all commands except version and daemon accept -db PATH (default $LOA_DB, else loa.db)`
+all commands accept -db PATH (default $LOA_DB, else loa.db)`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -130,19 +133,27 @@ func defaultDB() string {
 // open builds a flag set for one command, parses args, and returns the opened
 // store along with the positional arguments.
 func open(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, error) {
+	s, positional, _, err := openFlags(ctx, name, args, register)
+	return s, positional, err
+}
+
+// openFlags is open with the parsed flag set returned, for commands whose
+// semantics depend on which flags a caller actually set rather than on their
+// zero values.
+func openFlags(ctx context.Context, name string, args []string, register func(*flag.FlagSet)) (*store.Store, []string, *flag.FlagSet, error) {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	db := fs.String("db", defaultDB(), "path to the task database")
 	register(fs)
 
 	positional, err := parseFlags(fs, args)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	s, err := store.Open(ctx, *db)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return s, positional, nil
+	return s, positional, fs, nil
 }
 
 // parseFlags allows flags to appear after positional arguments, which the
@@ -958,30 +969,55 @@ func registerRunFlags(fs *flag.FlagSet, f *runFlags) {
 	fs.StringVar(&f.kind, "kind", "pi", "agent kind Herdr starts")
 }
 
-// buildRunner assembles the runner both commands use. One binary, one way to
-// work the queue. logw is separate from the process's stderr because `dash`
-// owns the terminal it runs on: its run log goes to a file.
-func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer) (*runner.Runner, error) {
-	if !herdr.InSession() {
-		return nil, errors.New("not inside a Herdr pane (HERDR_ENV is not 1), so there is no session to work in")
-	}
-	client := &herdr.Client{}
-	if _, err := client.CheckStatus(ctx); err != nil {
-		return nil, err
-	}
+// runOptionsFrom reads the flags a caller actually supplied. An unset flag must
+// leave the daemon's default alone; sending the command's own default would let
+// `loa run` silently undo the daemon's policy.
+func runOptionsFrom(fs *flag.FlagSet, f runFlags) daemon.RunOptions {
+	var o daemon.RunOptions
+	fs.Visit(func(flag *flag.Flag) {
+		switch flag.Name {
+		case "workers":
+			o.Workers = f.workers
+		case "max":
+			o.MaxTasks = f.maxTasks
+		case "base":
+			o.Base = f.base
+		case "prompts":
+			o.PromptsDir = f.promptsDir
+		case "check":
+			o.Check = f.check
+		case "timeout":
+			o.TaskTimeout = f.timeout
+		case "ttl":
+			o.LeaseTTL = f.ttl
+		case "model":
+			o.Model = f.model
+		case "kind":
+			o.Kind = f.kind
+		}
+	})
+	return o
+}
 
+// newRunnerBackend is the real backend. A run invoked by the daemon cannot
+// claim to be inside a pane, so the session check belongs to the commands that
+// mean "the human is looking at one", not here.
+func newRunnerBackend(f runFlags) (*runner.Herdr, error) {
 	agentArgs := []string{"--no-session"}
 	if f.model != "" {
 		agentArgs = append(agentArgs, "--model", f.model)
 	}
+	return &runner.Herdr{
+		Client:    &herdr.Client{},
+		AgentKind: f.kind,
+		AgentArgs: agentArgs,
+	}, nil
+}
 
-	return runner.New(runner.Config{
-		Store: s,
-		Backend: &runner.Herdr{
-			Client:    client,
-			AgentKind: f.kind,
-			AgentArgs: agentArgs,
-		},
+func newRunnerConfig(s *store.Store, backend *runner.Herdr, f runFlags, logw io.Writer) runner.Config {
+	return runner.Config{
+		Store:       s,
+		Backend:     backend,
 		Base:        f.base,
 		PromptsDir:  f.promptsDir,
 		Check:       f.check,
@@ -990,13 +1026,13 @@ func buildRunner(ctx context.Context, s *store.Store, f runFlags, logw io.Writer
 		LeaseTTL:    f.ttl,
 		TaskTimeout: f.timeout,
 		Logger:      log.New(logw, "loa: ", log.LstdFlags),
-	})
+	}
 }
 
 func cmdRun(ctx context.Context, args []string) error {
 	var flags runFlags
 	var asJSON bool
-	s, positional, err := open(ctx, "run", args, func(fs *flag.FlagSet) {
+	s, positional, fs, err := openFlags(ctx, "run", args, func(fs *flag.FlagSet) {
 		registerRunFlags(fs, &flags)
 		fs.BoolVar(&asJSON, "json", false, "emit the run outcome as JSON")
 	})
@@ -1009,11 +1045,11 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
 
-	r, err := buildRunner(ctx, s, flags, os.Stderr)
+	path, err := daemon.SocketPath()
 	if err != nil {
 		return err
 	}
-	stats, runErr := r.Run(ctx)
+	stats, runErr := (&daemon.Client{Path: path}).Run(ctx, runOptionsFrom(fs, flags))
 
 	// A run that never started has no row to report; the error says why.
 	if asJSON && stats.Run.ID != 0 {
@@ -1172,6 +1208,7 @@ type controls struct {
 	client *herdr.Client
 	store  *store.Store
 	runFn  func(ctx context.Context) error
+	stopFn func(ctx context.Context) error
 }
 
 func (c controls) Focus(ctx context.Context, row live.Row) error {
@@ -1202,13 +1239,15 @@ func (c controls) Resolve(ctx context.Context, taskID int64, done bool, result s
 
 func (c controls) Run(ctx context.Context) error { return c.runFn(ctx) }
 
+func (c controls) Stop(ctx context.Context) error { return c.stopFn(ctx) }
+
 func cmdDash(ctx context.Context, args []string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		return errors.New("dash needs a terminal")
 	}
 
 	var flags runFlags
-	s, positional, err := open(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
+	s, positional, fs, err := openFlags(ctx, "dash", args, func(fs *flag.FlagSet) { registerRunFlags(fs, &flags) })
 	if err != nil {
 		return err
 	}
@@ -1218,37 +1257,20 @@ func cmdDash(ctx context.Context, args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
 
-	// The tab owns the terminal. A run started from it must not write the runner's
-	// log over the view, so the log goes to a file and the path is printed once.
-	if err := os.MkdirAll(defaultStateDir(), 0o700); err != nil {
-		return fmt.Errorf("dash: state dir: %w", err)
-	}
-	logPath := filepath.Join(defaultStateDir(), "dash.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: the state dir the runner already owns
-	if err != nil {
-		return fmt.Errorf("dash: run log: %w", err)
-	}
-	defer func() { _ = logFile.Close() }()
-
-	client := &herdr.Client{}
-	r, err := buildRunner(ctx, s, flags, logFile)
+	path, err := daemon.SocketPath()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "loa: run log: %s\n", logPath)
+	client := &herdr.Client{}
+	d := &daemon.Client{Path: path}
+	opts := runOptionsFrom(fs, flags)
 
 	c := controls{client: client, store: s}
 	c.runFn = func(ctx context.Context) error {
-		// Progress is the tab's job, not a log line's: the summary lands in the
-		// message line, and the details are already in the log file.
-		stats, err := r.Run(ctx)
-		if err != nil {
-			return err
-		}
-		// A failed write here is a full disk; the run still happened.
-		_, _ = fmt.Fprintf(logFile, "loa: %d task(s): %d done, %d failed\n", stats.Tasks, stats.Completed, stats.Failed)
-		return nil
+		_, err := d.Run(ctx, opts)
+		return err
 	}
+	c.stopFn = func(ctx context.Context) error { return d.Stop(ctx) }
 
 	return dash.Run(ctx, dash.New(s, client, c), os.Stdin, os.Stdout)
 }

@@ -17,6 +17,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"loa/internal/runner"
+	"loa/internal/store"
 )
 
 const (
@@ -27,23 +30,34 @@ const (
 )
 
 // Config is what the process supplies to the daemon. PeerCheck is injectable so
-// the refusal of a foreign uid can be tested without a second user.
+// the refusal of a foreign uid can be tested without a second user. Runner is
+// the daemon's default budget and its backend; a run request may narrow that
+// budget but not replace its store or backend.
 type Config struct {
 	Logger    *log.Logger
 	PeerCheck func(*net.UnixConn) error
 	Probe     func(context.Context) error
+	Store     *store.Store
+	Backend   runner.Backend
+	Runner    runner.Config
 }
 
-// Server answers requests. It owns only its own state: no runs, no database.
+// Server answers requests. It owns the runs and the leases they take; every
+// queue operation still reaches SQLite directly.
 type Server struct {
 	logger    *log.Logger
 	peerCheck func(*net.UnixConn) error
 	probeFn   func(context.Context) error
 	started   time.Time
+	runner    runner.Config
 
-	mu     sync.Mutex
-	paused bool
-	run    *ActiveRun
+	mu           sync.Mutex
+	paused       bool
+	run          *ActiveRun
+	running      bool
+	runCancel    context.CancelFunc
+	shuttingDown bool
+	runWG        sync.WaitGroup
 }
 
 // Run starts the daemon and serves until ctx is cancelled. The runtime lock is
@@ -70,6 +84,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = lock.Close() }()
 
+	// Reconcile before the socket exists: by the time a client can connect, a
+	// dead run's row is already settled and its workspaces have been looked at.
+	srv := newServer(cfg)
+	srv.reconcileStart(ctx)
+
 	sockPath := filepath.Join(dir, socketName)
 	// The lock is ours, so anything at the socket path is debris.
 	if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -90,7 +109,6 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("daemon: socket mode: %w", err)
 	}
 
-	srv := newServer(cfg)
 	srv.logf("daemon: pid %d listening on %s (protocol %d)", os.Getpid(), sockPath, Protocol)
 
 	return srv.serve(ctx, ln)
@@ -164,11 +182,19 @@ func newServer(cfg Config) *Server {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	runCfg := cfg.Runner
+	if runCfg.Store == nil {
+		runCfg.Store = cfg.Store
+	}
+	if runCfg.Backend == nil {
+		runCfg.Backend = cfg.Backend
+	}
 	return &Server{
 		logger:    logger,
 		peerCheck: cfg.PeerCheck,
 		probeFn:   cfg.Probe,
 		started:   time.Now(),
+		runner:    runCfg,
 	}
 }
 
@@ -204,6 +230,7 @@ func (s *Server) serve(ctx context.Context, ln *net.UnixListener) error {
 		conn, err := ln.AcceptUnix()
 		if err != nil {
 			if ctx.Err() != nil {
+				s.shutdown()
 				return nil
 			}
 			return fmt.Errorf("daemon: accept: %w", err)
@@ -213,7 +240,7 @@ func (s *Server) serve(ctx context.Context, ln *net.UnixListener) error {
 			_ = conn.Close()
 			continue
 		}
-		go s.serveConn(conn)
+		go s.serveConn(ctx, conn)
 	}
 }
 
@@ -224,14 +251,14 @@ func (s *Server) checkPeer(conn *net.UnixConn) error {
 	return checkPeerUID(conn)
 }
 
-func (s *Server) serveConn(conn *net.UnixConn) {
+func (s *Server) serveConn(ctx context.Context, conn *net.UnixConn) {
 	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(bytes.TrimSpace(line)) > 0 {
-			resp, closeAfter := s.handleLine(line)
+			resp, closeAfter := s.handleLine(ctx, line)
 			if err := json.NewEncoder(conn).Encode(resp); err != nil {
 				return
 			}
@@ -245,7 +272,7 @@ func (s *Server) serveConn(conn *net.UnixConn) {
 	}
 }
 
-func (s *Server) handleLine(line []byte) (Response, bool) {
+func (s *Server) handleLine(ctx context.Context, line []byte) (Response, bool) {
 	if len(line) > maxRequest {
 		return Response{V: Protocol, OK: false, Error: "request is too large"}, true
 	}
@@ -264,8 +291,10 @@ func (s *Server) handleLine(line []byte) (Response, bool) {
 		status := s.status()
 		return Response{V: Protocol, OK: true, Status: &status}, false
 	case "stop":
-		// No run exists yet; accepting the verb keeps the client contract stable.
+		s.stop()
 		return Response{V: Protocol, OK: true}, false
+	case "run":
+		return s.runRequest(ctx, req.Run), false
 	case "pause":
 		s.mu.Lock()
 		s.paused = true
@@ -279,6 +308,130 @@ func (s *Server) handleLine(line []byte) (Response, bool) {
 	default:
 		return Response{V: Protocol, OK: false, Error: fmt.Sprintf("unknown verb %q", req.Do)}, false
 	}
+}
+
+// reconcileStart repairs what a dead daemon left behind before the socket
+// accepts work. The runtime lock proves no other daemon is live, so an open run
+// row belongs to a process that is gone and can be settled without waiting for
+// a person to run `loa runs -close`. Workspaces are then reconciled the same
+// way a run does it: leases, not the run row, decide what is still held.
+func (s *Server) reconcileStart(ctx context.Context) {
+	if s.runner.Store == nil {
+		return
+	}
+	active, err := s.runner.Store.ActiveRun(ctx)
+	if err != nil {
+		s.logf("daemon: reconcile: active run: %v", err)
+		return
+	}
+	if active != nil {
+		if err := s.runner.Store.SettleRun(ctx, active.ID); err != nil {
+			s.logf("daemon: reconcile: settle run %d: %v", active.ID, err)
+		} else {
+			s.logf("daemon: reconcile: settled dead run %d (%s)", active.ID, active.Owner)
+		}
+	}
+	if s.runner.Backend == nil {
+		return
+	}
+	r, err := runner.New(s.runner)
+	if err != nil {
+		s.logf("daemon: reconcile: %v", err)
+		return
+	}
+	reconcileCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	r.Reconcile(reconcileCtx)
+}
+
+// shutdown cancels the run in flight and waits for its cleanup. A run that
+// loses its daemon leaves its lease to lapse, exactly as a cancelled run did
+// before the daemon existed.
+func (s *Server) shutdown() {
+	s.mu.Lock()
+	s.shuttingDown = true
+	cancel := s.runCancel
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		s.logf("daemon: shutdown: a run did not finish cleaning up")
+	}
+}
+
+func (s *Server) stop() {
+	s.mu.Lock()
+	cancel := s.runCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// runRequest starts one run with the daemon's defaults, narrowed by the
+// request. The context is the daemon's, not the connection's: a client that
+// hangs up does not stop the work.
+func (s *Server) runRequest(ctx context.Context, opts *RunOptions) Response {
+	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		return Response{V: Protocol, OK: false, Error: "daemon is shutting down"}
+	}
+	if s.running {
+		active := s.run
+		s.mu.Unlock()
+		if active != nil {
+			return Response{V: Protocol, OK: false, Error: fmt.Sprintf("a run is already active (run %d)", active.ID)}
+		}
+		return Response{V: Protocol, OK: false, Error: "a run is already active"}
+	}
+
+	cfg := opts.Apply(s.runner)
+	if cfg.Store == nil || cfg.Backend == nil {
+		s.mu.Unlock()
+		return Response{V: Protocol, OK: false, Error: "runs are not configured"}
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.running = true
+	s.runCancel = cancel
+	s.runWG.Add(1)
+	s.mu.Unlock()
+
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		s.running = false
+		s.runCancel = nil
+		s.run = nil
+		s.mu.Unlock()
+		s.runWG.Done()
+	}()
+
+	cfg.OnStart = func(run store.Run) {
+		s.mu.Lock()
+		s.run = &ActiveRun{ID: run.ID, Owner: run.Owner, StartedAt: run.StartedAt}
+		s.mu.Unlock()
+	}
+	r, err := runner.New(cfg)
+	if err != nil {
+		return Response{V: Protocol, OK: false, Error: err.Error()}
+	}
+
+	stats, runErr := r.Run(runCtx)
+	resp := Response{V: Protocol, OK: runErr == nil, Run: resultOf(stats)}
+	if runErr != nil {
+		resp.Error = runErr.Error()
+	}
+	return resp
 }
 
 func versionRefusal(version int) Response {
