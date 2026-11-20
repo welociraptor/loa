@@ -144,10 +144,14 @@ from the result.
 narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
 `-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
 timeout or ttl, a wider budget, or a different `-check` when the daemon has one
-is refused before a run starts. The daemon probes `herdr status` at start and
-logs the result; a protocol or version mismatch then shows up as failed attempts
-rather than as a run that cannot start. `triage` and `plan` still require a
-Herdr pane, because they open a workspace for a person to watch.
+is refused before a run starts. The daemon probes `herdr status` once at start
+and logs the result. Automatic runs are gated on the probe: every `-auto` tick
+probes again, and a failed probe skips that tick and is retried at the next
+interval, so a daemon started before Herdr is up spends neither a lease nor
+`-daily` on doomed attempts. A manual `loa run` is not gated: a protocol or
+version mismatch there reaches the run as failed attempts, because a person
+asked for that work. `triage` and `plan` still require a Herdr pane, because
+they open a workspace for a person to watch.
 
 ## The daemon
 

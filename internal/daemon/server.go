@@ -228,10 +228,22 @@ func (s *Server) logf(format string, args ...any) {
 	s.logger.Printf(format, args...)
 }
 
-func (s *Server) probe(ctx context.Context) {
+// probe asks Herdr whether it answers, within the daemon's timeout, and returns
+// the answer. No configured probe means nothing to ask.
+func (s *Server) probe(ctx context.Context) error {
+	if s.probeFn == nil {
+		return nil
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	if err := s.probeFn(probeCtx); err != nil {
+	return s.probeFn(probeCtx)
+}
+
+// probeStartup is the diagnostic a daemon logs once it is up. It does not gate
+// anything: a manual run reaches a dead Herdr as a failed attempt, which is
+// what the person who asked for it will see. Automatic runs are gated in tick.
+func (s *Server) probeStartup(ctx context.Context) {
+	if err := s.probe(ctx); err != nil {
 		s.logf("daemon: herdr status: %v", err)
 		return
 	}
@@ -240,7 +252,7 @@ func (s *Server) probe(ctx context.Context) {
 
 func (s *Server) serve(ctx context.Context, ln *net.UnixListener) error {
 	if s.probeFn != nil {
-		go s.probe(ctx)
+		go s.probeStartup(ctx)
 	}
 	if s.auto {
 		go s.schedule(ctx)
@@ -482,9 +494,11 @@ func (s *Server) start(ctx context.Context, opts *RunOptions, auto bool) Respons
 	return resp
 }
 
-// schedule is the one timer automatic runs need. Each tick asks one question:
-// should the queue be worked now? The interval is the floor for an idle queue,
-// so a tick that finds no work is one pass over the queue, not a spin.
+// schedule is the one timer automatic runs need. Each tick asks two questions:
+// does Herdr answer, and should the queue be worked now? The interval is the
+// floor for an idle queue, so a tick that finds no work is one pass over the
+// queue, not a spin; a tick whose probe fails is skipped and retried at the
+// next interval.
 func (s *Server) schedule(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -503,6 +517,16 @@ func (s *Server) tick(ctx context.Context) {
 	paused, running := s.paused, s.running
 	s.mu.Unlock()
 	if paused || running || s.runner.Store == nil {
+		return
+	}
+
+	// Herdr is the execution substrate: starting a run against a dead one only
+	// spends a task's attempt. A failed probe skips this tick; the next one
+	// probes again, so a daemon started before Herdr recovers on its own.
+	if err := s.probe(ctx); err != nil {
+		if ctx.Err() == nil {
+			s.logf("daemon: auto run: herdr status: %v; skipping this interval", err)
+		}
 		return
 	}
 

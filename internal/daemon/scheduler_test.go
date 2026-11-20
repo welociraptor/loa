@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,107 @@ func autoRunConfig(s *store.Store, b *blockingBackend) runner.Config {
 	cfg.Workers = 1
 	cfg.MaxTasks = 1
 	return cfg
+}
+
+// probeStub stands in for `herdr status`: the test decides when Herdr answers,
+// so no real Herdr is needed to see what the scheduler does with each answer.
+type probeStub struct {
+	mu    sync.Mutex
+	fail  bool
+	calls int
+}
+
+func (p *probeStub) probe(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.fail {
+		return errors.New("herdr status: no server")
+	}
+	return nil
+}
+
+func (p *probeStub) setFail(fail bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fail = fail
+}
+
+func (p *probeStub) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func TestAutoWaitsForASuccessfulProbe(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	b := newBlockingBackend()
+	addRunTask(t, s)
+
+	probe := &probeStub{fail: true}
+	r := start(t, Config{
+		Runner: autoRunConfig(s, b), Auto: true, Interval: 20 * time.Millisecond,
+		Probe: probe.probe,
+	})
+	defer r.stop(t)
+
+	// The probe is retried every interval, not once at startup, so Herdr's
+	// recovery is noticed without restarting the daemon.
+	waitFor(t, "the probe to be retried each interval", func() bool { return probe.count() >= 3 })
+	runs, err := s.Runs(ctx, 10)
+	if err != nil {
+		t.Fatalf("runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %d, want none while the probe fails", len(runs))
+	}
+
+	probe.setFail(false)
+	select {
+	case <-b.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("auto did not start a run after the probe succeeded")
+	}
+}
+
+func TestManualRunIsNotGatedByTheProbe(t *testing.T) {
+	ctx := context.Background()
+	s := daemonStore(t)
+	b := newBlockingBackend()
+	addRunTask(t, s)
+
+	probe := &probeStub{fail: true}
+	r := start(t, Config{
+		Runner: autoRunConfig(s, b), Auto: true, Interval: 20 * time.Millisecond,
+		Probe: probe.probe,
+	})
+	defer r.stop(t)
+
+	client := &Client{Path: r.sock}
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Run(ctx, RunOptions{MaxTasks: 1})
+		result <- err
+	}()
+
+	select {
+	case <-b.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a manual run was gated on the probe")
+	}
+
+	if err := client.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Error("a stopped manual run reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the manual run did not finish after stop")
+	}
 }
 
 func TestAutoStartsARunWithinOneInterval(t *testing.T) {

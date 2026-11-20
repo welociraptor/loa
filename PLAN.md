@@ -792,12 +792,17 @@ the documents say that instead of implying a sandbox.
   run and the uptime, or exits non-zero: "is it up" has to be answerable by a
   script. The pane requirement is replaced by the probe it always meant:
   `InSession()` is `HERDR_ENV=1`, which a daemon cannot honestly claim, so the
-  daemon requires `herdr status` and the pane check stays only where it means
-  "the human is looking at a session" (`triage`). Test: the second daemon
-  refuses; a stale socket is reclaimed after `kill -9` and refused while a live
-  holder exists; a wrong-version client is refused; SIGTERM removes the socket;
-  the peer check rejects a foreign uid through an injected credential check, not
-  a second user.
+  daemon probes `herdr status` and the pane check stays only where it means
+  "the human is looking at a session" (`triage`). The startup probe is a logged
+  diagnostic, not a gate. Automatic starts are gated on a probe that runs again
+  on every `-auto` tick: a failed probe skips that tick and the next interval
+  tries again, so a daemon started before Herdr neither leases a task nor spends
+  `-daily` on attempts that cannot run. A manual run is not gated and reaches
+  its failure as failed attempts, which is what the person who asked for it
+  sees. Test: the second daemon refuses; a stale socket is reclaimed after
+  `kill -9` and refused while a live holder exists; a wrong-version client is
+  refused; SIGTERM removes the socket; the peer check rejects a foreign uid
+  through an injected credential check, not a second user.
 
 - [x] **38. Runs move into the daemon.** `loa run` becomes a client: the request
   starts a run in the daemon and the same outcome line comes back, `-json`
@@ -816,9 +821,10 @@ the documents say that instead of implying a sandbox.
   visible to another; a dead daemon's row is settled on the next start.
 
 - [x] **39. The scheduler, behind a flag and a brake.** `-auto`, off by default.
-  With it on the daemon starts a run when a task is claimable, no run is active,
-  and the last settled run is older than `-idle`; it stops starting when `-max`
-  (per run) or `-daily` (tasks settled today, counted from `runs`) is spent.
+  With it on the daemon starts a run when a task is claimable, Herdr answers the
+  probe, no run is active, and the last settled run is older than `-idle`; it
+  stops starting when `-max` (per run) or `-daily` (tasks settled today, counted
+  from `runs`) is spent.
   `loa pause` and `loa resume` stop and start auto-starting without touching the
   run in flight; pause lives in the daemon's memory, so a restart resumes —
   documented, because a brake that survives a restart is a file, and a file that
@@ -827,7 +833,8 @@ the documents say that instead of implying a sandbox.
   rather than by a conversation with a model. Test: `-auto` starts a run within
   one interval; `-pause` does not; no second run while one is active; `-daily`
   exhausted stops it; an empty queue is not a busy loop, the interval is the
-  floor.
+  floor; a failed probe skips the tick and a later success starts a run on the
+  next one; a manual run is not gated by the probe.
 
 - [x] **40. The unit, and the documents.** A systemd user unit is where the
   policy lives — `loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12`,
@@ -930,7 +937,8 @@ decisions define that mode; each widens the old design deliberately.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup
-  (`herdr status`, protocol 22 today) but not pinned: an upgrade that changes
+  and again before every automatic start (`herdr status`, protocol 22 today) but
+  not pinned: an upgrade that changes
   `agent prompt` flags will fail a run before it damages one.
 - **Focus actions need a live session.** `ps` and `dash` still show the queue
   without Herdr; only the actions that address a pane are disabled.
