@@ -1,0 +1,26 @@
+[Unit]
+Description=loa task daemon
+
+[Service]
+Type=simple
+# The control socket is $XDG_RUNTIME_DIR/loa/sock; %t is the user manager's
+# runtime directory. systemd removes the directory when the unit stops, so a
+# crashed daemon leaves at most a dead lock and socket for the next start to
+# reclaim.
+Environment=XDG_RUNTIME_DIR=%t
+RuntimeDirectory=loa
+RuntimeDirectoryMode=0700
+# Keep the queue in the user's state directory, not in the checkout.
+Environment=LOA_DB=%S/loa/tasks.db
+StateDirectory=loa
+StateDirectoryMode=0700
+# Role prompts are found by walking up from here. Point this at the checkout
+# that owns prompts/, and ExecStart at the installed binary.
+WorkingDirectory=%h/Repositories/loa
+# The flags are the policy. Edit this unit rather than a config that can drift.
+ExecStart=%h/.nix-profile/bin/loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

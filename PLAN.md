@@ -15,9 +15,11 @@ is something to look at rather than a timeout to interpret.
 
 ## Where things stand
 
-    cmd/loa/main.go                 1367   the CLI: add | list | show | cancel | ps | report
+    cmd/loa/main.go                 1399   the CLI: add | list | show | cancel | ps | report
                                            import | triage | plan | lease | unblock | resolve
-                                           done | fail | run | runs | merge | dash
+                                           done | fail | run | runs | merge | dash | daemon
+                                           pause | resume
+    cmd/loa/daemon.go                154   the supervisor, its policy flags, and -status
     cmd/loa/merge.go                 232   loa merge: the one deterministic transition
     cmd/loa/version.go                52   what the binary was built from
     internal/store/store.go          878   lease, deps, scopes, retries, cancel
@@ -37,12 +39,15 @@ is something to look at rather than a timeout to interpret.
     internal/live/live.go            201   queue joined with the session (`ps`)
     internal/dash/dash.go            437   the tab: model, keys, view (plain strings)
     internal/dash/run.go             259   raw mode, key decoding, one select loop
+    internal/daemon/server.go        643   the socket, the runs, and the scheduler
+    internal/daemon/protocol.go      199   versioned NDJSON; client and server types
     internal/report/report.go        221   the day: done, blocked, queued, open, gap
     internal/taskspec/taskspec.go    303   a proposal or plan: strict parse, compile
     internal/taskspec/verdict.go     146   verdict.json: strict parse
     internal/triage/triage.go        236   what the triage agent reads and writes back
     workflows/workflow.go            125   prompts, check, merge policy, stages
-    tests                           9270   274 tests, `-race` clean
+    contrib/loa.service               26   the flags that are the policy
+    tests                          10595   305 tests, `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a
@@ -348,20 +353,16 @@ written and checked by hand against a live session.
 
 ### Starting a run
 
-Decision: no timer. A run starts when a person or a coordinator starts it —
-`s` in the dashboard, `loa run`, or `loa run -json`. Three reasons, in order of
-weight:
-
-1. The failure mode that matters is a blocked agent, and that needs a person.
-   A scheduler delivers work to nobody.
-2. A session started by a unit is a session the human is not looking at, which
-   is the exact problem the dashboard exists to solve.
-3. "Daily" is a habit plus a legible record, not an alarm clock.
-
-What it costs: a forgotten day is a day with no work done, and nothing says so
-until someone looks. `report` (step 24) covers that by naming the gap —
-"nothing leased since Tuesday" is a finding, and it is the right place for it.
-Revisit only if the workflow stops being supervised.
+Phase 2 decided on no timer: the failure mode that matters is a blocked agent
+and that needs a person, a session started by a unit is a session nobody is
+looking at, and "daily" was a habit plus a record. Those reasons still hold for
+the default, which is why the daemon's `-auto` is off and why `pause` is memory
+rather than a cron entry. Phase 9 adds the timer as an explicit choice: the
+daemon starts a run when a task is claimable, no run is active and the last
+settled run is older than `-idle`, and it stops at `-max` per run and `-daily`
+settled tasks per day. The policy is the unit's `ExecStart`, so turning it on is
+an edit someone reviews. A forgotten day is still possible when the daemon is
+not running; that is what `report`'s gap line and `loa daemon -status` are for.
 
 ## Phase 3 — the dashboard (done)
 
@@ -745,16 +746,18 @@ depended-on one, so the delete cannot put a hole in the chain; and
 `loa version` prints the release and build commit, so a bug report names the
 binary it came from.
 
-## Phase 9 — a daemon, and the client it serves (planned)
+## Phase 9 — a daemon, and the client it serves (done)
 
-`loa` has no daemon, and that was a decision with a reason: a process that
-outlives the shell is state nobody is watching, and a scheduler spends money with
-nobody in the room. What changed is where the work is written. The queue is now
-filled by triage, by coordinators, and by this document; a run that waits for a
-person to press a key is the slowest part of the loop, and the tab has become a
-poller of the database plus a second caller of Herdr. So the daemon arrives —
-with the two things that made it dangerous written into it rather than hoped
-for: a budget, and a brake.
+`loa` had no daemon for most of its life, and that was a decision with a reason:
+a process that outlives the shell is state nobody is watching, and a scheduler
+spends money with nobody in the room. What changed is where the work is written.
+The queue is now filled by triage, by coordinators, and by this document; a run
+that waits for a person to press a key is the slowest part of the loop, and the
+tab had become a poller of the database plus a second caller of Herdr. So the
+daemon arrived — and the two things that made it dangerous were written into it
+rather than hoped for: a budget, and a brake. It shipped in three steps: the
+socket and its protocol, then the runs, then the scheduler behind `-auto`; the
+policy that turns it on is a checked-in unit, not a default.
 
 **The daemon owns only what must be single.** Leases and the runs that take them,
 every Herdr call, the supervision of attempts, and the scheduler move into one
@@ -779,7 +782,7 @@ mismatch is refused, the way the database refuses an older binary. Anything
 running as you can already write the queue; the daemon grants nothing new, and
 the documents say that instead of implying a sandbox.
 
-- [ ] **37. The daemon, and its protocol.** `loa daemon` serves `status`, `ping`,
+- [x] **37. The daemon, and its protocol.** `loa daemon` serves `status`, `ping`,
   `stop`, `pause` and `resume` over the socket and does nothing else: no runs, no
   scheduler, so it can land and be watched before it moves any work. One instance
   is an exclusive `flock` on `$XDG_RUNTIME_DIR/loa/lock`; a second daemon exits
@@ -796,7 +799,7 @@ the documents say that instead of implying a sandbox.
   the peer check rejects a foreign uid through an injected credential check, not
   a second user.
 
-- [ ] **38. Runs move into the daemon.** `loa run` becomes a client: the request
+- [x] **38. Runs move into the daemon.** `loa run` becomes a client: the request
   starts a run in the daemon and the same outcome line comes back, `-json`
   unchanged, so coordinator scripts do not notice. The tab's `s`/`S` become
   `run`/`stop` requests, and **closing the tab no longer cancels a run** — the
@@ -812,7 +815,7 @@ the documents say that instead of implying a sandbox.
   `TestCancelledRunCleansUpAndLeavesTheLease`; a run started by one client is
   visible to another; a dead daemon's row is settled on the next start.
 
-- [ ] **39. The scheduler, behind a flag and a brake.** `-auto`, off by default.
+- [x] **39. The scheduler, behind a flag and a brake.** `-auto`, off by default.
   With it on the daemon starts a run when a task is claimable, no run is active,
   and the last settled run is older than `-idle`; it stops starting when `-max`
   (per run) or `-daily` (tasks settled today, counted from `runs`) is spent.
@@ -826,7 +829,7 @@ the documents say that instead of implying a sandbox.
   exhausted stops it; an empty queue is not a busy loop, the interval is the
   floor.
 
-- [ ] **40. The unit, and the documents.** A systemd user unit is where the
+- [x] **40. The unit, and the documents.** A systemd user unit is where the
   policy lives — `loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12`,
   `Restart=on-failure`, and the socket path. README gains the daemon section and
   the honest limits; the "Starting a run" decision and this phase's no-daemon
@@ -911,10 +914,19 @@ decisions define that mode; each widens the old design deliberately.
 
 ## Known limitations
 
-- **Nothing runs unless someone starts it.** A person, a coordinator or the
-  daemon (step 39) must start a run; a missed day is a real gap, and a crashed
-  daemon is a machine quietly not working. Step 24 reports it, but nothing
-  reminds you beforehand.
+- **Nothing runs unless the daemon or a person starts it.** `-auto` is off by
+  default; with it on, the daemon starts a run only when a task is claimable, no
+  run is active and the last settled run is older than `-idle`. A daemon that is
+  not running is quiet: `loa daemon -status` fails to connect, and `report` names
+  the gap. `Restart=on-failure` in the unit is what turns a crash into a new
+  daemon rather than a machine quietly doing nothing.
+- **A crashed daemon leaves an idle queue and a stale run row.** The task still
+  reads leased with a lapsed or lapsing lease, `loa runs` shows the open run, and
+  `loa ps` shows the attempt. `loa runs -close ID` settles that row by hand now;
+  the next daemon start does it before accepting work, then reconciles the
+  workspaces and lets the lease lapse. `add`, `list`, `show`, `ps`, `report`,
+  `import` and `cancel` keep working while it is dead, so the queue is readable
+  before it is repaired.
 - **The dashboard is one terminal and one user.** `report-metadata` is
   display-only, and there is no remote view.
 - **Herdr is a dependency of the run.** Version skew is checked at startup

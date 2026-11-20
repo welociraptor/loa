@@ -363,6 +363,20 @@ func TestPauseAndResumeCommandsAndHelp(t *testing.T) {
 	}
 }
 
+func TestDaemonHelpListsThePolicyFlags(t *testing.T) {
+	// contrib/loa.service documents this command line; a flag that vanishes
+	// from help would make the checked-in policy unparsable.
+	_, errOut, code := runDaemonCLI(t, daemonEnv(t.TempDir()), "daemon", "-h")
+	if code != 0 {
+		t.Fatalf("daemon -h exited %d: %s", code, errOut)
+	}
+	for _, want := range []string{"-auto", "-workers", "-max", "-idle", "-daily"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("daemon -h is missing %q:\n%s", want, errOut)
+		}
+	}
+}
+
 func TestDaemonAutoStartsARunWithinOneInterval(t *testing.T) {
 	dir := t.TempDir()
 	env := daemonEnv(dir)
