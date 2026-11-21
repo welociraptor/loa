@@ -1,10 +1,10 @@
 # loa
 
 Task queue for a multi-agent daily workflow. The SQLite database is the only
-shared state: the runner leases one task at a time, hands it to an agent in a
-Herdr worktree workspace, and records the outcome. Workers do not write to the
-store; a coordinator may (see [Coordinator](#coordinator)), and that boundary is
-policy rather than a sandbox.
+shared state: a daemon or a person starts a run, the runner leases one task at a
+time, hands it to an agent in a Herdr worktree workspace, and records the
+outcome. Workers do not write to the store; a coordinator may (see
+[Coordinator](#coordinator)), and that boundary is policy rather than a sandbox.
 
 Named for the loa of Gibson's *Count Zero*: a spirit that takes up residence in
 a host and works through it.
@@ -43,7 +43,6 @@ loa cancel ID                      # delete a queued task; refuses leased, done,
 loa unblock ID                     # a blocked task back to the queue, one more attempt
 loa resolve ID [-fail] [-result TEXT] # settle a blocked task by hand, no lease needed
 loa ps     [-json]                 # the queue joined with the live session
-loa dash   [-workers N] [-max N]   # the tab: state, and the keys to act on it
 loa report [-since 24h|-json]      # what the day did, and how long it has been still
 loa runs   [-limit N] [-json] [-close ID] # every run, newest first; -close settles a dead one
 loa triage [-timeout 10m]          # ask an agent to propose work; never applies it
@@ -53,7 +52,11 @@ loa merge ID [-into BRANCH]        # merge an approved, green review; never push
 loa lease  -owner runner-1 -ttl 1h # prints the task as JSON, or null
 loa done   ID -branch b/thing -result "shipped"
 loa fail   ID -result "test suite red"
-loa run    -workers 2 -max 5 [-check CMD] [-prompts DIR] [-json] # works the queue, inside Herdr
+loa run    -workers 2 -max 5 [-timeout 45m] [-ttl 2h] [-check CMD] [-prompts DIR] [-json] # ask the daemon for a run; budgets only narrow, the daemon's -check wins
+loa stop                           # stop the run in flight; the daemon settles it and cleans up
+loa daemon [-status] [-auto] [-interval 1m] [-idle 5m] [-daily 12] # the supervisor; its flags are the run budget and check
+loa pause                          # stop automatic starts; memory only
+loa resume                         # allow them again
 loa version                        # the release and commit this binary was built from
 ```
 
@@ -61,8 +64,13 @@ Every other transition leaves a row behind; `cancel` deletes one, which is why
 it refuses a leased, done, or still-depended-on task rather than cascading a
 hole into the queue.
 
-`LOA_DB` selects the database (default `./loa.db`); every command
-except `version` also takes `-db`.
+`LOA_DB` selects the database (default `./loa.db`). Commands that open SQLite
+directly accept `-db PATH`: `add`, `list`, `show`, `cancel`, `ps`, `report`,
+`import`, `triage`, `plan`, `lease`, `unblock`, `resolve`, `done`, `fail`,
+`runs` and `merge`. `run`, `stop`, `pause`, `resume` and `daemon -status` are
+clients of the daemon and take no `-db`: the daemon decides which database they
+work. `daemon` itself takes `-db` because it opens the queue for the whole
+process.
 
 A task's `-role` selects its prompt and tool set. The default, `implement`,
 uses `prompts/implementer.md` and the full tool set; `plan` uses
@@ -72,17 +80,16 @@ runner appends its contract, which a prompt file cannot weaken. The dispatch
 records the prompt file and its content hash on the task, so a result is
 attributable to the instructions that produced it. `loa list`, `show` and `ps`
 show the role, and `show` shows the recorded prompt once a task has run.
-`loa run -prompts DIR` overrides the directory; otherwise it is found by
-walking up from the working directory to the repository root.
+`loa run -prompts DIR` overrides the directory; a relative `DIR` is resolved in
+the client, and when none is given the daemon's own working directory supplies
+the default (see [The daemon](#the-daemon)).
 
-Dependencies: `modernc.org/sqlite` (pure Go, no cgo) and
-`golang.org/x/term` for raw mode and the tab's window size. Everything else the
-tab draws is plain strings and escapes, so the loop stays testable and the
-dependency list stays at two.
+Dependencies: `modernc.org/sqlite` (pure Go, no cgo). It is the only
+dependency.
 
 ## The runner
 
-Everything runs inside Herdr: the runner itself is started in a pane, creates a
+Everything runs inside Herdr: the daemon supervises the run, creates a
 worktree workspace per task with `herdr worktree create`, starts the agent in
 that workspace's pane, prompts it and reads its terminal. Nothing is exec'd
 except the `herdr` client, `git`, and the workflow's `-check` command, which runs
@@ -137,47 +144,95 @@ Defaults: `HEAD` as the base, and Herdr's own configuration decides where the
 checkout lives — the runner passes no `--path`, and reads the created path back
 from the result.
 
-`loa run` refuses to start outside a Herdr pane, and checks
-`herdr status` first: a protocol or version mismatch fails the run before it
-does anything.
+`loa run` asks the daemon for a run and fails if it cannot reach it. It may
+narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
+`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
+timeout or ttl, a wider budget, or a different `-check` when the daemon has one
+is refused before a run starts. `Ctrl-C` on `loa run` sends the same stop request
+as `loa stop`; a second Ctrl-C kills the client if the run is wedged, and the
+daemon owns the run's cleanup either way. The daemon probes
+`herdr status` once at start
+and logs the result. Automatic runs are gated on the probe: every `-auto` tick
+probes again, and a failed probe skips that tick and is retried at the next
+interval, so a daemon started before Herdr is up spends neither a lease nor
+`-daily` on doomed attempts. A manual `loa run` is not gated: a protocol or
+version mismatch there reaches the run as failed attempts, because a person
+asked for that work. `triage` and `plan` still require a Herdr pane, because
+they open a workspace for a person to watch.
 
-## The tab
+## The daemon
 
-`loa dash` is a full-screen view of the queue joined with the session, and
-the place a person starts a run from:
+The daemon owns the leases and the runs that take them, and every Herdr call a
+run makes: start, prompt, read, interrupt and close. The queue is not behind it:
+`add`, `list`, `show`, `ps`, `report`, `import`, `cancel`, `lease`, `unblock`,
+`resolve`, `done`, `fail`, `runs`, `merge`, `triage` and `plan` open SQLite
+directly and work whether the daemon is up or dead. `ps` still reads the
+session directly for display, but it starts nothing and owns nothing. The
+`loa daemon -status` command reports the database the daemon works.
+
+Install the unit and start it:
 
 ```
-loa  1 running  0 blocked  2 queued
-
-  ID   STATUS   WORKSPACE    SESSION            TITLE
-> 1    leased   nixos        w3 working loa-1-1 wire the report command
-  2    new      nixos        -                  needs a decision on the timer
-  3    new      nixos        -                  bump the flake
-
-enter focus  x interrupt  d/f resolve  u unblock  c close  s/S run  q quit
+cp contrib/loa.service ~/.config/systemd/user/loa.service
+# edit ExecStart and WorkingDirectory if the binary or checkout is elsewhere
+systemctl --user daemon-reload
+systemctl --user enable --now loa
+loa daemon -status
+journalctl --user -u loa -f
 ```
 
-`enter` jumps to the task's pane (`agent focus`, or `workspace focus` when the
-agent has already exited), `x` interrupts, `u` returns a blocked task to the
-queue, `c` removes its workspace, `d`/`f` resolve it with a one-line result,
-`s`/`S` start and stop a run, `q` quits. Outside the tab, `loa unblock ID` and
-`loa resolve ID [-fail]` settle a blocked task the same way. It shows state and
-never announces it: Herdr already marks an agent that needs input.
-
-One tab, set up once:
+The unit's `ExecStart` is the policy:
 
 ```
-herdr workspace create --cwd "$XDG_STATE_HOME/loa" --label loa
-# then, in that workspace's root pane:
-LOA_DB="$XDG_STATE_HOME/loa/tasks.db" loa dash
+loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12
 ```
 
-Task worktrees are separate linked workspaces under the repository's own
-workspace, so the tab is an index rather than a container.
+`-auto` makes it start a run when a task is claimable; `-workers` and `-max` are
+one run's concurrency and budget; `-idle` is the quiet period after the last
+settled run; `-daily` is the number of tasks settled today (done and failed both
+count, and manual runs count too, because the budget is counted from the run
+record). These flags are the cap, not a default: a client may narrow them but
+cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client may only
+lower; `-check` is the daemon's check, and a client may supply one only when the
+daemon has none. A client may still choose `-base`, `-prompts`, `-model` and
+`-kind`; a relative `-prompts` is resolved against the client's working
+directory before it is sent. When a run has no prompts directory, the daemon
+walks up from its own working directory, which is why the unit sets
+`WorkingDirectory`. Change the unit, not a config file: a checked-in flag is a
+reviewed decision, while a file in a hidden directory drifts. `-interval`
+(default `1m`) is how often the queue is checked and the floor for an empty
+queue.
 
-A run started from the tab writes its log to `$XDG_STATE_HOME/loa/dash.log`
-rather than to the terminal the tab is drawing on; the tab itself only shows the
-outcome.
+The socket is `$XDG_RUNTIME_DIR/loa/sock`, protocol 1; `XDG_RUNTIME_DIR` must be
+set and absolute (the unit supplies `%t`). The control socket is Linux-only: on
+any other platform `loa daemon` refuses to start. `loa run`, `loa stop`, `loa
+pause`, `loa resume` and `loa daemon -status` are clients. One daemon per runtime
+directory holds an exclusive lock; `loa daemon -status` prints its pid, uptime,
+pause and auto state (with interval and daily cap), and active run, or exits
+non-zero.
+
+`loa stop` interrupts the run in flight; a stop that arrives before the run
+registers is remembered, and with no run to stop the daemon refuses instead of
+reporting a false success. The daemon keeps the run's cleanup and settles its
+row. `loa pause` stops automatic starts without touching a run in flight. It is
+memory, not a file, so restarting the daemon resumes. That is
+deliberate: a brake that survives a restart is a second policy file beside the
+unit.
+
+The socket is not a privilege boundary. The runtime directory is 0700 and the
+socket 0600, the daemon checks the connecting peer's uid with `SO_PEERCRED`, and
+there is no TCP listener. Anything running as you can already write the queue
+directly, so the socket grants nothing new; it keeps another user off the
+control channel, not the store.
+
+If the daemon dies, the queue stays readable and the next start repairs the
+rest: an open run row is settled only when its owner is provably gone, and
+orphaned workspaces are reconciled before the socket accepts work. A row whose
+owner is on another host is left for a person to settle, because this process
+cannot prove it is dead. The attempt's lease lapses on its own. In the
+meantime, `loa runs -close ID` settles the stale row by hand.
+`Restart=on-failure` is what turns a crash into a new daemon rather than a
+machine quietly doing nothing.
 
 ## Proposals
 
@@ -267,8 +322,11 @@ policy.
 ## Reviews
 
 A task whose role is `review` has a verdict as its deliverable, not a commit.
-The runner hands it the diffs of the tasks it depends on — that dependency set
-is the review subject — and reads `.loa/verdict.json` from its worktree:
+The runner writes the full diff of each task it depends on — that dependency
+set is the review subject — to `.loa/review.diff` in the review worktree, and
+names that file in the prompt with a per-dependency `git diff --stat` summary.
+The prompt therefore stays small however large the change is. It reads
+`.loa/verdict.json` from its worktree:
 
 ```json
 {"verdict": "approve|changes|blocked",
@@ -353,9 +411,9 @@ activity: just now
 
 Tasks are counted when they changed inside the window; workspaces are reported
 whatever the window, because one left open yesterday is still open today. The
-last line is the point: with no timer, an unsupervised week has to *say* that
-nothing moved, or it looks exactly like a quiet one. `-since` takes a duration
-or a date, `-json` gives the same sections.
+last line is the point: when the daemon is not running, an unsupervised week
+has to *say* that nothing moved, or it looks exactly like a quiet one. `-since`
+takes a duration or a date, `-json` gives the same sections.
 
 ## What bounds a worker, and what does not
 

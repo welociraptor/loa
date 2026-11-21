@@ -34,6 +34,9 @@ type Config struct {
 	LeaseTTL     time.Duration // must exceed TaskTimeout
 	TaskTimeout  time.Duration
 	Logger       *log.Logger
+	// OnStart is told the run row as soon as it is opened. A supervisor uses it
+	// to make the active run visible before the first task is leased.
+	OnStart func(store.Run)
 }
 
 // TaskOutcome is what became of one dispatched task, as recorded in the store.
@@ -128,13 +131,16 @@ func New(cfg Config) (*Runner, error) {
 // being missed by a worker that already gave up.
 func (r *Runner) Run(ctx context.Context) (stats Stats, runErr error) {
 	// Whatever a previous, dead run left open is closed before new work starts.
-	r.reconcile(ctx, time.Now())
+	r.Reconcile(ctx)
 
 	run, err := r.startRun(ctx)
 	if err != nil {
 		return stats, err
 	}
 	stats.Run = run
+	if r.cfg.OnStart != nil {
+		r.cfg.OnStart(run)
+	}
 
 	// The row is closed on every way out of this function, including a cancelled
 	// run: an open row would keep the next run from starting until a person
@@ -343,7 +349,7 @@ func (r *Runner) dispatch(ctx context.Context, task *store.Task) outcome {
 	// sent, so everything this attempt produces is attributable to those bytes.
 	fields := fieldsFor(task, handle.Worktree, handle.Repo, handle.Branch)
 	if review {
-		diffs, err := r.reviewDiffs(ctx, task, handle)
+		diffs, err := r.reviewDiffs(ctx, task, handle, logf)
 		if err != nil {
 			r.stopAndClose(handle, logf)
 			if commits, _ := commitsAhead(ctx, handle.Worktree, handle.Base); commits == 0 {
@@ -431,6 +437,13 @@ func (r *Runner) stopAndClose(handle Handle, logf func(string, ...any)) {
 	if err := r.cfg.Backend.Close(ctx, handle); err != nil {
 		logf("close workspace %s: %v", handle.WorkspaceID, err)
 	}
+}
+
+// Reconcile closes workspaces the runner owns but nobody is holding, plus the
+// ones a dead run created before it could record them. The supervisor calls it
+// at start, and every run calls it before leasing anything.
+func (r *Runner) Reconcile(ctx context.Context) {
+	r.reconcile(ctx, time.Now())
 }
 
 // reconcile closes workspaces the runner owns but nobody is holding, plus the

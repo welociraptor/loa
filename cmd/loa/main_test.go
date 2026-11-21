@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"loa/internal/daemon"
 	"loa/internal/runner"
 	"loa/internal/store"
 )
@@ -45,6 +47,7 @@ type cli struct {
 	t   *testing.T
 	db  string
 	dir string
+	env []string
 }
 
 func newCLI(t *testing.T) *cli {
@@ -60,11 +63,13 @@ func (c *cli) run(args ...string) (stdout, stderr string, code int) {
 	// answer ps with this machine's session.
 	env := []string{"LOA_DB=" + c.db, "PATH=" + c.t.TempDir()}
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "HERDR_") || strings.HasPrefix(kv, "LOA_DB=") || strings.HasPrefix(kv, "PATH=") {
+		if strings.HasPrefix(kv, "HERDR_") || strings.HasPrefix(kv, "LOA_DB=") || strings.HasPrefix(kv, "PATH=") ||
+			strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") {
 			continue
 		}
 		env = append(env, kv)
 	}
+	env = append(env, c.env...)
 	cmd.Env = env
 	if c.dir != "" {
 		cmd.Dir = c.dir
@@ -511,7 +516,7 @@ func TestPsPrintsTheQueueAndTheSessionColumns(t *testing.T) {
 	if !strings.Contains(lines[0], "SESSION") || !strings.Contains(lines[0], "WORKSPACE") {
 		t.Errorf("header = %q", lines[0])
 	}
-	// Rows are located by id, not by position: ps is a separate order from the tab.
+	// Rows are located by id, not by position.
 	rows := psRows(t, out)
 	if !strings.Contains(rows[1], "leased") || !strings.Contains(rows[2], "new") {
 		t.Errorf("rows = %q", lines[1:])
@@ -888,17 +893,77 @@ func TestRunJSONShape(t *testing.T) {
 	}
 }
 
-func TestRunJSONWithoutASessionExitsOneAndPrintsNothing(t *testing.T) {
+func TestRunJSONWithoutADaemonExitsOneAndPrintsNothing(t *testing.T) {
 	c := newCLI(t)
 	stdout, stderr, code := c.run("run", "-json")
 	if code != 1 {
 		t.Fatalf("exit %d, want 1", code)
 	}
 	if stdout != "" {
-		t.Errorf("stdout = %q, want no document when the runner never started", stdout)
+		t.Errorf("stdout = %q, want no document when the run never started", stdout)
 	}
-	if !strings.Contains(stderr, "Herdr") {
-		t.Errorf("stderr = %q", stderr)
+	if !strings.Contains(stderr, "daemon") && !strings.Contains(stderr, "XDG_RUNTIME_DIR") {
+		t.Errorf("stderr = %q, want the daemon connection reason", stderr)
+	}
+}
+
+func TestRunSendsRelativePromptsAsAnAbsolutePath(t *testing.T) {
+	runtimeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(runtimeDir, "loa"), 0o700); err != nil {
+		t.Fatalf("runtime dir: %v", err)
+	}
+	listener, err := net.Listen("unix", filepath.Join(runtimeDir, "loa", "sock"))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	type served struct {
+		req daemon.Request
+		err error
+	}
+	servedCh := make(chan served, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			servedCh <- served{err: err}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var req daemon.Request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			servedCh <- served{err: err}
+			return
+		}
+		resp := daemon.Response{V: daemon.Protocol, OK: true, Run: &daemon.RunResult{Run: daemon.RunRecord{ID: 1}}}
+		if err := json.NewEncoder(conn).Encode(resp); err != nil {
+			servedCh <- served{err: err}
+			return
+		}
+		servedCh <- served{req: req}
+	}()
+
+	c := newCLI(t)
+	c.dir = t.TempDir()
+	c.env = []string{"XDG_RUNTIME_DIR=" + runtimeDir}
+	if _, stderr, code := c.run("run", "-prompts", "prompts"); code != 0 {
+		t.Fatalf("run exited %d: %s", code, stderr)
+	}
+
+	select {
+	case got := <-servedCh:
+		if got.err != nil {
+			t.Fatalf("fake daemon: %v", got.err)
+		}
+		if got.req.Run == nil {
+			t.Fatalf("request carried no run options: %+v", got.req)
+		}
+		want := filepath.Join(c.dir, "prompts")
+		if got.req.Run.PromptsDir != want {
+			t.Errorf("prompts = %q, want %q", got.req.Run.PromptsDir, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake daemon saw no request")
 	}
 }
 

@@ -19,7 +19,7 @@
             pname = "loa";
             inherit version;
             src = self;
-            vendorHash = "sha256-lm3SAmSuo9aLEVG451A6XhzwbZ3YyDBRzsXcq0F9ldk=";
+            vendorHash = "sha256-k28UL6S1wIRjZRBUlHXoPDU8nRhF/yo01yuyZpf0p2M=";
             ldflags = [
               "-X main.version=${version}"
               "-X main.commit=${self.shortRev or self.dirtyShortRev or ""}"

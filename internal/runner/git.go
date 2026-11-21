@@ -40,6 +40,20 @@ func diffBetween(ctx context.Context, repoPath, base, branch string) (string, er
 	return gitOutput(ctx, repoPath, "diff", "--no-color", base+"..."+branch)
 }
 
+// diffStat is the per-dependency summary the prompt carries. The full change
+// goes to the review file instead.
+func diffStat(ctx context.Context, repoPath, base, branch string) (string, error) {
+	return gitOutput(ctx, repoPath, "diff", "--no-color", "--stat", base+"..."+branch)
+}
+
+// refResolves reports whether ref names a commit. Any failure reads as "no":
+// a branch tidied away after its merge and a repository that cannot answer are
+// the same cue to fall back to a base that will be diffed next.
+func refResolves(ctx context.Context, repoPath, ref string) bool {
+	_, err := gitOutput(ctx, repoPath, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	return err == nil
+}
+
 // deleteBranch removes a branch nobody has checked out. The runner asked Herdr
 // for this branch name, so it also owns cleaning it up when an attempt produced
 // nothing; otherwise every failed attempt litters the repository.
