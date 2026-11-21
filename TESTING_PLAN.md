@@ -225,11 +225,11 @@ Use both the real embedded migrations and synthetic `fstest.MapFS` cases:
 
 | test | case |
 |---|---|
-| `TestRealMigrationsFromEveryVersion` | for each `n` in 1..4: create a DB, apply the real migrations up to `n` with `applyMigration`, insert a representative task, then `migrate(ctx, db, migrationsFS)`. Assert `user_version == 4`, the row still exists, and new columns have their defaults (`workspace = ''`, `workspace_id = ''`, `pane_id = ''`, `run_ms = 0`) |
+| `TestRealMigrationsFromEveryVersion` | for each `n` in 1..10: create a DB, apply the real migrations up to `n` with `applyMigration`, insert a representative task (plus a scope and a dependency, so there is more than the task row to preserve), then `migrate(ctx, db, migrationsFS)`. Assert `user_version == 10`, the row, the scope and the dependency edge still exist, and the columns added after `n` have their defaults (`workspace = ''`, `workspace_id = ''`, `pane_id = ''`, `run_ms = 0`, `role = 'implement'`, `prompt = ''`, `prompt_hash = ''`, `verdict = ''`, `verdict_notes = ''`, `check_command = ''`, `check_passed = 0`, `check_output = ''`, `merged_at = ''`, `merge_commit = ''`, `plan_id = ''`) |
 | `TestRealSchemaSnapshot` | fresh DB → `SELECT type, name, sql FROM sqlite_master ORDER BY type, name` compared with `testdata/schema.golden`. Any schema change without a new migration changes this file, forcing a review |
 | `TestMigrationRollsBackOnFailure` | synthetic 0001 creates a table; 0002 has a valid statement followed by invalid SQL. Assert `user_version == 1`, the table from 0001 exists and the partial table from 0002 does not |
 | `TestMigrateStopsAtTheFirstFailure` | 0002 invalid, 0003 valid: only 0001 is applied |
-| `TestConcurrentOpenMigratesOnce` | two goroutines call `store.Open` on the same fresh path; both succeed, the final version is 4, and no "table already exists" error escapes. If this reveals a real race, fix migration serialization rather than loosening the test |
+| `TestConcurrentOpenMigratesOnce` | two goroutines call `store.Open` on the same fresh path; both succeed, the final version is 10, and no "table already exists" error escapes. If this reveals a real race, fix migration serialization rather than loosening the test |
 | `TestMigrationNameEdgeCases` | no underscore, no `.sql`, non-numeric and zero version, duplicate version, nested directory ignored, empty set; `loadMigrations` rejects each with its stated reason |
 | `TestAppliedMigrationIsNeverReapplied` | existing case stays; add a counter row or a failing second `CREATE TABLE` to prove no silent re-run |
 
