@@ -15,7 +15,7 @@
         {
           # The checks are the gate: this derivation runs the tests and the
           # linter, so `nix flake check` answers "is it good" on a clean machine.
-          default = let version = "0.1.0"; in pkgs.buildGoModule {
+          default = let version = "0.2.0"; in pkgs.buildGoModule {
             pname = "loa";
             inherit version;
             src = self;
