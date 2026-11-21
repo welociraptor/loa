@@ -192,13 +192,15 @@ loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12
 one run's concurrency and budget; `-idle` is the quiet period after the last
 settled run; `-daily` is the number of tasks settled today (done and failed both
 count, and manual runs count too, because the budget is counted from the run
-record). These flags are the cap, not a default: a client may narrow them but
-cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client may only
-lower; `-check` is the daemon's check, and a client may supply one only when the
-daemon has none. A client may still choose `-base`, `-prompts`, `-model` and
-`-kind`; a relative `-prompts` is resolved against the client's working
-directory before it is sent. When a run has no prompts directory, the daemon
-walks up from its own working directory, which is why the unit sets
+record). `-daily` gates the next start, not the run in flight: a run begun at 11
+of 12 may still settle its full `-max`, so a day can overshoot by up to `-max`-1
+tasks. These flags are the daemon's policy, not a default: a client may narrow
+them but cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client
+may only lower; `-check` is the daemon's check, and a client may supply one only
+when the daemon has none. A client may still choose `-base`, `-prompts`,
+`-model` and `-kind`; a relative `-prompts` is resolved against the client's
+working directory before it is sent. When a run has no prompts directory, the
+daemon walks up from its own working directory, which is why the unit sets
 `WorkingDirectory`. Change the unit, not a config file: a checked-in flag is a
 reviewed decision, while a file in a hidden directory drifts. `-interval`
 (default `1m`) is how often the queue is checked and the floor for an empty

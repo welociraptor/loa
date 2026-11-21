@@ -230,8 +230,9 @@ an approved review with a green check merge with `loa merge`. loa never pushes.
 
 With the queue trusted, let the daemon work it. Start the unit (or run `loa
 daemon -auto`); whenever a task is claimable and the last run is older than
-`-idle`, the daemon starts a run until `-daily` or `-max` is spent. Without
-`-auto`, ask for each run with `loa run`.
+`-idle`, the daemon starts a run until `-daily` or `-max` is spent. `-daily`
+gates the next start rather than the run in flight, so a day can overshoot by up
+to `-max`-1 tasks. Without `-auto`, ask for each run with `loa run`.
 
 `loa pause` stops automatic starts without touching the run in flight; `loa
 resume` allows them again. The pause is memory, so a restart resumes.
