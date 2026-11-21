@@ -232,6 +232,59 @@ func TestDaemonRefusesAnInvalidRunBudget(t *testing.T) {
 	}
 }
 
+func TestRunRefusesAnInvalidRunBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"workers zero", []string{"run", "-workers", "0"}, []string{"-workers", "positive"}},
+		{"workers negative", []string{"run", "-workers", "-1"}, []string{"-workers", "positive"}},
+		{"max zero", []string{"run", "-max", "0"}, []string{"-max", "positive"}},
+		{"timeout zero", []string{"run", "-timeout", "0s"}, []string{"-timeout", "positive"}},
+		{"ttl zero", []string{"run", "-ttl", "0s"}, []string{"-ttl", "positive"}},
+		{"ttl equal to timeout", []string{"run", "-ttl", "2m", "-timeout", "2m"}, []string{"-ttl", "-timeout"}},
+		{"ttl below timeout", []string{"run", "-ttl", "1m", "-timeout", "2m"}, []string{"-ttl", "-timeout"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runtimeDir := filepath.Join(dir, "run")
+			if err := os.MkdirAll(filepath.Join(runtimeDir, "loa"), 0o700); err != nil {
+				t.Fatalf("runtime dir: %v", err)
+			}
+			listener, err := net.Listen("unix", filepath.Join(runtimeDir, "loa", "sock"))
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			_, errOut, code := runDaemonCLI(t, daemonEnv(runtimeDir), tc.args...)
+			if code != 1 {
+				t.Fatalf("%v exited %d, want the refusal (1); stderr %q", tc.args, code, errOut)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr = %q, want %q named", errOut, want)
+				}
+			}
+
+			// A refused request must stop before the socket. The client has exited,
+			// so a queued connection would still be accepted; an expired deadline
+			// makes an empty queue answer at once.
+			ul, ok := listener.(*net.UnixListener)
+			if !ok {
+				t.Fatalf("listener is %T, want a Unix listener", listener)
+			}
+			_ = ul.SetDeadline(time.Now())
+			conn, err := ul.Accept()
+			if err == nil {
+				_ = conn.Close()
+				t.Errorf("%v reached the daemon socket", tc.args)
+			}
+		})
+	}
+}
+
 func TestDaemonSecondInstanceRefuses(t *testing.T) {
 	p := startDaemonIn(t, t.TempDir())
 
