@@ -33,12 +33,16 @@ func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 		return err
 	}
 
+	latest := migrations[len(migrations)-1].version
+
+	// This read is a fast path for a database that is already current: it
+	// avoids opening a write transaction when there is nothing to do. It is not
+	// authoritative, because another Open may commit after it; each step below
+	// re-reads the version under the write lock.
 	var current int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
 		return fmt.Errorf("store: read schema version: %w", err)
 	}
-
-	latest := migrations[len(migrations)-1].version
 	if current > latest {
 		return fmt.Errorf("store: database schema v%d is newer than this binary (v%d)", current, latest)
 	}
@@ -47,31 +51,49 @@ func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 		if m.version <= current {
 			continue
 		}
-		if err := applyMigration(ctx, db, m); err != nil {
+		if current, err = applyMigration(ctx, db, m, latest); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func applyMigration(ctx context.Context, db *sql.DB, m migration) error {
+// applyMigration applies one step in an IMMEDIATE transaction and returns the
+// version the transaction saw. The DSN sets _txlock=immediate, so the write
+// lock is held before user_version is read: a concurrent Open that committed
+// while this one waited has already applied the step, and re-running it would
+// fail its first CREATE TABLE.
+func applyMigration(ctx context.Context, db *sql.DB, m migration, latest int) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: migration %d: %w", m.version, err)
+		return 0, fmt.Errorf("store: migration %d: %w", m.version, err)
 	}
 	defer tx.Rollback()
 
+	var current int
+	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
+		return 0, fmt.Errorf("store: migration %d: read schema version: %w", m.version, err)
+	}
+	// A newer binary may have migrated the file between the fast-path read and
+	// this transaction. Refuse from inside the lock rather than write past it.
+	if current > latest {
+		return current, fmt.Errorf("store: database schema v%d is newer than this binary (v%d)", current, latest)
+	}
+	if current >= m.version {
+		return current, nil
+	}
+
 	if _, err := tx.ExecContext(ctx, m.sql); err != nil {
-		return fmt.Errorf("store: migration %s: %w", m.name, err)
+		return current, fmt.Errorf("store: migration %s: %w", m.name, err)
 	}
 	// PRAGMA does not take parameters; m.version is an int from the filename.
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", m.version)); err != nil {
-		return fmt.Errorf("store: migration %s: %w", m.name, err)
+		return current, fmt.Errorf("store: migration %s: %w", m.name, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: migration %s: %w", m.name, err)
+		return current, fmt.Errorf("store: migration %s: %w", m.name, err)
 	}
-	return nil
+	return m.version, nil
 }
 
 // loadMigrations reads NNNN_name.sql files and returns them oldest first.

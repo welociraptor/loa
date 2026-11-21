@@ -8,13 +8,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver with database/sql
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // RetryDelay is how long a failed or abandoned task stays out of the queue.
@@ -113,6 +113,10 @@ type Store struct {
 	db *sql.DB
 }
 
+// busyTimeout is how long a connection waits on another writer, and also how
+// long Open retries a connection that lost a WAL-conversion race.
+const busyTimeout = 5 * time.Second
+
 // Open opens (creating if needed) the task database at path and applies the
 // schema. Transactions start as write transactions so that contended writers
 // block on busy_timeout instead of failing with SQLITE_BUSY_SNAPSHOT.
@@ -121,12 +125,16 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, errors.New("store: empty database path")
 	}
 
-	q := url.Values{}
-	q.Set("_txlock", "immediate")
-	q.Add("_pragma", "foreign_keys(1)")
-	q.Add("_pragma", "journal_mode(WAL)")
-	q.Add("_pragma", "busy_timeout(5000)")
-	dsn := "file:" + filepath.ToSlash(path) + "?" + q.Encode()
+	// Keep the query text explicit because url.Values.Encode sorts keys, so
+	// accumulating these as separate parameters would not preserve the required
+	// order: busy_timeout must be in force before journal_mode(WAL), whose
+	// conversion can need the write lock.
+	dsn := "file:" + filepath.ToSlash(path) + "?" + strings.Join([]string{
+		"_txlock=immediate",
+		fmt.Sprintf("_pragma=busy_timeout(%d)", busyTimeout.Milliseconds()),
+		"_pragma=journal_mode(WAL)",
+		"_pragma=foreign_keys(1)",
+	}, "&")
 
 	// The database holds task bodies and agent output; SQLite's own default
 	// follows the umask, which can leave them readable by everyone.
@@ -134,18 +142,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := connect(ctx, dsn, path)
 	if err != nil {
-		return nil, fmt.Errorf("store: open %s: %w", path, err)
-	}
-
-	// One connection serialises writers in-process; busy_timeout covers other
-	// processes sharing the file, such as a CLI invocation next to the runner.
-	db.SetMaxOpenConns(1)
-
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: open %s: %w", path, err)
+		return nil, err
 	}
 	if err := migrate(ctx, db, migrationsFS); err != nil {
 		db.Close()
@@ -153,6 +152,43 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// connect opens the database and retries a connection that fails while applying
+// its pragmas. SQLite answers the journal_mode(WAL) conversion with SQLITE_BUSY
+// without consulting busy_timeout when another opener is converting the same
+// fresh file, so the timeout alone does not cover connection setup. A failed
+// connection is discarded and reopened rather than pinged again: the pragmas
+// before the one that hit the lock applied, and the rest did not.
+func connect(ctx context.Context, dsn, path string) (*sql.DB, error) {
+	deadline := time.Now().Add(busyTimeout)
+	for {
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("store: open %s: %w", path, err)
+		}
+
+		// One connection serialises writers in-process; busy_timeout covers other
+		// processes sharing the file, such as a CLI invocation next to the runner.
+		db.SetMaxOpenConns(1)
+
+		err = db.PingContext(ctx)
+		if err == nil {
+			return db, nil
+		}
+		db.Close()
+
+		var sqliteErr *sqlite.Error
+		if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != sqlite3.SQLITE_BUSY || time.Now().After(deadline) {
+			return nil, fmt.Errorf("store: open %s: %w", path, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("store: open %s: %w", path, ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 // createPrivate creates the database file with owner-only permissions. An
