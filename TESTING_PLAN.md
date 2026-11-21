@@ -440,7 +440,7 @@ Command matrix (each row is a test or a table case):
 | `ps` | with no Herdr, `session_unavailable` is set and rows still print; `-json` orphans; table headers; extra args |
 | `report` | `-since 0h`, negative, `24h`, `2026-01-01`, `tuesday`; `-json` shape; unavailable session line; empty queue gap |
 | `import` | stdin `-`; empty stdin; missing file; `-dry-run` with notes; unknown field; cycle; missing `after`; reprioritise nonexistent → nothing created; two positional files → exit 1 |
-| `run` | outside a Herdr pane → exit 1 and the exact message; fake Herdr with empty queue → exit 0, reconcile ran, no tasks; incompatible status fixture → exit 1 before any lease; `-ttl` <= `-timeout` → exit 1 |
+| `run` | `-db` → exit 2 and no file (`TestRunRefusesADatabaseFlagAndCreatesNoFile`); `-owner` → exit 2 (`TestRunRefusesTheOwnerFlag`); daemon refuses an invalid run budget (`TestDaemonRefusesAnInvalidRunBudget`); a request cannot widen the daemon's workers/max, lengthen timeout/ttl, or replace its check (`TestRunRequestCannotWidenTheDaemonsBudget`, `TestRunRequestCannotLengthenTimeoutOrTTL`, `TestRunRequestCannotReplaceTheDaemonsCheck`); `-json` through the socket stays one document (`TestRunJSONThroughTheDaemonKeepsItsShape`); the first Ctrl-C asks for stop and the second kills a wedged client (`TestRunSecondInterruptKillsTheClient`) |
 | `triage` | outside a Herdr pane → exit 1; with a scripted fake Herdr, a proposal file is written, saved under the temp state dir, and the queue is unchanged; blocked-prompt path names the workspace/pane |
 | root | `-h`, `--help`, `help`, unknown command → exit 2 for unknown, 0 for help, no args → 2 |
 
@@ -451,12 +451,13 @@ subprocess cannot cover them: `parseSince` (table), `taskID` (table),
 defaults, and the `allowlist` contents (a change to the tool allowlist is a
 security change).
 
-For `buildRunner`, use the fake Herdr script and test:
+For `newRunnerBackend` and `newRunnerConfig`, use the fake Herdr script and test:
 
-- `buildRunner` rejects no session **before** `CheckStatus`;
-- `buildRunner` rejects a stopped/incompatible server;
+- `newRunnerBackend` does not require a Herdr pane; the session check belongs to
+  commands where a person is watching;
 - the agent args contain `--no-session --tools read,edit,write,bash,grep,find,ls`
   and only add `--model` when set;
+- `newRunnerConfig` copies the flags into `runner.Config` unchanged.
 
 ### 4.11 Coverage collection for the CLI
 
@@ -579,11 +580,6 @@ Extend it carefully:
 - **Test the child process's coverage separately** (§4.11), not in normal runs.
 - **Run each CLI command from a temp working directory** so default `./loa.db`
   and relative proposal paths are tested without polluting the repo.
-
-Concrete new CLI tests are listed in §4.10. The highest-value ones are
-`TestRunRefusesOutsideHerdr`, `TestRunWithEmptyQueueReconcilesAndExits` and
-`TestRunRejectsIncompatibleHerdr`, because that command currently has no
-process-level coverage at all.
 
 ## 8. Migration tests (expanded)
 
@@ -724,11 +720,13 @@ temp repo.
 Exit: `internal/runner/herdr_backend.go` is no longer at 0%; a missing label, a
 bad base, a failed agent start and a failed remove each have a test.
 
-**A5. CLI session gate (1 day)**
-Add `run`/`triage` refusal tests and the empty-queue `run` flow with a fake
-Herdr, plus the `buildRunner` unit tests from §4.10.
-Exit: `loa run` and `loa triage` cannot start without a compatible session, and
-`run` with an empty queue returns 0 after reconciliation.
+**A5. CLI session gate and run client (1 day)**
+Add the `triage` refusal test and the `run` client tests from §4.10 (daemon
+connection, flag refusals, clamp refusals, JSON, Ctrl-C), plus the
+`newRunnerBackend`/`newRunnerConfig` unit tests.
+Exit: `loa triage` cannot start without a compatible session; `loa run` fails
+cleanly when the daemon is unreachable and reports the daemon's outcome
+otherwise.
 
 ### Phase B — P1: stop the tool from lying
 

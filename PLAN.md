@@ -828,10 +828,12 @@ the documents say that instead of implying a sandbox.
   says whether this machine may spend money belongs in the unit, not in a hidden
   directory. The policy is the unit: flags, checked in, changed by an edit
   rather than by a conversation with a model. Test: `-auto` starts a run within
-  one interval; `-pause` does not; no second run while one is active; `-daily`
-  exhausted stops it; an empty queue is not a busy loop, the interval is the
-  floor; a failed probe skips the tick and a later success starts a run on the
-  next one; a manual run is not gated by the probe.
+  one interval; pause stops it until resume (`TestPausePreventsAutoUntilResume`)
+  and leaves the run in flight alone (`TestPauseLeavesTheRunInFlightAlone`); no
+  second run while one is active; `-daily` exhausted stops it; an empty queue is
+  not a busy loop, the interval is the floor; a failed probe skips the tick and a
+  later success starts a run on the next one; a manual run is not gated by the
+  probe.
 
 - [x] **40. The unit, and the documents.** A systemd user unit is where the
   policy lives — `loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12`,

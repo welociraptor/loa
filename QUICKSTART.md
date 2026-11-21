@@ -174,15 +174,18 @@ one task. For each task, the daemon:
 
 1. leases the highest-priority runnable task;
 2. resolves its workspace label to a Herdr workspace;
-3. creates a worktree on a new branch from `HEAD`;
+3. creates a worktree on a new branch from `-base` (`HEAD` by default) or from
+   the newest done dependency's branch;
 4. starts the agent in that worktree and sends it the task body plus the
    instructions that apply to every task;
 5. waits for the agent, reads the branch, and removes the worktree;
 6. records the branch and result, and marks the task done only if the branch
    gained a commit.
 
-Progress and the final `done`/`failed` count go to stderr. A worktree is
-scratch space; it is removed even when the task succeeds.
+The daemon logs per-task progress to its journal
+(`journalctl --user -u loa -f`); `loa run` prints the final `done`/`failed`
+count to stderr. A worktree is scratch space; it is removed even when the task
+succeeds.
 
 With no daemon policy to narrow, `loa run` asks for two concurrent workers,
 five tasks, a 45-minute task timeout and a two-hour lease. The daemon's flags
@@ -305,10 +308,13 @@ loa add -workspace my-project -title "Document the API endpoint" \
 The documentation task cannot run until the API task is `done`. Both carry the
 same scope, so two workers will not edit the same repository at once.
 
-A dependency orders work; it does not stack branches. A dependent task branches
-from the configured base (`HEAD` by default), not from its dependency's branch.
-Merge or otherwise make the dependency's work part of the base before expecting
-the dependent task to see it. Use `-base` to choose a different ref.
+A dependency orders work, and while the dependency's branch exists a dependent
+task branches from the newest done dependency's recorded branch, so a chain
+stacks its commits. If the dependency was re-queued, recorded no branch, or its
+branch has since been deleted, the dependent branches from the configured base
+(`-base`, `HEAD` by default) instead. Once a dependency is merged and its branch
+is tidied away, merge its work into the base before expecting the dependent task
+to see it.
 
 ## Proposals from an agent
 

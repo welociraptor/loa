@@ -80,8 +80,9 @@ runner appends its contract, which a prompt file cannot weaken. The dispatch
 records the prompt file and its content hash on the task, so a result is
 attributable to the instructions that produced it. `loa list`, `show` and `ps`
 show the role, and `show` shows the recorded prompt once a task has run.
-`loa run -prompts DIR` overrides the directory; otherwise it is found by
-walking up from the working directory to the repository root.
+`loa run -prompts DIR` overrides the directory; a relative `DIR` is resolved in
+the client, and when none is given the daemon's own working directory supplies
+the default (see [The daemon](#the-daemon)).
 
 Dependencies: `modernc.org/sqlite` (pure Go, no cgo). It is the only
 dependency.
