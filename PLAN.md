@@ -37,6 +37,10 @@ is something to look at rather than a timeout to interpret.
     internal/runner/git.go            commit count, summary, branch delete
     internal/runner/prompt.go         render the task, then the contract
     internal/live/live.go             queue joined with the session (`ps`)
+    internal/daemon/client.go         the daemon client: socket path, calls, NDJSON
+    internal/daemon/owner.go          the run's owner: host and pid, proof of death
+    internal/daemon/peer_linux.go     the control socket's SO_PEERCRED gate
+    internal/daemon/peer_other.go     the control socket's non-Linux refusal
     internal/daemon/server.go         the socket, the runs, and the scheduler
     internal/daemon/protocol.go       versioned NDJSON; client and server types
     internal/report/report.go         the day: done, blocked, queued, open, gap
@@ -45,7 +49,7 @@ is something to look at rather than a timeout to interpret.
     internal/triage/triage.go         what the triage agent reads and writes back
     workflows/workflow.go             prompts, check, merge policy, stages
     contrib/loa.service               the flags that are the policy
-    tests                             321 tests, `-race` clean
+    tests                             320 tests (functions beginning Test, excluding TestMain), `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a

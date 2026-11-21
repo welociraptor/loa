@@ -35,11 +35,11 @@ not force it off.
 | `internal/triage` | 8 | 84.1% | modes and write failures are covered; the CLI flow is covered in `cmd/loa` |
 | `internal/daemon` | 35 | 79.0% | socket, runs, reconciliation and the scheduler are covered; live Herdr recovery stays manual |
 | `workflows` | 4 | 84.0% | strict parsing and merge policy are covered |
-| `cmd/loa` | 73 CLI tests | 21.1% instrumented | the tests mostly build and run the binary, so child-process coverage is not collected; the direct unit helpers are measured |
-| **total** | **317** | **66.8%** | enough to trust the queue's invariants; the live Herdr transport and soak runs remain manual/nightly |
+| `cmd/loa` | 76 CLI tests | 21.1% instrumented | the tests mostly build and run the binary, so child-process coverage is not collected; the direct unit helpers are measured |
+| **total** | **320** | **66.8%** | enough to trust the queue's invariants; the live Herdr transport and soak runs remain manual/nightly |
 
 The low instrumented number for `cmd/loa` is mostly an instrumentation artefact:
-the CLI has 73 process-level tests, principally in `main_test.go` and
+the CLI has 76 process-level tests, principally in `main_test.go` and
 `daemon_test.go`. Run the child-process coverage collection in §4.11 to see the
 remaining branches; do not read the package figure as those tests being absent.
 
@@ -73,12 +73,12 @@ remaining branches; do not read the package figure as those tests being absent.
 | risk | impact | current evidence | planned evidence |
 |---|---|---|---|
 | a task is leased twice | two agents edit one scope; lost work | `TestConcurrentLeasesNeverDuplicate` | race/shuffle soak, reaper boundaries, multi-connection tests |
-| a migration damages an existing database | data loss on upgrade | only synthetic migrations | real v1→v4 fixtures, data-preservation and rollback tests |
+| a migration damages an existing database | data loss on upgrade | `TestRealMigrationsFromEveryVersion` (versions 1..10, preserving a task, scope and dependency); `TestRealSchemaSnapshot`, `TestMigrationRollsBackOnFailure`, `TestMigrateStopsAtTheFirstFailure` | corruption injection and long-run upgrade soak |
 | the runner creates a worktree for the wrong label | work happens in the wrong repository | `herdr.resolve` untested | backend resolve/Open tests with a scripted fake CLI |
 | a blocked agent is torn down | the human loses the approval dialog | `TestBlockedAgentIsLeftForTheHuman` (fake backend only) | `Herdr.Prompt` blocked-code test and manual check |
 | success is judged from the agent's summary | false `done`, missing commit | commit-count tests | failure matrix, git edge cases, result truncation |
 | a failed attempt is retried in the same run | burns attempts and starves the queue | store retry-delay test only | runner-level budget/retry test |
-| the CLI parses a flag differently than scripts expect | wrong task changed | 73 CLI tests | full command/flag matrix, env precedence |
+| the CLI parses a flag differently than scripts expect | wrong task changed | 76 CLI tests | full command/flag matrix, env precedence |
 | `report` silently lies about a quiet day | unsupervised week looks normal | 4 report tests | fixed-snapshot golden output and boundary cases |
 | the real Herdr transport drifts on upgrade | run fails or misbehaves | client fixtures + manual checklist | expand fixtures; run backend against scripted Herdr; manual end-to-end |
 
@@ -229,7 +229,7 @@ Use both the real embedded migrations and synthetic `fstest.MapFS` cases:
 | `TestRealSchemaSnapshot` | fresh DB → `SELECT type, name, sql FROM sqlite_master ORDER BY type, name` compared with `testdata/schema.golden`. Any schema change without a new migration changes this file, forcing a review |
 | `TestMigrationRollsBackOnFailure` | synthetic 0001 creates a table; 0002 has a valid statement followed by invalid SQL. Assert `user_version == 1`, the table from 0001 exists and the partial table from 0002 does not |
 | `TestMigrateStopsAtTheFirstFailure` | 0002 invalid, 0003 valid: only 0001 is applied |
-| `TestConcurrentOpenMigratesOnce` | two goroutines call `store.Open` on the same fresh path; both succeed, the final version is 10, and no "table already exists" error escapes. If this reveals a real race, fix migration serialization rather than loosening the test |
+| `TestConcurrentOpenMigratesOnce` | two goroutines call `store.Open` on the same fresh path; both succeed, the final version is 10, and no "table already exists" error escapes. Shipped evidence for serialised migrations: each step re-reads the version under the write lock, so an opener skips a step another opener committed. Keep the assertions strict rather than loosening them |
 | `TestMigrationNameEdgeCases` | no underscore, no `.sql`, non-numeric and zero version, duplicate version, nested directory ignored, empty set; `loadMigrations` rejects each with its stated reason |
 | `TestAppliedMigrationIsNeverReapplied` | existing case stays; add a counter row or a failing second `CREATE TABLE` to prove no silent re-run |
 
@@ -471,7 +471,7 @@ go tool covdata textfmt -i="$dir" -o=cmd.cov
 ```
 
 Merge with the package profiles using `go tool covdata merge`. This is the only
-way to see which `cmd/loa` branches the 73 process tests actually reach. It uses
+way to see which `cmd/loa` branches the 76 process tests actually reach. It uses
 only the Go toolchain. Keep the normal `go test` fast; run the coverage variant
 in CI or a nightly job, not on every save.
 
@@ -694,12 +694,14 @@ green. Effort is a rough guide, not a commitment.
 
 ### Phase A — P0: protect the queue and the transport
 
-**A1. Migration integrity (1–2 days)**
-Add the real-migration chain, schema golden, rollback, first-failure and
-concurrent-`Open` tests from §4.2. These are the tests that would catch a bad
-`0005_*.sql` before it reaches a real database.
-Exit: a fresh DB, a v1–v4 DB with data, and a failed migration all behave as
-described; two concurrent opens do not corrupt or fail.
+**A1. Migration integrity (shipped)**
+The real-migration chain, schema golden, rollback, first-failure and
+concurrent-`Open` tests from §4.2 are in the tree.
+`TestRealMigrationsFromEveryVersion` runs versions 1..10 with a task, scope and
+dependency, so a bad `0005_*.sql` fails before it reaches a real database.
+Exit: a fresh DB, a DB at every version 1..10 with data, and a failed migration
+all behave as described; `TestConcurrentOpenMigratesOnce` proves two concurrent
+opens do not corrupt or fail.
 
 **A2. Store lifecycle and validation (1–2 days)**
 Add `Unblock`, `Resolve`, `Add` rollback/defaults, `Lease` boundaries/validation,
