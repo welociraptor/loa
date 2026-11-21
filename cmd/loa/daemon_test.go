@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -443,6 +444,58 @@ func (c *daemonClient) status() (struct{}, error) {
 		return struct{}{}, fmt.Errorf("status refused")
 	}
 	return struct{}{}, nil
+}
+
+func TestControlVerbsFailWhenTheDaemonNeverAnswers(t *testing.T) {
+	old := daemonCallTimeout
+	daemonCallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { daemonCallTimeout = old })
+
+	dir := t.TempDir()
+	runtime := filepath.Join(dir, "loa")
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(runtime, "sock"), Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Accept every call and hold it open without an answer: a wedged daemon.
+	go func() {
+		var held []*net.UnixConn
+		defer func() {
+			for _, conn := range held {
+				_ = conn.Close()
+			}
+		}()
+		for {
+			conn, err := ln.AcceptUnix()
+			if err != nil {
+				return
+			}
+			held = append(held, conn)
+		}
+	}()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	for _, verb := range []string{"pause", "resume", "stop"} {
+		t.Run(verb, func(t *testing.T) {
+			start := time.Now()
+			err := cmdDaemonControl(context.Background(), verb, nil)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatalf("%s returned nil from a daemon that never answers", verb)
+			}
+			if !strings.Contains(err.Error(), "did not answer within") {
+				t.Errorf("%s error = %v, want the timeout named", verb, err)
+			}
+			if elapsed > time.Second {
+				t.Errorf("%s took %s, want it bounded by the %s deadline", verb, elapsed, daemonCallTimeout)
+			}
+		})
+	}
 }
 
 func TestDaemonStatusFailsWithTheReasonWhenNoDaemonRuns(t *testing.T) {

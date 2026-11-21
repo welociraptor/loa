@@ -1137,10 +1137,8 @@ func cmdRun(ctx context.Context, args []string) error {
 		select {
 		case <-interrupt:
 			signal.Stop(interrupt)
-			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			if err := client.Stop(stopCtx); err != nil {
-				fmt.Fprintf(os.Stderr, "loa: stop: %v\n", err)
+			if err := daemonCall(ctx, "stop", client.Stop); err != nil {
+				fmt.Fprintf(os.Stderr, "loa: %v\n", err)
 			}
 		case <-runDone:
 		}
