@@ -146,11 +146,12 @@ from the result.
 
 `loa run` asks the daemon for a run and fails if it cannot reach it. It may
 narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
-`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
-timeout or ttl, a wider budget, or a different `-check` when the daemon has one
-is refused before a run starts. `Ctrl-C` on `loa run` sends the same stop request
-as `loa stop`; a second Ctrl-C kills the client if the run is wedged, and the
-daemon owns the run's cleanup either way. The daemon probes
+`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A wider
+budget is clamped to the daemon's; a longer timeout or ttl, or a different
+`-check` when the daemon has one, is refused before a run starts. `Ctrl-C`
+on `loa run` sends the same stop request as `loa stop`; a second Ctrl-C kills
+the client if the run is wedged, and the daemon owns the run's cleanup
+either way. The daemon probes
 `herdr status` once at start
 and logs the result. Automatic runs are gated on the probe: every `-auto` tick
 probes again, and a failed probe skips that tick and is retried at the next
