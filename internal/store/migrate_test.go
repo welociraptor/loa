@@ -155,11 +155,12 @@ func applyMigrationsUpTo(t *testing.T, db *sql.DB, latest int) {
 	if err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
+	newest := migrations[len(migrations)-1].version
 	for _, m := range migrations {
 		if m.version > latest {
 			break
 		}
-		if err := applyMigration(context.Background(), db, m); err != nil {
+		if _, err := applyMigration(context.Background(), db, m, newest); err != nil {
 			t.Fatalf("apply migration %d: %v", m.version, err)
 		}
 	}
@@ -382,16 +383,10 @@ func TestMigrateStopsAtTheFirstFailure(t *testing.T) {
 	}
 }
 
-// TestConcurrentOpenMigratesOnce is blocked: two simultaneous store.Open calls
-// on a fresh file race in production. Each reads user_version before the other
-// commits, so the loser re-runs 0001 ("table tasks already exists"), and the
-// journal_mode(WAL) pragma runs before busy_timeout, so a connection can also
-// fail with SQLITE_BUSY during Ping. Unskip this once migrate serialises the
-// version read with the migration transaction and busy_timeout precedes WAL
-// conversion; do not weaken the assertions to make it pass.
+// TestConcurrentOpenMigratesOnce proves two simultaneous store.Open calls on a
+// fresh file converge on one schema: each migration step re-reads the version
+// under the write lock, so the loser skips the step the winner committed.
 func TestConcurrentOpenMigratesOnce(t *testing.T) {
-	t.Skip("known production race: concurrent store.Open re-applies a migration; see migrate.go")
-
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tasks.db")
 

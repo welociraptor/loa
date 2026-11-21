@@ -15,37 +15,41 @@ is something to look at rather than a timeout to interpret.
 
 ## Where things stand
 
-    cmd/loa/main.go                 1390   the CLI: add | list | show | cancel | ps | report
-                                           import | triage | plan | lease | unblock | resolve
-                                           done | fail | run | runs | merge | daemon
-                                           pause | resume
-    cmd/loa/daemon.go                204   the supervisor, its policy flags, and -status
-    cmd/loa/merge.go                 232   loa merge: the one deterministic transition
-    cmd/loa/version.go                52   what the binary was built from
-    internal/store/store.go          878   lease, deps, scopes, retries, cancel
-    internal/store/run.go            193   runs: one active, and the record
-    internal/store/explain.go        203   deps, dependents, blockers ("why not running")
-    internal/store/migrate.go        119   numbered, transactional migrations
-    internal/store/migrations/       123   0001–0010, up to task_plan
-    internal/herdr/client.go         371   typed CLI client; JSON is the contract
-    internal/herdr/labels.go          54   the `loa #N` label, parsed in one place
-    internal/runner/runner.go        544   rounds, judgement, reconciliation
-    internal/runner/backend.go        69   Backend interface (the fake's seam)
-    internal/runner/herdr_backend.go  233   resolve, worktree, agent, blocked, close
-    internal/runner/roles.go         111   a role's prompt file and tool set
-    internal/runner/verdict.go       273   the reviewer's deliverable, and its check
-    internal/runner/git.go           101   commit count, summary, branch delete
-    internal/runner/prompt.go        157   render the task, then the contract
-    internal/live/live.go            201   queue joined with the session (`ps`)
-    internal/daemon/server.go        750   the socket, the runs, and the scheduler
-    internal/daemon/protocol.go      218   versioned NDJSON; client and server types
-    internal/report/report.go        221   the day: done, blocked, queued, open, gap
-    internal/taskspec/taskspec.go    303   a proposal or plan: strict parse, compile
-    internal/taskspec/verdict.go     146   verdict.json: strict parse
-    internal/triage/triage.go        236   what the triage agent reads and writes back
-    workflows/workflow.go            125   prompts, check, merge policy, stages
-    contrib/loa.service               26   the flags that are the policy
-    tests                          11058   317 tests, `-race` clean
+    cmd/loa/main.go                   the CLI: add | list | show | cancel | ps | report
+                                      import | triage | plan | lease | unblock | resolve
+                                      done | fail | run | stop | runs | merge | daemon
+                                      pause | resume
+    cmd/loa/daemon.go                 the supervisor, its policy flags, and -status
+    cmd/loa/merge.go                  loa merge: the one deterministic transition
+    cmd/loa/version.go                what the binary was built from
+    internal/store/store.go           lease, deps, scopes, retries, cancel
+    internal/store/run.go             runs: one active, and the record
+    internal/store/explain.go         deps, dependents, blockers ("why not running")
+    internal/store/migrate.go         numbered, transactional migrations
+    internal/store/migrations/        0001–0010, up to task_plan
+    internal/herdr/client.go          typed CLI client; JSON is the contract
+    internal/herdr/labels.go          the `loa #N` label, parsed in one place
+    internal/runner/runner.go         rounds, judgement, reconciliation
+    internal/runner/backend.go        Backend interface (the fake's seam)
+    internal/runner/herdr_backend.go  resolve, worktree, agent, blocked, close
+    internal/runner/roles.go          a role's prompt file and tool set
+    internal/runner/verdict.go        the reviewer's deliverable, and its check
+    internal/runner/git.go            commit count, summary, branch delete
+    internal/runner/prompt.go         render the task, then the contract
+    internal/live/live.go             queue joined with the session (`ps`)
+    internal/daemon/client.go         the daemon client: socket path, calls, NDJSON
+    internal/daemon/owner.go          the run's owner: host and pid, proof of death
+    internal/daemon/peer_linux.go     the control socket's SO_PEERCRED gate
+    internal/daemon/peer_other.go     the control socket's non-Linux refusal
+    internal/daemon/server.go         the socket, the runs, and the scheduler
+    internal/daemon/protocol.go       versioned NDJSON; client and server types
+    internal/report/report.go         the day: done, blocked, queued, open, gap
+    internal/taskspec/taskspec.go     a proposal or plan: strict parse, compile
+    internal/taskspec/verdict.go      verdict.json: strict parse
+    internal/triage/triage.go         what the triage agent reads and writes back
+    workflows/workflow.go             prompts, check, merge policy, stages
+    contrib/loa.service               the flags that are the policy
+    tests                             320 tests (functions beginning Test, excluding TestMain), `-race` clean
 
 `nix flake check` builds the binary and runs the tests and the linter in the
 sandbox, so the gate is one command on a clean machine. Verified end to end in a

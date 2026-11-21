@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -232,6 +233,59 @@ func TestDaemonRefusesAnInvalidRunBudget(t *testing.T) {
 	}
 }
 
+func TestRunRefusesAnInvalidRunBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"workers zero", []string{"run", "-workers", "0"}, []string{"-workers", "positive"}},
+		{"workers negative", []string{"run", "-workers", "-1"}, []string{"-workers", "positive"}},
+		{"max zero", []string{"run", "-max", "0"}, []string{"-max", "positive"}},
+		{"timeout zero", []string{"run", "-timeout", "0s"}, []string{"-timeout", "positive"}},
+		{"ttl zero", []string{"run", "-ttl", "0s"}, []string{"-ttl", "positive"}},
+		{"ttl equal to timeout", []string{"run", "-ttl", "2m", "-timeout", "2m"}, []string{"-ttl", "-timeout"}},
+		{"ttl below timeout", []string{"run", "-ttl", "1m", "-timeout", "2m"}, []string{"-ttl", "-timeout"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runtimeDir := filepath.Join(dir, "run")
+			if err := os.MkdirAll(filepath.Join(runtimeDir, "loa"), 0o700); err != nil {
+				t.Fatalf("runtime dir: %v", err)
+			}
+			listener, err := net.Listen("unix", filepath.Join(runtimeDir, "loa", "sock"))
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			_, errOut, code := runDaemonCLI(t, daemonEnv(runtimeDir), tc.args...)
+			if code != 1 {
+				t.Fatalf("%v exited %d, want the refusal (1); stderr %q", tc.args, code, errOut)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr = %q, want %q named", errOut, want)
+				}
+			}
+
+			// A refused request must stop before the socket. The client has exited,
+			// so a queued connection would still be accepted; an expired deadline
+			// makes an empty queue answer at once.
+			ul, ok := listener.(*net.UnixListener)
+			if !ok {
+				t.Fatalf("listener is %T, want a Unix listener", listener)
+			}
+			_ = ul.SetDeadline(time.Now())
+			conn, err := ul.Accept()
+			if err == nil {
+				_ = conn.Close()
+				t.Errorf("%v reached the daemon socket", tc.args)
+			}
+		})
+	}
+}
+
 func TestDaemonSecondInstanceRefuses(t *testing.T) {
 	p := startDaemonIn(t, t.TempDir())
 
@@ -390,6 +444,58 @@ func (c *daemonClient) status() (struct{}, error) {
 		return struct{}{}, fmt.Errorf("status refused")
 	}
 	return struct{}{}, nil
+}
+
+func TestControlVerbsFailWhenTheDaemonNeverAnswers(t *testing.T) {
+	old := daemonCallTimeout
+	daemonCallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { daemonCallTimeout = old })
+
+	dir := t.TempDir()
+	runtime := filepath.Join(dir, "loa")
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(runtime, "sock"), Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Accept every call and hold it open without an answer: a wedged daemon.
+	go func() {
+		var held []*net.UnixConn
+		defer func() {
+			for _, conn := range held {
+				_ = conn.Close()
+			}
+		}()
+		for {
+			conn, err := ln.AcceptUnix()
+			if err != nil {
+				return
+			}
+			held = append(held, conn)
+		}
+	}()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	for _, verb := range []string{"pause", "resume", "stop"} {
+		t.Run(verb, func(t *testing.T) {
+			start := time.Now()
+			err := cmdDaemonControl(context.Background(), verb, nil)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatalf("%s returned nil from a daemon that never answers", verb)
+			}
+			if !strings.Contains(err.Error(), "did not answer within") {
+				t.Errorf("%s error = %v, want the timeout named", verb, err)
+			}
+			if elapsed > time.Second {
+				t.Errorf("%s took %s, want it bounded by the %s deadline", verb, elapsed, daemonCallTimeout)
+			}
+		})
+	}
 }
 
 func TestDaemonStatusFailsWithTheReasonWhenNoDaemonRuns(t *testing.T) {

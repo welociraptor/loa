@@ -1030,6 +1030,32 @@ func runOptionsFrom(fs *flag.FlagSet, f runFlags) daemon.RunOptions {
 	return o
 }
 
+// checkRunRequest refuses a supplied flag the request cannot carry. RunOptions
+// are omitempty on the wire, so a zero or negative value would be dropped and
+// the daemon would run its full budget instead. The daemon refuses its own such
+// flags in parseDaemonFlags; a caller that spent its budget gets the same
+// answer rather than a wider run.
+func checkRunRequest(fs *flag.FlagSet, f runFlags) error {
+	if flagWasSet(fs, "workers") && f.workers <= 0 {
+		return fmt.Errorf("run: -workers %d must be positive", f.workers)
+	}
+	if flagWasSet(fs, "max") && f.maxTasks <= 0 {
+		return fmt.Errorf("run: -max %d must be positive", f.maxTasks)
+	}
+	if flagWasSet(fs, "timeout") && f.timeout <= 0 {
+		return fmt.Errorf("run: -timeout %s must be positive", f.timeout)
+	}
+	if flagWasSet(fs, "ttl") && f.ttl <= 0 {
+		return fmt.Errorf("run: -ttl %s must be positive", f.ttl)
+	}
+	// The runner refuses a lease that does not outlive the task. When the caller
+	// sets both, that failure is knowable here instead of after the lease.
+	if flagWasSet(fs, "ttl") && flagWasSet(fs, "timeout") && f.ttl <= f.timeout {
+		return fmt.Errorf("run: -ttl %s must exceed -timeout %s", f.ttl, f.timeout)
+	}
+	return nil
+}
+
 // resolvePrompts makes a relative -prompts absolute against the caller's cwd.
 // The daemon has its own cwd, so a path left relative would name a different
 // checkout, or no prompts at all.
@@ -1089,6 +1115,10 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", positional)
 	}
 
+	if err := checkRunRequest(fs, flags); err != nil {
+		return err
+	}
+
 	path, err := daemon.SocketPath()
 	if err != nil {
 		return err
@@ -1107,10 +1137,8 @@ func cmdRun(ctx context.Context, args []string) error {
 		select {
 		case <-interrupt:
 			signal.Stop(interrupt)
-			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			if err := client.Stop(stopCtx); err != nil {
-				fmt.Fprintf(os.Stderr, "loa: stop: %v\n", err)
+			if err := daemonCall(ctx, "stop", client.Stop); err != nil {
+				fmt.Fprintf(os.Stderr, "loa: %v\n", err)
 			}
 		case <-runDone:
 		}

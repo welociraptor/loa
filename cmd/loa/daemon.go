@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -151,17 +152,18 @@ func cmdDaemonControl(ctx context.Context, verb string, args []string) error {
 		return err
 	}
 	client := &daemon.Client{Path: path}
+	var call func(context.Context) error
 	switch verb {
 	case "pause":
-		err = client.Pause(ctx)
+		call = client.Pause
 	case "resume":
-		err = client.Resume(ctx)
+		call = client.Resume
 	case "stop":
-		err = client.Stop(ctx)
+		call = client.Stop
 	default:
 		return fmt.Errorf("daemon control: unknown verb %q", verb)
 	}
-	if err != nil {
+	if err := daemonCall(ctx, verb, call); err != nil {
 		return err
 	}
 	switch verb {
@@ -175,16 +177,37 @@ func cmdDaemonControl(ctx context.Context, verb string, args []string) error {
 	return nil
 }
 
-func daemonStatus(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+// daemonCallTimeout bounds one client call to the daemon. A daemon that accepts
+// the connection and then never answers must fail the caller loudly, not leave
+// the shell blocked. It is a variable so a test can shrink the wait.
+var daemonCallTimeout = 5 * time.Second
 
+// daemonCall runs one client call under the shared bound. The verb names the
+// call in the timeout error, so a wedged daemon reads as a timeout and not as
+// a refusal.
+func daemonCall(ctx context.Context, verb string, call func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, daemonCallTimeout)
+	defer cancel()
+	err := call(ctx)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("%s: the daemon did not answer within %s: %w", verb, daemonCallTimeout, err)
+	}
+	return err
+}
+
+func daemonStatus(ctx context.Context) error {
 	path, err := daemon.SocketPath()
 	if err != nil {
 		return err
 	}
-	status, err := (&daemon.Client{Path: path}).Status(ctx)
-	if err != nil {
+
+	client := &daemon.Client{Path: path}
+	var status daemon.Status
+	if err := daemonCall(ctx, "status", func(ctx context.Context) error {
+		var err error
+		status, err = client.Status(ctx)
+		return err
+	}); err != nil {
 		return err
 	}
 

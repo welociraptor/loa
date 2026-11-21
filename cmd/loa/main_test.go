@@ -907,8 +907,10 @@ func TestRunJSONWithoutADaemonExitsOneAndPrintsNothing(t *testing.T) {
 	}
 }
 
-func TestRunSendsRelativePromptsAsAnAbsolutePath(t *testing.T) {
-	runtimeDir := t.TempDir()
+// serveOneRun stands in for the daemon: it accepts one run request, answers
+// with a finished run so the client can exit, and reports what it saw.
+func serveOneRun(t *testing.T, runtimeDir string) <-chan daemon.Request {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Join(runtimeDir, "loa"), 0o700); err != nil {
 		t.Fatalf("runtime dir: %v", err)
 	}
@@ -916,32 +918,31 @@ func TestRunSendsRelativePromptsAsAnAbsolutePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer func() { _ = listener.Close() }()
+	t.Cleanup(func() { _ = listener.Close() })
 
-	type served struct {
-		req daemon.Request
-		err error
-	}
-	servedCh := make(chan served, 1)
+	served := make(chan daemon.Request, 1)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
-			servedCh <- served{err: err}
 			return
 		}
 		defer func() { _ = conn.Close() }()
 		var req daemon.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			servedCh <- served{err: err}
 			return
 		}
 		resp := daemon.Response{V: daemon.Protocol, OK: true, Run: &daemon.RunResult{Run: daemon.RunRecord{ID: 1}}}
 		if err := json.NewEncoder(conn).Encode(resp); err != nil {
-			servedCh <- served{err: err}
 			return
 		}
-		servedCh <- served{req: req}
+		served <- req
 	}()
+	return served
+}
+
+func TestRunSendsRelativePromptsAsAnAbsolutePath(t *testing.T) {
+	runtimeDir := t.TempDir()
+	servedCh := serveOneRun(t, runtimeDir)
 
 	c := newCLI(t)
 	c.dir = t.TempDir()
@@ -952,15 +953,35 @@ func TestRunSendsRelativePromptsAsAnAbsolutePath(t *testing.T) {
 
 	select {
 	case got := <-servedCh:
-		if got.err != nil {
-			t.Fatalf("fake daemon: %v", got.err)
-		}
-		if got.req.Run == nil {
-			t.Fatalf("request carried no run options: %+v", got.req)
+		if got.Run == nil {
+			t.Fatalf("request carried no run options: %+v", got)
 		}
 		want := filepath.Join(c.dir, "prompts")
-		if got.req.Run.PromptsDir != want {
-			t.Errorf("prompts = %q, want %q", got.req.Run.PromptsDir, want)
+		if got.Run.PromptsDir != want {
+			t.Errorf("prompts = %q, want %q", got.Run.PromptsDir, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake daemon saw no request")
+	}
+}
+
+func TestRunSendsTheBudgetItWasGiven(t *testing.T) {
+	runtimeDir := t.TempDir()
+	servedCh := serveOneRun(t, runtimeDir)
+
+	c := newCLI(t)
+	c.env = []string{"XDG_RUNTIME_DIR=" + runtimeDir}
+	if _, stderr, code := c.run("run", "-workers", "1", "-max", "2", "-timeout", "10m", "-ttl", "1h"); code != 0 {
+		t.Fatalf("run exited %d: %s", code, stderr)
+	}
+
+	select {
+	case got := <-servedCh:
+		if got.Run == nil {
+			t.Fatalf("request carried no run options: %+v", got)
+		}
+		if got.Run.Workers != 1 || got.Run.MaxTasks != 2 || got.Run.TaskTimeout != 10*time.Minute || got.Run.LeaseTTL != time.Hour {
+			t.Errorf("run options = %+v, want workers 1, max 2, timeout 10m, ttl 1h", *got.Run)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("fake daemon saw no request")

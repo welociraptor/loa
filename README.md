@@ -146,11 +146,12 @@ from the result.
 
 `loa run` asks the daemon for a run and fails if it cannot reach it. It may
 narrow the daemon's `-workers` and `-max`, and shorten `-timeout` and `-ttl`;
-`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A longer
-timeout or ttl, a wider budget, or a different `-check` when the daemon has one
-is refused before a run starts. `Ctrl-C` on `loa run` sends the same stop request
-as `loa stop`; a second Ctrl-C kills the client if the run is wedged, and the
-daemon owns the run's cleanup either way. The daemon probes
+`-base`, `-prompts`, `-model` and `-kind` are the client's choice. A wider
+budget is clamped to the daemon's; a longer timeout or ttl, or a different
+`-check` when the daemon has one, is refused before a run starts. `Ctrl-C`
+on `loa run` sends the same stop request as `loa stop`; a second Ctrl-C kills
+the client if the run is wedged, and the daemon owns the run's cleanup
+either way. The daemon probes
 `herdr status` once at start
 and logs the result. Automatic runs are gated on the probe: every `-auto` tick
 probes again, and a failed probe skips that tick and is retried at the next
@@ -191,13 +192,15 @@ loa daemon -auto -workers 1 -max 4 -idle 5m -daily 12
 one run's concurrency and budget; `-idle` is the quiet period after the last
 settled run; `-daily` is the number of tasks settled today (done and failed both
 count, and manual runs count too, because the budget is counted from the run
-record). These flags are the cap, not a default: a client may narrow them but
-cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client may only
-lower; `-check` is the daemon's check, and a client may supply one only when the
-daemon has none. A client may still choose `-base`, `-prompts`, `-model` and
-`-kind`; a relative `-prompts` is resolved against the client's working
-directory before it is sent. When a run has no prompts directory, the daemon
-walks up from its own working directory, which is why the unit sets
+record). `-daily` gates the next start, not the run in flight: a run begun at 11
+of 12 may still settle its full `-max`, so a day can overshoot by up to `-max`-1
+tasks. These flags are the daemon's policy, not a default: a client may narrow
+them but cannot widen them. `-timeout` and `-ttl` are likewise ceilings a client
+may only lower; `-check` is the daemon's check, and a client may supply one only
+when the daemon has none. A client may still choose `-base`, `-prompts`,
+`-model` and `-kind`; a relative `-prompts` is resolved against the client's
+working directory before it is sent. When a run has no prompts directory, the
+daemon walks up from its own working directory, which is why the unit sets
 `WorkingDirectory`. Change the unit, not a config file: a checked-in flag is a
 reviewed decision, while a file in a hidden directory drifts. `-interval`
 (default `1m`) is how often the queue is checked and the floor for an empty
