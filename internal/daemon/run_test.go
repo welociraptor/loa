@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -244,7 +245,7 @@ func TestClientDisconnectLeavesTheRunGoing(t *testing.T) {
 func TestDeadRunRowIsSettledAtTheNextStart(t *testing.T) {
 	ctx := context.Background()
 	s := daemonStore(t)
-	dead, err := s.StartRun(ctx, "dead-daemon/999999", 1, 1)
+	dead, err := s.StartRun(ctx, fmt.Sprintf("%s/%d", hostName(t), deadPID(t)), 1, 1)
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}

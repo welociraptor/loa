@@ -12,7 +12,8 @@ import (
 // runOwnerGone reports whether an active run's recorded owner is provably
 // gone. The runtime lock only covers this process's XDG_RUNTIME_DIR, so a
 // different host or runtime directory may still be working the same database.
-// Anything short of proof of death leaves the row alone.
+// Anything short of proof of death leaves the row alone; a different host is
+// unknown, not proof, because a live daemon there may share this database.
 func runOwnerGone(owner string) (bool, string) {
 	host, pid, err := parseOwner(owner)
 	if err != nil {
@@ -23,7 +24,7 @@ func runOwnerGone(owner string) (bool, string) {
 		return false, fmt.Sprintf("cannot identify this host: %v; not proof of death", err)
 	}
 	if host != local {
-		return true, fmt.Sprintf("owner is on host %q, not this host %q", host, local)
+		return false, fmt.Sprintf("owner is on host %q, not this host %q; not proof of death", host, local)
 	}
 
 	err = syscall.Kill(pid, 0)

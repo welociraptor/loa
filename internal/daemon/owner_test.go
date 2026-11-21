@@ -131,7 +131,7 @@ func TestReconcileLeavesAnUnparseableOwnerAlone(t *testing.T) {
 	}
 }
 
-func TestReconcileSettlesAnOwnerOnAnotherHost(t *testing.T) {
+func TestReconcileLeavesAnOwnerOnAnotherHost(t *testing.T) {
 	ctx := context.Background()
 	s := daemonStore(t)
 	run := seedActiveRun(t, s, fmt.Sprintf("another-host/%d", os.Getpid()))
@@ -147,17 +147,14 @@ func TestReconcileSettlesAnOwnerOnAnotherHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("active run: %v", err)
 	}
-	if active != nil {
-		t.Fatalf("active run = %+v, want the other host's run settled", active)
+	if active == nil || active.ID != run.ID {
+		t.Fatalf("active run = %+v, want run %d left alone", active, run.ID)
 	}
-	settled, err := s.GetRun(ctx, run.ID)
-	if err != nil {
-		t.Fatalf("get run: %v", err)
+	got := logs.String()
+	if !strings.Contains(got, "leaving run") || !strings.Contains(got, "not this host") || !strings.Contains(got, "not proof of death") {
+		t.Errorf("logs = %q, want the other host named as unknown", got)
 	}
-	if settled.Active() {
-		t.Errorf("run = %+v, want it closed", settled)
-	}
-	if !strings.Contains(logs.String(), "not this host") {
-		t.Errorf("logs = %q, want the host mismatch named", logs.String())
+	if !strings.Contains(got, "loa runs -close") {
+		t.Errorf("logs = %q, want the way to close it named", got)
 	}
 }

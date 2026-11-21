@@ -58,6 +58,15 @@ func parseDaemonFlags(args []string) (*daemonOptions, *flag.FlagSet, error) {
 	if o.daily < 0 {
 		return nil, nil, fmt.Errorf("daemon: -daily %d must not be negative", o.daily)
 	}
+	if o.run.workers <= 0 {
+		return nil, nil, fmt.Errorf("daemon: -workers %d must be positive", o.run.workers)
+	}
+	if o.run.maxTasks <= 0 {
+		return nil, nil, fmt.Errorf("daemon: -max %d must be positive", o.run.maxTasks)
+	}
+	if o.run.ttl <= o.run.timeout {
+		return nil, nil, fmt.Errorf("daemon: -ttl %s must exceed -timeout %s", o.run.ttl, o.run.timeout)
+	}
 	return &o, fs, nil
 }
 

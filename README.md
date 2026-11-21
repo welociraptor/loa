@@ -225,11 +225,13 @@ directly, so the socket grants nothing new; it keeps another user off the
 control channel, not the store.
 
 If the daemon dies, the queue stays readable and the next start repairs the
-rest: the runtime lock proves the old process is gone, so an open run row is
-settled and orphaned workspaces are reconciled before the socket accepts work.
-The attempt's lease lapses on its own. In the meantime, `loa runs -close ID`
-settles the stale row by hand. `Restart=on-failure` is what turns a crash into a
-new daemon rather than a machine quietly doing nothing.
+rest: an open run row is settled only when its owner is provably gone, and
+orphaned workspaces are reconciled before the socket accepts work. A row whose
+owner is on another host is left for a person to settle, because this process
+cannot prove it is dead. The attempt's lease lapses on its own. In the
+meantime, `loa runs -close ID` settles the stale row by hand.
+`Restart=on-failure` is what turns a crash into a new daemon rather than a
+machine quietly doing nothing.
 
 ## Proposals
 

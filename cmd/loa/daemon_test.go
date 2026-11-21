@@ -203,6 +203,35 @@ func TestDaemonStatusRefusesTheDatabaseFlag(t *testing.T) {
 	}
 }
 
+func TestDaemonRefusesAnInvalidRunBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"workers", []string{"daemon", "-workers", "0"}, []string{"-workers", "positive"}},
+		{"max", []string{"daemon", "-max", "0"}, []string{"-max", "positive"}},
+		{"ttl equal to timeout", []string{"daemon", "-ttl", "45m", "-timeout", "45m"}, []string{"-ttl", "-timeout"}},
+		{"ttl below timeout", []string{"daemon", "-ttl", "30m", "-timeout", "45m"}, []string{"-ttl", "-timeout"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, errOut, code := runDaemonCLI(t, daemonEnv(dir), tc.args...)
+			if code != 1 {
+				t.Fatalf("daemon exited %d, want the budget refusal (1); stderr %q", code, errOut)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr = %q, want %q named", errOut, want)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dir, "loa", "sock")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("refused daemon left a socket: %v", err)
+			}
+		})
+	}
+}
+
 func TestDaemonSecondInstanceRefuses(t *testing.T) {
 	p := startDaemonIn(t, t.TempDir())
 
@@ -448,6 +477,10 @@ func TestDaemonServiceCommandLineParses(t *testing.T) {
 	if !o.auto || o.run.workers != 1 || o.run.maxTasks != 4 || o.idle != 5*time.Minute || o.daily != 12 {
 		t.Errorf("unit parses as auto %t, workers %d, max %d, idle %s, daily %d; want the checked-in policy",
 			o.auto, o.run.workers, o.run.maxTasks, o.idle, o.daily)
+	}
+	if o.run.ttl <= o.run.timeout {
+		t.Errorf("unit parses as ttl %s, timeout %s; want -ttl to exceed -timeout",
+			o.run.ttl, o.run.timeout)
 	}
 }
 
